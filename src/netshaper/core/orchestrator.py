@@ -226,6 +226,7 @@ class NetShaper:
             self._mitm_proc.terminate()
             log.info("mitmproxy terminated")
         self._remove_global_rules()
+        StateSnapshotManager.restore(self.state_snapshot)
         self.shaper.cleanup()
         state_path = os.path.join(config.STATE_DIR, self.session_id, "state.json")
         if os.path.exists(state_path):

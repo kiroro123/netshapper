@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "netshaper"
 version = "3.8.0"
-description = "A modular authorized network shaping and diagnostics toolkit for controlled lab testing"
+description = "A safety-first, authorized network shaping and diagnostics toolkit for controlled lab testing"
 readme = "README.md"
 requires-python = ">=3.10"
 authors = [{name = "NetShaper Contributors"}]

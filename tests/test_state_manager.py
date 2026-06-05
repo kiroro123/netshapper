@@ -2,7 +2,7 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
-from netshaper.core.state_manager import StateSnapshotManager
+from netshaper.core.state_manager import NetworkStateSnapshot, StateSnapshotManager
 
 
 class StateSnapshotTests(unittest.TestCase):
@@ -22,6 +22,45 @@ class StateSnapshotTests(unittest.TestCase):
         self.assertEqual(snapshot.interface, "wlp0s20f3")
         self.assertEqual(snapshot.ipv4_forwarding, 1)
         self.assertEqual(snapshot.ipv6_forwarding, 0)
+
+    @mock.patch("netshaper.core.state_manager.subprocess.run")
+    def test_restore_reapplies_saved_forwarding_and_rules(self, run_mock):
+        snapshot = NetworkStateSnapshot(
+            session_id="NS-TEST",
+            interface="wlp0s20f3",
+            ipv4_forwarding=1,
+            ipv6_forwarding=0,
+            iptables_rules="*filter\n-A FORWARD -j ACCEPT\nCOMMIT\n",
+            ip6tables_rules="*filter\n-A FORWARD -j ACCEPT\nCOMMIT\n",
+            tc_configuration="qdisc noqueue 0: dev wlp0s20f3 root",
+        )
+
+        StateSnapshotManager.restore(snapshot)
+
+        run_mock.assert_any_call(
+            ["sysctl", "-w", "net.ipv4.ip_forward=1"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        run_mock.assert_any_call(
+            ["sysctl", "-w", "net.ipv6.conf.all.forwarding=0"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        run_mock.assert_any_call(
+            ["iptables-restore"],
+            input="*filter\n-A FORWARD -j ACCEPT\nCOMMIT\n",
+            text=True,
+            check=False,
+        )
+        run_mock.assert_any_call(
+            ["ip6tables-restore"],
+            input="*filter\n-A FORWARD -j ACCEPT\nCOMMIT\n",
+            text=True,
+            check=False,
+        )
 
 
 if __name__ == "__main__":

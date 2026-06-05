@@ -19,7 +19,7 @@ class NetworkStateSnapshot:
 
 
 class StateSnapshotManager:
-    """Capture the pre-session network state for safer cleanup."""
+    """Capture and restore the pre-session network state for safer cleanup."""
 
     @staticmethod
     def _run(args: list[str]) -> str:
@@ -28,6 +28,47 @@ class StateSnapshotManager:
             return completed.stdout.strip() if completed.returncode == 0 else ""
         except FileNotFoundError:
             return ""
+
+    @classmethod
+    def restore(cls, snapshot: NetworkStateSnapshot) -> None:
+        """Restore the captured forwarding and iptables state."""
+        if snapshot.ipv4_forwarding is not None:
+            subprocess.run(
+                ["sysctl", "-w", f"net.ipv4.ip_forward={snapshot.ipv4_forwarding}"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        if snapshot.ipv6_forwarding is not None:
+            subprocess.run(
+                ["sysctl", "-w", f"net.ipv6.conf.all.forwarding={snapshot.ipv6_forwarding}"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+        for binary, rules in (("iptables", snapshot.iptables_rules), ("ip6tables", snapshot.ip6tables_rules)):
+            if rules and rules.strip():
+                try:
+                    subprocess.run(
+                        [f"{binary}-restore"],
+                        input=rules,
+                        text=True,
+                        check=False,
+                    )
+                except FileNotFoundError:
+                    continue
+
+        if snapshot.tc_configuration.strip():
+            try:
+                subprocess.run(
+                    ["tc", "qdisc", "del", "dev", snapshot.interface, "root"],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+            except FileNotFoundError:
+                return
 
     @classmethod
     def capture(cls, interface: str, session_id: str) -> NetworkStateSnapshot:

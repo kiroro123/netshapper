@@ -20,6 +20,8 @@ log = logging.getLogger("netshaper")
 class SystemChecker:
     @staticmethod
     def check() -> None:
+        if config.DRY_RUN:
+            return
         if not sys.platform.startswith("linux"):
             sys.exit("[NetShaper] Linux only.")
         if os.geteuid() != 0:
