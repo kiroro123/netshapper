@@ -56,10 +56,12 @@ class TrafficShaper:
                 ["tc", "class", "add", "dev", self.interface,
                  "parent", "1:", "classid", classid,
                  "htb", "rate", f"{k}kbit", "burst", "15k"]):
-                self._rollback_failed_target(created_filters, created_classes)
-                raise RuntimeError(
-                    f"Failed to create traffic class {classid}"
-                )
+                rollback_ok = self._rollback_failed_target(
+                    created_filters, created_classes)
+                message = f"Failed to create traffic class {classid}"
+                if not rollback_ok:
+                    message += "; rollback incomplete"
+                raise RuntimeError(message)
             created_classes.append(mark)
             for proto in ["ip", "ipv6"]:
                 if not SubprocessRunner.run(
@@ -67,10 +69,12 @@ class TrafficShaper:
                      "parent", "1:", "protocol", proto,
                      "handle", str(mark), "fw", "flowid", classid],
                     silent=True):
-                    self._rollback_failed_target(created_filters, created_classes)
-                    raise RuntimeError(
-                        f"Failed to create traffic filter for mark {mark}"
-                    )
+                    rollback_ok = self._rollback_failed_target(
+                        created_filters, created_classes)
+                    message = f"Failed to create traffic filter for mark {mark}"
+                    if not rollback_ok:
+                        message += "; rollback incomplete"
+                    raise RuntimeError(message)
                 created_filters.append((mark, proto))
         self._active_marks.add(mark_base)
         log.info(
@@ -80,26 +84,29 @@ class TrafficShaper:
     def _rollback_failed_target(
             self,
             filters: List[Tuple[int, str]],
-            classes: List[int]) -> None:
-        self._rollback_created(filters, classes)
+            classes: List[int]) -> bool:
+        ok = self._rollback_created(filters, classes)
         if self._base_initialized and not self._active_marks:
-            self.cleanup()
+            ok = self.cleanup() and ok
+        return ok
 
     def _rollback_created(
             self,
             filters: List[Tuple[int, str]],
-            classes: List[int]) -> None:
+            classes: List[int]) -> bool:
+        ok = True
         for mark, proto in reversed(filters):
-            SubprocessRunner.run(
+            ok = SubprocessRunner.run(
                 ["tc", "filter", "del", "dev", self.interface,
                  "parent", "1:", "protocol", proto,
                  "handle", str(mark), "fw"],
-                check=False, silent=True)
+                check=False, silent=True) and ok
         for mark in reversed(classes):
-            SubprocessRunner.run(
+            ok = SubprocessRunner.run(
                 ["tc", "class", "del", "dev", self.interface,
                  "classid", f"1:{mark}"],
-                check=False, silent=True)
+                check=False, silent=True) and ok
+        return ok
 
     def cleanup_target(self, mark_base: int) -> bool:
         ok = True
@@ -114,15 +121,17 @@ class TrafficShaper:
                 ["tc", "class", "del", "dev", self.interface,
                  "classid", f"1:{mark}"],
                 check=False, silent=True) and ok
-        self._active_marks.discard(mark_base)
+        if ok:
+            self._active_marks.discard(mark_base)
         return ok
 
     def cleanup(self) -> bool:
-        ok = True
-        if self._base_initialized:
-            ok = SubprocessRunner.run(
-                ["tc", "qdisc", "del", "dev", self.interface, "root"],
-                check=False, silent=True)
-        self._base_initialized = False
-        self._active_marks.clear()
+        if not self._base_initialized:
+            return True
+        ok = SubprocessRunner.run(
+            ["tc", "qdisc", "del", "dev", self.interface, "root"],
+            check=False, silent=True)
+        if ok:
+            self._base_initialized = False
+            self._active_marks.clear()
         return ok

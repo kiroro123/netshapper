@@ -495,11 +495,14 @@ class NetShaper:
                 except subprocess.TimeoutExpired:
                     proc.kill()
                     proc.wait(timeout=5)
-            log.info("mitmproxy terminated")
+            if proc.poll() is None:
+                ok = False
+            else:
+                log.info("mitmproxy terminated")
         except Exception as exc:
             ok = False
             log.error(f"mitmproxy cleanup failed: {exc}")
-        finally:
+        if ok:
             self._mitm_proc = None
         return ok
 
@@ -612,6 +615,40 @@ class NetShaper:
                         cleanup_ok = False
                         log.error(f"Stale cleanup failed ({description})")
 
+                def resource_present(
+                        command: list[str],
+                        *,
+                        output_contains: Optional[str] = None) -> bool:
+                    try:
+                        result = subprocess.run(
+                            command,
+                            capture_output=True,
+                            text=True,
+                            check=False,
+                        )
+                    except FileNotFoundError:
+                        return False
+                    if result.returncode != 0:
+                        return False
+                    if output_contains is not None:
+                        return output_contains in (result.stdout or "")
+                    return True
+
+                def run_recovery_if_present(
+                        description: str,
+                        command: list[str],
+                        exists_command: list[str],
+                        *,
+                        output_contains: Optional[str] = None) -> None:
+                    if not resource_present(
+                            exists_command,
+                            output_contains=output_contains):
+                        log.info(
+                            f"Stale cleanup skipped ({description} already absent)"
+                        )
+                        return
+                    run_recovery(description, command)
+
                 def require_binary(binary: str, reason: str) -> bool:
                     nonlocal cleanup_ok
                     if shutil.which(binary):
@@ -633,19 +670,25 @@ class NetShaper:
                     for binary in binaries:
                         if not require_binary(binary, "global firewall rules"):
                             continue
-                        run_recovery(
+                        run_recovery_if_present(
                             f"{binary} forward same-interface accept",
                             [binary, "-D", "FORWARD",
                              "-i", iface, "-o", iface, "-j", "ACCEPT"],
+                            [binary, "-C", "FORWARD",
+                             "-i", iface, "-o", iface, "-j", "ACCEPT"],
                         )
-                        run_recovery(
+                        run_recovery_if_present(
                             f"{binary} established forward accept",
                             [binary, "-D", "FORWARD", "-m", "state",
                              "--state", "ESTABLISHED,RELATED", "-j", "ACCEPT"],
+                            [binary, "-C", "FORWARD", "-m", "state",
+                             "--state", "ESTABLISHED,RELATED", "-j", "ACCEPT"],
                         )
-                        run_recovery(
+                        run_recovery_if_present(
                             f"{binary} masquerade",
                             [binary, "-t", "nat", "-D", "POSTROUTING",
+                             "-o", iface, "-j", "MASQUERADE"],
+                            [binary, "-t", "nat", "-C", "POSTROUTING",
                              "-o", iface, "-j", "MASQUERADE"],
                         )
 
@@ -666,42 +709,56 @@ class NetShaper:
                             continue
                         if target.get("dns"):
                             for proto in ["udp", "tcp"]:
-                                run_recovery(
+                                run_recovery_if_present(
                                     f"{binary} DNS input {ip}/{proto}",
                                     [binary, "-D", "INPUT",
+                                     "-i", iface, "-s", ip,
+                                     "-p", proto, "--dport", "53",
+                                     "-j", "ACCEPT"],
+                                    [binary, "-C", "INPUT",
                                      "-i", iface, "-s", ip,
                                      "-p", proto, "--dport", "53",
                                      "-j", "ACCEPT"],
                                 )
                         http_port = target.get("http_redirect_port")
                         if http_port:
-                            run_recovery(
+                            run_recovery_if_present(
                                 f"{binary} HTTP input {ip}",
                                 [binary, "-D", "INPUT",
                                  "-i", iface, "-s", ip,
                                  "-p", "tcp", "--dport", str(http_port),
                                  "-j", "ACCEPT"],
+                                [binary, "-C", "INPUT",
+                                 "-i", iface, "-s", ip,
+                                 "-p", "tcp", "--dport", str(http_port),
+                                 "-j", "ACCEPT"],
                             )
                         for table, hook, chain_name in chain_specs:
-                            run_recovery(
+                            run_recovery_if_present(
                                 f"{binary} unlink {chain_name}",
                                 [binary, "-t", table, "-D", hook,
                                  "-j", chain_name],
+                                [binary, "-t", table, "-C", hook,
+                                 "-j", chain_name],
                             )
-                            run_recovery(
+                            run_recovery_if_present(
                                 f"{binary} flush {chain_name}",
                                 [binary, "-t", table, "-F", chain_name],
+                                [binary, "-t", table, "-L", chain_name],
                             )
-                            run_recovery(
+                            run_recovery_if_present(
                                 f"{binary} delete {chain_name}",
                                 [binary, "-t", table, "-X", chain_name],
+                                [binary, "-t", table, "-L", chain_name],
                             )
 
                 if data.get("shaper_base_initialized"):
                     if require_binary("tc", "traffic shaper"):
-                        run_recovery(
+                        run_recovery_if_present(
                             "tc root qdisc",
                             ["tc", "qdisc", "del", "dev", iface, "root"],
+                            ["tc", "qdisc", "show", "dev", iface, "root"],
+                            output_contains="qdisc htb 1:",
                         )
 
                 snapshot = self._snapshot_from_state(data)
