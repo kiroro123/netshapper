@@ -394,7 +394,7 @@ class NetShaper:
                 if not config.DRY_RUN:
                     cleanup_step(
                         "state file",
-                        lambda: os.remove(state_path) if os.path.exists(state_path) else None,
+                        lambda: self._remove_state_file(state_path),
                     )
                 if errors:
                     log.warning(
@@ -412,6 +412,14 @@ class NetShaper:
     def stop(self) -> None:
         self.cleanup()
 
+    @staticmethod
+    def _remove_state_file(state_path: str) -> None:
+        if os.path.exists(state_path):
+            os.remove(state_path)
+        try:
+            os.rmdir(os.path.dirname(state_path))
+        except OSError:
+            pass
 
     # ── Sniffer ───────────────────────────────────────────────────────────────
     def launch_sniffer(self, target_ips: Optional[List[str]] = None,
@@ -563,6 +571,7 @@ class NetShaper:
     def load_state_and_cleanup(self) -> None:
         if not os.path.isdir(config.STATE_DIR):
             return
+        recovery_attempted = False
         for state_path in sorted(glob.glob(os.path.join(config.STATE_DIR, "*", "state.json"))):
             cleanup_ok = True
             try:
@@ -579,6 +588,7 @@ class NetShaper:
                     )
                     continue
                 print_flush(f"  [!] Stale session on {iface} — cleaning up…")
+                recovery_attempted = True
 
                 def run_recovery(description: str, command: list[str]) -> None:
                     nonlocal cleanup_ok
@@ -692,6 +702,12 @@ class NetShaper:
                     log.error(f"Leaving recovery state in place: {state_path}")
             except Exception as exc:
                 log.debug(f"No valid state file to recover: {exc}")
+        current_interface = getattr(self, "interface", None)
+        if recovery_attempted and current_interface:
+            self.state_snapshot = StateSnapshotManager.capture(
+                current_interface,
+                getattr(self, "session_id", ""),
+            )
 
     # ── Bandwidth monitor ─────────────────────────────────────────────────────
     def monitor(self) -> None:

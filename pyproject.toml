@@ -25,6 +25,7 @@ dev = ["pytest>=8.0"]
 
 [project.scripts]
 netshaper = "netshaper.ui.cli:main"
+netshaper-fake-server = "netshaper.fake_server3:main"
 
 [tool.setuptools]
 include-package-data = true

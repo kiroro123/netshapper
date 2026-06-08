@@ -3,9 +3,13 @@ from types import SimpleNamespace
 from unittest import mock
 
 import fake_server3
+from netshaper import fake_server3 as packaged_fake_server
 
 
 class FakeServerStartupTests(unittest.TestCase):
+    def test_packaged_fake_server_exposes_main(self):
+        self.assertTrue(callable(packaged_fake_server.main))
+
     @mock.patch("fake_server3.socket.socket")
     def test_bind_dns_socket_binds_before_returning(self, socket_mock):
         sock = mock.Mock()

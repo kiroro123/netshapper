@@ -16,7 +16,8 @@ def print_flush(*args, **kwargs) -> None:
 
 def safe_input(prompt: str = "") -> str:
     """Read a line from stdin with terminal sanity restored first."""
-    os.system("stty sane")
+    if sys.stdin.isatty() and sys.stdout.isatty():
+        os.system("stty sane")
     if prompt:
         sys.stdout.write(prompt)
         sys.stdout.flush()

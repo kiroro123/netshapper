@@ -6,8 +6,9 @@ so that teardown of one target never touches another's rules.
 """
 import hashlib
 import logging
+import shutil
 import subprocess
-from typing import List, Optional
+from typing import List, Optional, Set, Tuple
 
 from netshaper import config
 from netshaper.system import SubprocessRunner
@@ -32,11 +33,16 @@ class FirewallManager:
         suffix         = self._chain_suffix(target_ip, session_id)
         self.MANGLE    = f"NS-MNG-{suffix}"
         self.NAT       = f"NS-NAT-{suffix}"
+        self._managed_chains: Set[Tuple[str, str, str]] = set()
+        self._linked_chains: Set[Tuple[str, str, str]] = set()
+        self._created_chains: Set[Tuple[str, str, str]] = set()
         # Track which optional rule groups were actually added so cleanup
         # only removes what exists (avoids iptables errors + log noise).
         self._dns_added  = False
         self._http_added = False
         self._http_redirect_port: Optional[int] = None
+        self._shaping_added = False
+        self._shaping_mark_base: Optional[int] = None
         if not self._setup():
             self.cleanup()
             raise RuntimeError(
@@ -56,6 +62,9 @@ class FirewallManager:
     def _binaries(self) -> List[str]:
         return ["ip6tables"] if self._v6 else ["iptables"]
 
+    def _binary_available(self, b: str) -> bool:
+        return config.DRY_RUN or shutil.which(b) is not None
+
     def _chain_ok(self, b: str, t: str, c: str) -> bool:
         if config.DRY_RUN:
             return False
@@ -72,6 +81,7 @@ class FirewallManager:
         ok = True
         for b in self._binaries:
             for t, c in [("mangle", self.MANGLE), ("nat", self.NAT)]:
+                self._managed_chains.add((b, t, c))
                 if not self._chain_ok(b, t, c):
                     hook = _TABLE_HOOK[t]
                     created = SubprocessRunner.run(
@@ -80,10 +90,13 @@ class FirewallManager:
                     )
                     linked = False
                     if created:
+                        self._created_chains.add((b, t, c))
                         linked = SubprocessRunner.run(
                             [b, "-t", t, "-I", hook, "1", "-j", c],
                             silent=True,
                         )
+                        if linked:
+                            self._linked_chains.add((b, t, c))
                     ok = created and linked and ok
         return ok
 
@@ -91,6 +104,8 @@ class FirewallManager:
         binaries = ["ip6tables"] if ':' in target_ip else ["iptables"]
         ok = True
         for b in binaries:
+            self._shaping_added = True
+            self._shaping_mark_base = mark_base
             ok = SubprocessRunner.run(
                 [b, "-t", "mangle", "-A", self.MANGLE,
                  "-d", target_ip, "-j", "MARK", "--set-mark", str(mark_base)],
@@ -144,9 +159,18 @@ class FirewallManager:
     def cleanup(self) -> bool:
         ok = True
         for b in self._binaries:
+            if not self._binary_available(b):
+                if self._managed_chains or self._dns_added or self._http_added:
+                    log.error(
+                        f"Cannot clean firewall resources for {self.target_ip}: "
+                        f"{b} unavailable"
+                    )
+                    ok = False
+                continue
             # Flush + delete per-target chains
             for t, c in [("mangle", self.MANGLE), ("nat", self.NAT)]:
-                if self._chain_ok(b, t, c):
+                should_cleanup = (b, t, c) in self._managed_chains
+                if self._chain_ok(b, t, c) or should_cleanup:
                     ok = SubprocessRunner.run(
                         [b, "-t", t, "-F", c],
                         check=False, silent=True) and ok
@@ -174,7 +198,13 @@ class FirewallManager:
                      "-p", "tcp", "--dport", str(self._http_redirect_port),
                      "-j", "ACCEPT"],
                     check=False, silent=True) and ok
+        if ok:
+            self._managed_chains.clear()
+            self._linked_chains.clear()
+            self._created_chains.clear()
             self._dns_added = False
             self._http_added = False
             self._http_redirect_port = None
+            self._shaping_added = False
+            self._shaping_mark_base = None
         return ok

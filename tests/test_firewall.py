@@ -34,14 +34,54 @@ class FirewallManagerTests(unittest.TestCase):
         fw._v6 = False
         fw.MANGLE = "NS-MNG-TEST"
         fw.NAT = "NS-NAT-TEST"
+        fw._managed_chains = {
+            ("iptables", "mangle", "NS-MNG-TEST"),
+            ("iptables", "nat", "NS-NAT-TEST"),
+        }
+        fw._linked_chains = set()
+        fw._created_chains = set()
         fw._dns_added = False
         fw._http_added = False
         fw._http_redirect_port = None
+        fw._shaping_added = False
+        fw._shaping_mark_base = None
 
-        with mock.patch.object(fw, "_chain_ok", return_value=True):
+        with mock.patch.object(fw, "_chain_ok", return_value=True), \
+             mock.patch("netshaper.network.firewall.shutil.which",
+                        return_value="/sbin/iptables"):
             result = fw.cleanup()
 
         self.assertFalse(result)
+
+    def test_cleanup_reports_missing_binary_for_managed_resources(self):
+        fw = FirewallManager.__new__(FirewallManager)
+        fw.target_ip = "192.0.2.10"
+        fw.interface = "eth0"
+        fw._v6 = False
+        fw.MANGLE = "NS-MNG-TEST"
+        fw.NAT = "NS-NAT-TEST"
+        fw._managed_chains = {
+            ("iptables", "mangle", "NS-MNG-TEST"),
+        }
+        fw._linked_chains = set()
+        fw._created_chains = set()
+        fw._dns_added = False
+        fw._http_added = False
+        fw._http_redirect_port = None
+        fw._shaping_added = False
+        fw._shaping_mark_base = None
+
+        with mock.patch("netshaper.network.firewall.config.DRY_RUN", False), \
+             mock.patch("netshaper.network.firewall.shutil.which",
+                        return_value=None), \
+             mock.patch("netshaper.network.firewall.log"):
+            result = fw.cleanup()
+
+        self.assertFalse(result)
+        self.assertEqual(
+            fw._managed_chains,
+            {("iptables", "mangle", "NS-MNG-TEST")},
+        )
 
     def test_session_scoped_chain_names_are_short(self):
         suffix = FirewallManager._chain_suffix(

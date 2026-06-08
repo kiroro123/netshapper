@@ -41,6 +41,18 @@ Safe preview mode:
 python -m netshaper -i <your-interface> --dry-run
 ```
 
+Optional captive-portal / DNS helper:
+
+```bash
+sudo netshaper-fake-server
+```
+
+From a source checkout, this remains available too:
+
+```bash
+sudo python3 fake_server3.py
+```
+
 ## Testing
 
 Run the regression suite:
@@ -52,7 +64,7 @@ python -m unittest discover -s tests -v
 ## Repository notes
 
 - The main CLI workflow lives in the packaged `src/netshaper` tree and is the recommended path for normal use.
-- `fake_server3.py` is an optional experimental helper for captive-portal / DNS lab scenarios. Keep it as a supporting utility, not as the main user path.
+- `netshaper-fake-server` / `fake_server3.py` is an optional experimental helper for captive-portal / DNS lab scenarios. Keep it as a supporting utility, not as the main user path.
 - Use this tool only on networks and devices you are authorized to test.
 
 The project is still evolving, and the current focus is safety, rollback, and reliable validation behavior.

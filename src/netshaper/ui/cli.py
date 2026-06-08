@@ -333,13 +333,13 @@ def main() -> None:
 
         if dns_spoof_on and not check_local_port(ns.own_ip, 53, socket.SOCK_DGRAM):
             print_flush("  [!] Fake DNS (port 53) not reachable.")
-            print_flush("      sudo python3 fake_server3.py")
+            print_flush("      sudo netshaper-fake-server")
             if safe_input("  Continue anyway? (y/n): ").lower() != "y":
                 sys.exit(0)
 
         if http_redirect_port == 80 and not check_local_port(ns.own_ip, 80):
             print_flush("  [!] Fake HTTP (port 80) not reachable.")
-            print_flush("      sudo python3 fake_server3.py")
+            print_flush("      sudo netshaper-fake-server")
             if safe_input("  Continue anyway? (y/n): ").lower() != "y":
                 sys.exit(0)
 

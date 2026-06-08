@@ -233,6 +233,49 @@ class NetShaperCleanupTests(unittest.TestCase):
             )
             self.assertFalse(os.path.exists(state_path))
 
+    def test_stale_cleanup_recaptures_current_snapshot_after_recovery(self):
+        ns = NetShaper.__new__(NetShaper)
+        ns.interface = "eth0"
+        ns.session_id = "NS-NEW"
+        ns.state_snapshot = mock.Mock()
+        snapshot = {
+            "session_id": "NS-OLD",
+            "interface": "eth0",
+            "ipv4_forwarding": 1,
+            "ipv6_forwarding": 1,
+            "route_localnet": 1,
+            "iptables_rules": "",
+            "ip6tables_rules": "",
+            "tc_configuration": "",
+        }
+        state = {
+            "session_id": "NS-OLD",
+            "interface": "eth0",
+            "targets": [],
+            "global_rules_applied": False,
+            "shaper_base_initialized": False,
+            "snapshot": snapshot,
+        }
+        recaptured = mock.Mock()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = os.path.join(tmp, "NS-OLD")
+            os.makedirs(state_dir)
+            state_path = os.path.join(state_dir, "state.json")
+            with open(state_path, "w", encoding="utf-8") as fh:
+                json.dump(state, fh)
+
+            with mock.patch("netshaper.core.orchestrator.config.STATE_DIR", tmp), \
+                 mock.patch("netshaper.core.orchestrator.print_flush"), \
+                 mock.patch("netshaper.core.orchestrator.StateSnapshotManager.restore",
+                            return_value=True), \
+                 mock.patch("netshaper.core.orchestrator.StateSnapshotManager.capture",
+                            return_value=recaptured) as capture_mock:
+                ns.load_state_and_cleanup()
+
+        capture_mock.assert_called_once_with("eth0", "NS-NEW")
+        self.assertIs(ns.state_snapshot, recaptured)
+
     def test_stale_cleanup_keeps_manifest_when_target_binary_missing(self):
         ns = NetShaper.__new__(NetShaper)
         snapshot = {
@@ -277,6 +320,19 @@ class NetShaperCleanupTests(unittest.TestCase):
                 ns.load_state_and_cleanup()
 
             self.assertTrue(os.path.exists(state_path))
+
+    def test_remove_state_file_removes_empty_session_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = os.path.join(tmp, "NS-TEST")
+            os.makedirs(state_dir)
+            state_path = os.path.join(state_dir, "state.json")
+            with open(state_path, "w", encoding="utf-8") as fh:
+                fh.write("{}")
+
+            NetShaper._remove_state_file(state_path)
+
+            self.assertFalse(os.path.exists(state_path))
+            self.assertFalse(os.path.exists(state_dir))
 
 
 if __name__ == "__main__":
