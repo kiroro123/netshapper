@@ -1,11 +1,40 @@
+import json
+import os
+import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest import mock
 
+from netshaper.core.orchestrator import NetShaper
 from netshaper.core.state_manager import NetworkStateSnapshot, StateSnapshotManager
 
 
 class StateSnapshotTests(unittest.TestCase):
+    def test_save_state_writes_manifest_for_cleanup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ns = NetShaper.__new__(NetShaper)
+            ns.interface = "eth0"
+            ns.gw = "192.0.2.1"
+            ns.own_ip = "192.0.2.10"
+            ns.session_id = "NS-TEST"
+            ns.sessions = {
+                "192.0.2.20": SimpleNamespace(
+                    target=SimpleNamespace(ip="192.0.2.20"),
+                    dns_on=False,
+                    limit=None,
+                )
+            }
+
+            with mock.patch("netshaper.core.orchestrator.config.STATE_DIR", tmp):
+                ns.save_state()
+
+            state_path = os.path.join(tmp, ns.session_id, "state.json")
+            self.assertTrue(os.path.exists(state_path))
+            with open(state_path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            self.assertEqual(data["session_id"], "NS-TEST")
+            self.assertEqual(data["interface"], "eth0")
+
     @mock.patch("netshaper.core.state_manager.subprocess.run")
     def test_capture_records_original_forwarding_values(self, run_mock):
         run_mock.side_effect = [

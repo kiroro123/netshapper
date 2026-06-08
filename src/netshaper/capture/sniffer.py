@@ -10,12 +10,46 @@ import threading
 import time
 from typing import List, Optional
 
-from scapy.all import IP, AsyncSniffer, wrpcap
-from scapy.utils import RawPcapWriter
-
 from netshaper.utils import print_flush
 
 log = logging.getLogger("netshaper")
+
+IP = None
+IPv6 = None
+AsyncSniffer = None
+RawPcapWriter = None
+_wrpcap = None
+
+
+def _ensure_packet_layers() -> None:
+    global IP, IPv6
+    if IP is None or IPv6 is None:
+        from scapy.all import IP as scapy_IP, IPv6 as scapy_IPv6
+
+        if IP is None:
+            IP = scapy_IP
+        if IPv6 is None:
+            IPv6 = scapy_IPv6
+
+
+def _ensure_capture_tools() -> None:
+    global AsyncSniffer, RawPcapWriter, _wrpcap
+    if AsyncSniffer is None or RawPcapWriter is None or _wrpcap is None:
+        from scapy.all import AsyncSniffer as scapy_AsyncSniffer
+        from scapy.utils import RawPcapWriter as scapy_RawPcapWriter
+        from scapy.utils import wrpcap as scapy_wrpcap
+
+        if AsyncSniffer is None:
+            AsyncSniffer = scapy_AsyncSniffer
+        if RawPcapWriter is None:
+            RawPcapWriter = scapy_RawPcapWriter
+        if _wrpcap is None:
+            _wrpcap = scapy_wrpcap
+
+
+def wrpcap(*args, **kwargs):
+    _ensure_capture_tools()
+    return _wrpcap(*args, **kwargs)
 
 
 class PacketSniffer:
@@ -38,13 +72,16 @@ class PacketSniffer:
         )
 
     def _packet_callback(self, pkt) -> None:
-        if IP in pkt:
-            src, dst = pkt[IP].src, pkt[IP].dst
+        _ensure_packet_layers()
+        ip_layer = pkt[IP] if pkt.haslayer(IP) else pkt[IPv6] if pkt.haslayer(IPv6) else None
+        if ip_layer is not None:
+            src, dst = ip_layer.src, ip_layer.dst
             if (self.target_ips
                     and src not in self.target_ips
                     and dst not in self.target_ips):
                 return
-            print_flush(f"[Sniff] {src} → {dst}  {pkt.sprintf('%IP.proto%')}")
+            proto = pkt.sprintf('%IP.proto%') if pkt.haslayer(IP) else pkt.sprintf('%IPv6.nh%')
+            print_flush(f"[Sniff] {src} → {dst}  {proto}")
         if self._queue is not None:
             try:
                 self._queue.put_nowait(pkt)
@@ -54,6 +91,7 @@ class PacketSniffer:
     def start(self) -> None:
         log.info("Packet sniffer started" +
                  (" (saving to .pcap)" if self.save_pcap else ""))
+        _ensure_capture_tools()
         self._sniffer = AsyncSniffer(
             iface=self.interface,
             prn=self._packet_callback,
@@ -110,12 +148,16 @@ class RollingPacketSniffer:
         return f"{self.base_filename}_{ts}_{self.file_index}.pcap"
 
     def _packet_callback(self, pkt) -> None:
-        if IP in pkt:
-            src, dst = pkt[IP].src, pkt[IP].dst
+        _ensure_packet_layers()
+        ip_layer = pkt[IP] if pkt.haslayer(IP) else pkt[IPv6] if pkt.haslayer(IPv6) else None
+        if ip_layer is not None:
+            src, dst = ip_layer.src, ip_layer.dst
             if (self.target_ips
                     and src not in self.target_ips
                     and dst not in self.target_ips):
                 return
+            proto = pkt.sprintf('%IP.proto%') if pkt.haslayer(IP) else pkt.sprintf('%IPv6.nh%')
+            print_flush(f"[Sniff] {src} → {dst}  {proto}")
         try:
             self._queue.put_nowait(pkt)
         except queue.Full:
@@ -124,6 +166,7 @@ class RollingPacketSniffer:
     def _consumer_flush_loop(self) -> None:
         active_pcap = self._get_filename()
         try:
+            _ensure_capture_tools()
             writer = RawPcapWriter(active_pcap, append=True, sync=True)
         except Exception as e:
             log.error(f"[RollingSniffer] Initial file open failed: {e}")
@@ -166,6 +209,7 @@ class RollingPacketSniffer:
                 log.error(f"[RollingSniffer] Final close failed: {e}")
 
     def start(self) -> None:
+        _ensure_capture_tools()
         self._sniffer = AsyncSniffer(
             iface=self.interface,
             prn=self._packet_callback,

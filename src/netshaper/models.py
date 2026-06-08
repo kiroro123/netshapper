@@ -23,7 +23,7 @@ class MarkIDPool:
     Marks are allocated in *pairs*: base and base+10.
     The step parameter must therefore be >= 20 to prevent pair-collision
     between adjacent allocations (e.g. target A gets base=10, target B
-    gets base=20; A's pair mark is 20 which would alias B's base — so
+    gets base=30; A's pair mark is 20 which would not alias B's base — so
     step=20 is the minimum safe value).
 
     acquire() is idempotent for an already-registered IP.

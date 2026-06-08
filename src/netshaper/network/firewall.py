@@ -65,7 +65,6 @@ class FirewallManager:
                 silent=True)
 
     def add_redirect_rules(self, dns_spoof: bool = False,
-                           captive_portal: bool = False,
                            http_redirect_port: Optional[int] = None) -> None:
         for b in self._binaries:
             if dns_spoof:

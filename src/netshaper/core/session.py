@@ -62,7 +62,6 @@ class TargetSession:
         if dns_spoof or captive_portal or http_redirect_port:
             self.firewall.add_redirect_rules(
                 dns_spoof=dns_spoof,
-                captive_portal=captive_portal,
                 http_redirect_port=http_redirect_port)
             self.dns_on = dns_spoof
         if limit is not None:

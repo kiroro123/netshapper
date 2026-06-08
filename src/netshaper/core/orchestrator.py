@@ -7,6 +7,7 @@ sniffer management, and the bandwidth monitor thread.
 """
 from __future__ import annotations
 
+import glob
 import json
 import logging
 import os
@@ -279,6 +280,7 @@ class NetShaper:
     # ── State persistence ─────────────────────────────────────────────────────
     def save_state(self) -> None:
         data = {
+            "session_id": self.session_id,
             "interface": self.interface,
             "targets":   [{"ip": s.target.ip, "dns": s.dns_on,
                            "limit": s.limit}
@@ -298,23 +300,23 @@ class NetShaper:
             log.error(f"State save failed: {e}")
 
     def load_state_and_cleanup(self) -> None:
-        if not os.path.exists(config.STATE_FILE):
+        if not os.path.isdir(config.STATE_DIR):
             return
         try:
-            with open(config.STATE_FILE) as f:
-                data = json.load(f)
-            iface = data.get("interface")
-            if iface:
+            for state_path in sorted(glob.glob(os.path.join(config.STATE_DIR, "*", "state.json"))):
+                with open(state_path, encoding="utf-8") as f:
+                    data = json.load(f)
+                iface = data.get("interface")
+                if not iface:
+                    continue
                 print_flush(f"  [!] Stale session on {iface} — cleaning up…")
                 for binary in ["iptables", "ip6tables"]:
                     if not shutil.which(binary):
                         continue
                     for table in ["nat", "mangle"]:
-                        # BUG FIX: grep "Chain NS-" header lines instead of
-                        # tokenising every line (original could match rule targets)
                         result = subprocess.run(
                             [binary, "-t", table, "-n", "-L"],
-                            capture_output=True, text=True)
+                            capture_output=True, text=True, check=False)
                         for line in result.stdout.splitlines():
                             if line.startswith("Chain NS-"):
                                 chain_name = line.split()[1]
@@ -330,7 +332,11 @@ class NetShaper:
                 SubprocessRunner.run(
                     ["sysctl", "-w", "net.ipv4.ip_forward=0"], silent=True)
                 log.info("Stale rules cleaned.")
-            os.remove(config.STATE_FILE)
+                os.remove(state_path)
+                try:
+                    os.rmdir(os.path.dirname(state_path))
+                except OSError:
+                    pass
         except Exception:
             log.debug("No valid state file to recover.")
 

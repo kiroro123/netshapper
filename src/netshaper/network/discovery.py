@@ -11,12 +11,48 @@ from ipaddress import IPv4Network
 from typing import Dict, List, Optional
 
 import psutil
-from scapy.all import ARP, Ether, sniff, srp
 
 from netshaper.models import Device
 from netshaper.utils import print_flush
 
 log = logging.getLogger("netshaper")
+
+ARP = None
+Ether = None
+_sniff = None
+_srp = None
+
+
+def _ensure_scapy_layers() -> None:
+    global ARP, Ether
+    if ARP is None or Ether is None:
+        from scapy.all import ARP as scapy_ARP, Ether as scapy_Ether
+
+        if ARP is None:
+            ARP = scapy_ARP
+        if Ether is None:
+            Ether = scapy_Ether
+
+
+def _ensure_scapy_io() -> None:
+    global _sniff, _srp
+    if _sniff is None or _srp is None:
+        from scapy.all import sniff as scapy_sniff, srp as scapy_srp
+
+        if _sniff is None:
+            _sniff = scapy_sniff
+        if _srp is None:
+            _srp = scapy_srp
+
+
+def sniff(*args, **kwargs):
+    _ensure_scapy_io()
+    return _sniff(*args, **kwargs)
+
+
+def srp(*args, **kwargs):
+    _ensure_scapy_io()
+    return _srp(*args, **kwargs)
 
 
 class NetworkDiscovery:
@@ -31,6 +67,7 @@ class NetworkDiscovery:
             if a.family == psutil.AF_LINK:
                 return a.address.lower()
         try:
+            _ensure_scapy_layers()
             return Ether().src.lower()
         except Exception:
             return ""
@@ -85,6 +122,7 @@ class NetworkDiscovery:
 
     def resolve_mac(self, ip: str) -> Optional[str]:
         try:
+            _ensure_scapy_layers()
             ans, _ = srp(
                 Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=ip),
                 iface=self.interface, timeout=3, verbose=0)
@@ -103,6 +141,7 @@ class NetworkDiscovery:
         which injected ghost entries (ff:ff:ff:ff:ff:ff) for every probed IP.
         Now only the *source* IP/MAC is registered.
         """
+        _ensure_scapy_layers()
         if ARP not in pkt:
             return
         src_ip  = pkt[ARP].psrc
@@ -119,6 +158,7 @@ class NetworkDiscovery:
     def arp_sweep(self, subnet: str, gateway_ip: str) -> List[Device]:
         log.info(f"ARP sweep on {subnet}")
         try:
+            _ensure_scapy_layers()
             net     = IPv4Network(subnet, strict=False)
             targets = [str(ip) for ip in net.hosts()
                        if str(ip) != gateway_ip]

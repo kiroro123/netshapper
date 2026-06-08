@@ -44,7 +44,25 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Print commands without applying system changes",
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--targets",
+        nargs="+",
+        help="Skip discovery and use these IPs directly (comma-separated values allowed).",
+    )
+    parser.add_argument(
+        "--limit",
+        type=float,
+        help="Set bandwidth throttling in Mbps without using the interactive prompt.",
+    )
+    args = parser.parse_args()
+    if args.targets:
+        args.targets = [
+            item.strip()
+            for token in args.targets
+            for item in token.split(",")
+            if item.strip()
+        ]
+    return args
 
 
 def choose_interface(requested: Optional[str] = None) -> str:
@@ -171,6 +189,7 @@ def main() -> None:
         print(VERSION)
         return
 
+    config.configure_logging()
     config.DRY_RUN = args.dry_run
     if config.DRY_RUN:
         print_flush("[*] DRY RUN MODE - no system changes.\n")
@@ -192,8 +211,15 @@ def main() -> None:
     if ns.gw_ipv6:
         print_flush(f"  IPv6 GW : {ns.gw_ipv6}")
 
-    devices = ns.discover()
-    targets = pick_targets_ui(devices)
+    if args.targets:
+        raw_targets = []
+        for token in args.targets:
+            raw_targets.extend(part.strip() for part in token.split(",") if part.strip())
+        targets = raw_targets
+        print_flush(f"  Targets from --targets: {', '.join(targets)}")
+    else:
+        devices = ns.discover()
+        targets = [dev.ip for dev in pick_targets_ui(devices)]
 
     print_flush("\n  -- Features (enter numbers e.g. 1 3 5) ------------------")
     print_flush("  [1] ARP spoofing (core MITM)")
@@ -236,7 +262,7 @@ def main() -> None:
         print_flush("  [!] HTTP redirect captures plain HTTP only.")
         print_flush("      For HTTPS, install the mitmproxy CA on the target device.")
 
-    limit = pick_limit_ui() if throttle_on else None
+    limit = args.limit if throttle_on and args.limit is not None else pick_limit_ui() if throttle_on else None
     save_pcap = False
     rolling = False
     if sniff_on:
@@ -271,7 +297,7 @@ def main() -> None:
                 sys.exit(0)
 
     print_flush(f"\n{'=' * 58}")
-    print_flush(f"  Targets       : {', '.join(t.ip for t in targets)}")
+    print_flush(f"  Targets       : {', '.join(targets)}")
     print_flush(f"  ARP spoof     : {'Yes' if arp_on else 'No'}")
     print_flush(f"  DNS spoof     : {'Yes' if dns_spoof_on else 'No'}")
     print_flush(f"  Captive portal: {'Yes' if captive_portal else 'No'}")

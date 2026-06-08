@@ -5,9 +5,14 @@ from __future__ import annotations
 import logging
 import subprocess
 
-from scapy.all import sendp
-
 log = logging.getLogger("netshaper")
+
+
+def sendp(packet, iface: str, verbose: bool = False) -> None:
+    """Lazy Scapy wrapper so importing this module does not touch raw sockets."""
+    from scapy.all import sendp as scapy_sendp
+
+    scapy_sendp(packet, iface=iface, verbose=verbose)
 
 
 class CommandBackend:

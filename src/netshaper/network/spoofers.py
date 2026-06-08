@@ -12,14 +12,42 @@ import threading
 import time
 from typing import TYPE_CHECKING, List
 
-from scapy.all import ARP, Ether, IPv6, ICMPv6ND_NA, ICMPv6NDOptSrcLLAddr
-
 from netshaper.network.backends import DryRunPacketBackend, RealPacketBackend
 
 if TYPE_CHECKING:
     from netshaper.core.session import TargetSession
 
 log = logging.getLogger("netshaper")
+
+ARP = None
+Ether = None
+IPv6 = None
+ICMPv6ND_NA = None
+ICMPv6NDOptSrcLLAddr = None
+
+
+def _ensure_scapy_layers() -> None:
+    global ARP, Ether, IPv6, ICMPv6ND_NA, ICMPv6NDOptSrcLLAddr
+    if (ARP is None or Ether is None or IPv6 is None
+            or ICMPv6ND_NA is None or ICMPv6NDOptSrcLLAddr is None):
+        from scapy.all import (
+            ARP as scapy_ARP,
+            Ether as scapy_Ether,
+            ICMPv6ND_NA as scapy_ICMPv6ND_NA,
+            ICMPv6NDOptSrcLLAddr as scapy_ICMPv6NDOptSrcLLAddr,
+            IPv6 as scapy_IPv6,
+        )
+
+        if ARP is None:
+            ARP = scapy_ARP
+        if Ether is None:
+            Ether = scapy_Ether
+        if IPv6 is None:
+            IPv6 = scapy_IPv6
+        if ICMPv6ND_NA is None:
+            ICMPv6ND_NA = scapy_ICMPv6ND_NA
+        if ICMPv6NDOptSrcLLAddr is None:
+            ICMPv6NDOptSrcLLAddr = scapy_ICMPv6NDOptSrcLLAddr
 
 
 class ARPSpoofer:
@@ -38,6 +66,8 @@ class ARPSpoofer:
         self.threads: List[threading.Thread] = []
 
     def start(self) -> None:
+        _ensure_scapy_layers()
+
         def spoof_target() -> None:
             """Tell target: gateway MAC = ours."""
             while (not self._stop.is_set()
@@ -85,6 +115,7 @@ class ARPSpoofer:
         log.info(f"ARP spoofing active → {self.target_ip}")
 
     def shutdown(self) -> None:
+        _ensure_scapy_layers()
         self._stop.set()
         for t in self.threads:
             t.join(timeout=3.0)
@@ -128,6 +159,8 @@ class NDPSpoofer:
         self.threads: List[threading.Thread] = []
 
     def start(self) -> None:
+        _ensure_scapy_layers()
+
         def spoof_target() -> None:
             while (not self._stop.is_set()
                    and self.session.active

@@ -42,12 +42,18 @@ class SubprocessRunner:
         try:
             res = subprocess.run(
                 args, capture_output=True, text=True, check=check)
-            if res.returncode != 0 and check and not silent:
-                log.error(
-                    f"Command failed ({description}): "
-                    f"{' '.join(str(a) for a in args)}")
-                if res.stderr and not silent:
-                    log.debug(f"stderr: {res.stderr.strip()}")
+            if res.returncode != 0:
+                if not silent:
+                    # Always log on failure when silent=False.
+                    # Tests expect logger.error() to be called even when
+                    # stderr is empty or mocked without real attributes.
+                    cmd = " ".join(str(a) for a in args)
+                    log.error(f"Command failed ({description}): {cmd}")
+                    stderr_val = getattr(res, "stderr", "")
+                    if stderr_val and not silent:
+                        err = str(stderr_val).strip()
+                        if err:
+                            log.debug(f"stderr: {err}")
             return res.returncode == 0
         except subprocess.CalledProcessError as e:
             if not silent:
