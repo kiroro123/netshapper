@@ -253,6 +253,8 @@ class NetShaperCleanupTests(unittest.TestCase):
 
         with mock.patch("netshaper.core.orchestrator.shutil.which",
                         return_value="/sbin/iptables"), \
+             mock.patch("netshaper.core.orchestrator.subprocess.run",
+                        return_value=mock.Mock(returncode=0)), \
              mock.patch("netshaper.core.orchestrator.SubprocessRunner.run",
                         return_value=True) as runner_mock:
             result = ns._remove_global_rules()
@@ -269,6 +271,54 @@ class NetShaperCleanupTests(unittest.TestCase):
              "-i", "eth0", "-o", "eth0", "-j", "ACCEPT"],
             delete_commands,
         )
+        self.assertFalse(ns._global_rules_applied)
+        self.assertEqual(ns._global_firewall_binaries_applied, [])
+
+    def test_remove_global_rules_skips_firewall_when_never_applied(self):
+        ns = NetShaper.__new__(NetShaper)
+        ns.interface = "eth0"
+        ns.session_id = "NS-TEST"
+        ns.state_snapshot = mock.Mock(
+            ipv4_forwarding=None,
+            ipv6_forwarding=None,
+            route_localnet=None,
+        )
+        ns._global_rules_applied = False
+        ns._global_firewall_binaries_applied = []
+
+        with mock.patch("netshaper.core.orchestrator.shutil.which",
+                        return_value="/sbin/iptables"), \
+             mock.patch("netshaper.core.orchestrator.subprocess.run") as run_mock, \
+             mock.patch("netshaper.core.orchestrator.SubprocessRunner.run"
+                        ) as runner_mock:
+            result = ns._remove_global_rules()
+
+        self.assertTrue(result)
+        run_mock.assert_not_called()
+        runner_mock.assert_not_called()
+
+    def test_remove_global_rules_treats_absent_commented_rules_as_clean(self):
+        ns = NetShaper.__new__(NetShaper)
+        ns.interface = "eth0"
+        ns.session_id = "NS-TEST"
+        ns.state_snapshot = mock.Mock(
+            ipv4_forwarding=None,
+            ipv6_forwarding=None,
+            route_localnet=None,
+        )
+        ns._global_rules_applied = True
+        ns._global_firewall_binaries_applied = ["iptables"]
+
+        with mock.patch("netshaper.core.orchestrator.shutil.which",
+                        return_value="/sbin/iptables"), \
+             mock.patch("netshaper.core.orchestrator.subprocess.run",
+                        return_value=mock.Mock(returncode=1)), \
+             mock.patch("netshaper.core.orchestrator.SubprocessRunner.run"
+                        ) as runner_mock:
+            result = ns._remove_global_rules()
+
+        self.assertTrue(result)
+        runner_mock.assert_not_called()
         self.assertFalse(ns._global_rules_applied)
         self.assertEqual(ns._global_firewall_binaries_applied, [])
 
@@ -375,6 +425,65 @@ class NetShaperCleanupTests(unittest.TestCase):
                 delete_commands,
             )
             self.assertFalse(os.path.exists(state_path))
+
+    def test_stale_cleanup_uses_target_input_rule_comment(self):
+        ns = NetShaper.__new__(NetShaper)
+        snapshot = {
+            "session_id": "NS-OLD",
+            "interface": "eth0",
+            "ipv4_forwarding": None,
+            "ipv6_forwarding": None,
+            "route_localnet": None,
+            "iptables_rules": "",
+            "ip6tables_rules": "",
+            "tc_configuration": "",
+        }
+        comment = "netshaper:NS-OLD:192.0.2.10"
+        state = {
+            "session_id": "NS-OLD",
+            "interface": "eth0",
+            "targets": [{
+                "ip": "192.0.2.10",
+                "dns": True,
+                "http_redirect_port": 8088,
+                "firewall_rule_comment": comment,
+                "mangle_chain": "NS-MNG-TEST",
+                "nat_chain": "NS-NAT-TEST",
+            }],
+            "global_rules_applied": False,
+            "shaper_base_initialized": False,
+            "snapshot": snapshot,
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = os.path.join(tmp, "NS-OLD")
+            os.makedirs(state_dir)
+            state_path = os.path.join(state_dir, "state.json")
+            with open(state_path, "w", encoding="utf-8") as fh:
+                json.dump(state, fh)
+
+            with mock.patch("netshaper.core.orchestrator.config.STATE_DIR", tmp), \
+                 mock.patch("netshaper.core.orchestrator.print_flush"), \
+                 mock.patch("netshaper.core.orchestrator.shutil.which",
+                            return_value="/sbin/iptables"), \
+                 mock.patch("netshaper.core.orchestrator.subprocess.run",
+                            return_value=mock.Mock(returncode=0, stdout="")), \
+                 mock.patch("netshaper.core.orchestrator.SubprocessRunner.run",
+                            return_value=True) as runner_mock, \
+                 mock.patch("netshaper.core.orchestrator.StateSnapshotManager.restore",
+                            return_value=True):
+                result = ns.load_state_and_cleanup()
+
+            input_deletes = [
+                call.args[0]
+                for call in runner_mock.call_args_list
+                if call.args[0][1:3] == ["-D", "INPUT"]
+            ]
+            self.assertTrue(result)
+            self.assertEqual(len(input_deletes), 3)
+            for command in input_deletes:
+                self.assertIn("--comment", command)
+                self.assertIn(comment, command)
 
     def test_stale_cleanup_treats_absent_recorded_resources_as_clean(self):
         ns = NetShaper.__new__(NetShaper)

@@ -100,6 +100,29 @@ class TargetSessionCleanupTests(unittest.TestCase):
         self.assertIsNone(session.limit)
         self.assertEqual(session.shaper.cleanup_target.call_count, 2)
 
+    def test_failed_firewall_setup_remains_attached_for_recovery(self):
+        session = TargetSession.__new__(TargetSession)
+        session.target = SimpleNamespace(ip="192.0.2.10")
+        session.interface = "eth0"
+        session.session_id = "NS-TEST"
+        session.firewall = None
+        session.shaper = mock.Mock()
+
+        with mock.patch("netshaper.core.session.FirewallManager") as fw_cls:
+            firewall = fw_cls.return_value
+            firewall.setup.side_effect = RuntimeError("setup failed")
+
+            with self.assertRaisesRegex(RuntimeError, "setup failed"):
+                session.setup()
+
+        fw_cls.assert_called_once_with(
+            "192.0.2.10",
+            "eth0",
+            session_id="NS-TEST",
+            auto_setup=False,
+        )
+        self.assertIs(session.firewall, firewall)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

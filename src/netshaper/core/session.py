@@ -61,11 +61,14 @@ class TargetSession:
               limit: Optional[float] = None,
               mark_base: int = 10) -> None:
         session_id = getattr(self, "session_id", None)
-        self.firewall = FirewallManager(
+        firewall = FirewallManager(
             self.target.ip,
             self.interface,
             session_id=session_id,
+            auto_setup=False,
         )
+        self.firewall = firewall
+        firewall.setup()
         if dns_spoof or captive_portal or http_redirect_port:
             if not self.firewall.add_redirect_rules(
                     dns_spoof=dns_spoof,

@@ -215,6 +215,41 @@ class NetShaper:
             },
         ]
 
+    @staticmethod
+    def _rule_present(command: List[str]) -> bool:
+        try:
+            return subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                check=False,
+            ).returncode == 0
+        except FileNotFoundError:
+            return False
+
+    @staticmethod
+    def _target_input_rule_spec(
+            binary: str,
+            iface: str,
+            ip: str,
+            proto: str,
+            port: int,
+            comment: Optional[str]) -> dict:
+        comment_args = (
+            ["-m", "comment", "--comment", comment]
+            if comment else []
+        )
+        base = [
+            "-i", iface, "-s", ip,
+            "-p", proto, "--dport", str(port),
+            *comment_args,
+            "-j", "ACCEPT",
+        ]
+        return {
+            "delete": [binary, "-D", "INPUT", *base],
+            "check": [binary, "-C", "INPUT", *base],
+        }
+
     def _apply_global_rules(self) -> None:
         if self._global_rules_applied:
             return
@@ -267,11 +302,9 @@ class NetShaper:
 
     def _remove_global_rules(self) -> bool:
         ok = self._restore_original_forwarding()
-        binaries = (
-            self._global_firewall_binaries_applied
-            if self._global_firewall_binaries_applied
-            else ["iptables", "ip6tables"]
-        )
+        binaries = list(self._global_firewall_binaries_applied)
+        if not self._global_rules_applied and not binaries:
+            return ok
         for binary in binaries:
             if not shutil.which(binary):
                 if binary in self._global_firewall_binaries_applied:
@@ -283,6 +316,8 @@ class NetShaper:
                 continue
             for spec in self._global_firewall_rule_specs(
                     binary, self.interface, self._global_rule_comment()):
+                if not self._rule_present(spec["check"]):
+                    continue
                 ok = SubprocessRunner.run(
                     spec["delete"], check=False, silent=True) and ok
         if ok:
@@ -602,14 +637,34 @@ class NetShaper:
             tc_configuration=snapshot.get("tc_configuration", ""),
         )
 
+    @staticmethod
+    def _session_dns_recorded(session: TargetSession) -> bool:
+        firewall = session.firewall
+        return (
+            session.dns_on
+            or bool(
+                getattr(firewall, "_dns_input_rules", set())
+                if firewall else False
+            )
+            or bool(
+                getattr(firewall, "_dns_added", False)
+                if firewall else False
+            )
+        )
+
     def save_state(self) -> bool:
         data = {
             "session_id": self.session_id,
             "interface": self.interface,
-            "targets":   [{"ip": s.target.ip, "dns": s.dns_on,
+            "targets":   [{"ip": s.target.ip,
+                           "dns": self._session_dns_recorded(s),
                            "limit": s.limit,
                            "http_redirect_port": (
                                getattr(s.firewall, "_http_redirect_port", None)
+                               if s.firewall else None
+                           ),
+                           "firewall_rule_comment": (
+                               getattr(s.firewall, "_rule_comment", None)
                                if s.firewall else None
                            ),
                            "mangle_chain": (
@@ -762,30 +817,26 @@ class NetShaper:
                         if not require_binary(binary, f"target firewall {ip}"):
                             continue
                         if target.get("dns"):
+                            rule_comment = target.get("firewall_rule_comment")
                             for proto in ["udp", "tcp"]:
+                                rule_spec = self._target_input_rule_spec(
+                                    binary, iface, ip, proto, 53,
+                                    rule_comment)
                                 run_recovery_if_present(
                                     f"{binary} DNS input {ip}/{proto}",
-                                    [binary, "-D", "INPUT",
-                                     "-i", iface, "-s", ip,
-                                     "-p", proto, "--dport", "53",
-                                     "-j", "ACCEPT"],
-                                    [binary, "-C", "INPUT",
-                                     "-i", iface, "-s", ip,
-                                     "-p", proto, "--dport", "53",
-                                     "-j", "ACCEPT"],
+                                    rule_spec["delete"],
+                                    rule_spec["check"],
                                 )
                         http_port = target.get("http_redirect_port")
                         if http_port:
+                            rule_comment = target.get("firewall_rule_comment")
+                            rule_spec = self._target_input_rule_spec(
+                                binary, iface, ip, "tcp", int(http_port),
+                                rule_comment)
                             run_recovery_if_present(
                                 f"{binary} HTTP input {ip}",
-                                [binary, "-D", "INPUT",
-                                 "-i", iface, "-s", ip,
-                                 "-p", "tcp", "--dport", str(http_port),
-                                 "-j", "ACCEPT"],
-                                [binary, "-C", "INPUT",
-                                 "-i", iface, "-s", ip,
-                                 "-p", "tcp", "--dport", str(http_port),
-                                 "-j", "ACCEPT"],
+                                rule_spec["delete"],
+                                rule_spec["check"],
                             )
                         for table, hook, chain_name in chain_specs:
                             run_recovery_if_present(

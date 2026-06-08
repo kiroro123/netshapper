@@ -15,6 +15,9 @@ class TrafficShaper:
         self.interface         = interface
         self._base_initialized = False
         self._active_marks: Set[int] = set()
+        self._target_filters: Set[Tuple[int, str]] = set()
+        self._target_classes: Set[int] = set()
+        self._tracked_mark_bases: Set[int] = set()
 
     def _root_qdisc(self) -> str:
         try:
@@ -63,6 +66,7 @@ class TrafficShaper:
                     message += "; rollback incomplete"
                 raise RuntimeError(message)
             created_classes.append(mark)
+            self._target_classes.add(mark)
             for proto in ["ip", "ipv6"]:
                 if not SubprocessRunner.run(
                     ["tc", "filter", "add", "dev", self.interface,
@@ -76,6 +80,8 @@ class TrafficShaper:
                         message += "; rollback incomplete"
                     raise RuntimeError(message)
                 created_filters.append((mark, proto))
+                self._target_filters.add((mark, proto))
+        self._tracked_mark_bases.add(mark_base)
         self._active_marks.add(mark_base)
         log.info(
             f"Shaping {target_ip}: {mbps} Mbps "
@@ -96,33 +102,70 @@ class TrafficShaper:
             classes: List[int]) -> bool:
         ok = True
         for mark, proto in reversed(filters):
-            ok = SubprocessRunner.run(
-                ["tc", "filter", "del", "dev", self.interface,
-                 "parent", "1:", "protocol", proto,
-                 "handle", str(mark), "fw"],
-                check=False, silent=True) and ok
+            if self._delete_filter(mark, proto):
+                self._target_filters.discard((mark, proto))
+            else:
+                ok = False
         for mark in reversed(classes):
-            ok = SubprocessRunner.run(
-                ["tc", "class", "del", "dev", self.interface,
-                 "classid", f"1:{mark}"],
-                check=False, silent=True) and ok
+            if self._delete_class(mark):
+                self._target_classes.discard(mark)
+            else:
+                ok = False
         return ok
+
+    def _delete_filter(self, mark: int, proto: str) -> bool:
+        return SubprocessRunner.run(
+            ["tc", "filter", "del", "dev", self.interface,
+             "parent", "1:", "protocol", proto,
+             "handle", str(mark), "fw"],
+            check=False, silent=True)
+
+    def _delete_class(self, mark: int) -> bool:
+        return SubprocessRunner.run(
+            ["tc", "class", "del", "dev", self.interface,
+             "classid", f"1:{mark}"],
+            check=False, silent=True)
 
     def cleanup_target(self, mark_base: int) -> bool:
         ok = True
-        for mark in [mark_base, mark_base + 10]:
-            for proto in ["ip", "ipv6"]:
-                ok = SubprocessRunner.run(
-                    ["tc", "filter", "del", "dev", self.interface,
-                     "parent", "1:", "protocol", proto,
-                     "handle", str(mark), "fw"],
-                    check=False, silent=True) and ok
-            ok = SubprocessRunner.run(
-                ["tc", "class", "del", "dev", self.interface,
-                 "classid", f"1:{mark}"],
-                check=False, silent=True) and ok
-        if ok:
+        expected_filters = {
+            (mark, proto)
+            for mark in [mark_base, mark_base + 10]
+            for proto in ["ip", "ipv6"]
+        }
+        expected_classes = {mark_base, mark_base + 10}
+        if not hasattr(self, "_target_filters"):
+            self._target_filters = set()
+        if not hasattr(self, "_target_classes"):
+            self._target_classes = set()
+        if not hasattr(self, "_tracked_mark_bases"):
+            self._tracked_mark_bases = set()
+        if (
+                mark_base in self._active_marks
+                and mark_base not in self._tracked_mark_bases
+                and not self._target_filters.intersection(expected_filters)
+                and not self._target_classes.intersection(expected_classes)):
+            self._target_filters.update(expected_filters)
+            self._target_classes.update(expected_classes)
+            self._tracked_mark_bases.add(mark_base)
+        for mark, proto in sorted(
+                self._target_filters.intersection(expected_filters)):
+            if self._delete_filter(mark, proto):
+                self._target_filters.discard((mark, proto))
+            else:
+                ok = False
+        for mark in sorted(self._target_classes.intersection(expected_classes)):
+            if self._delete_class(mark):
+                self._target_classes.discard(mark)
+            else:
+                ok = False
+        remaining = (
+            self._target_filters.intersection(expected_filters)
+            or self._target_classes.intersection(expected_classes)
+        )
+        if ok and not remaining:
             self._active_marks.discard(mark_base)
+            self._tracked_mark_bases.discard(mark_base)
         return ok
 
     def cleanup(self) -> bool:
@@ -134,4 +177,7 @@ class TrafficShaper:
         if ok:
             self._base_initialized = False
             self._active_marks.clear()
+            self._target_filters.clear()
+            self._target_classes.clear()
+            self._tracked_mark_bases.clear()
         return ok

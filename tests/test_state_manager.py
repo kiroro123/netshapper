@@ -35,6 +35,9 @@ class StateSnapshotTests(unittest.TestCase):
                     limit=None,
                     firewall=SimpleNamespace(
                         _http_redirect_port=None,
+                        _rule_comment="netshaper:NS-TEST:192.0.2.20",
+                        _dns_input_rules=set(),
+                        _dns_added=False,
                         MANGLE="NS-MNG-TEST",
                         NAT="NS-NAT-TEST",
                     ),
@@ -58,6 +61,10 @@ class StateSnapshotTests(unittest.TestCase):
             self.assertEqual(
                 data["targets"][0]["mangle_chain"], "NS-MNG-TEST")
             self.assertEqual(data["targets"][0]["nat_chain"], "NS-NAT-TEST")
+            self.assertEqual(
+                data["targets"][0]["firewall_rule_comment"],
+                "netshaper:NS-TEST:192.0.2.20",
+            )
 
     def test_save_state_records_global_rule_comment(self):
         with tempfile.TemporaryDirectory() as tmp:

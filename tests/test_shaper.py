@@ -179,6 +179,31 @@ class TrafficShaperTests(unittest.TestCase):
         self.assertFalse(result)
         self.assertIn(10, shaper._active_marks)
 
+    @mock.patch("netshaper.network.shaper.SubprocessRunner.run")
+    def test_partial_cleanup_target_retries_only_remaining_resources(
+            self, runner_mock):
+        runner_mock.side_effect = [True, False, True, True, True, True, True]
+        shaper = TrafficShaper("eth0")
+        shaper._active_marks.add(10)
+        shaper._tracked_mark_bases.add(10)
+        shaper._target_filters = {
+            (10, "ip"),
+            (10, "ipv6"),
+            (20, "ip"),
+            (20, "ipv6"),
+        }
+        shaper._target_classes = {10, 20}
+
+        first = shaper.cleanup_target(10)
+        second = shaper.cleanup_target(10)
+
+        self.assertFalse(first)
+        self.assertTrue(second)
+        self.assertNotIn(10, shaper._active_marks)
+        self.assertEqual(shaper._target_filters, set())
+        self.assertEqual(shaper._target_classes, set())
+        self.assertEqual(runner_mock.call_count, 7)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
