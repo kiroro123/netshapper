@@ -1,9 +1,13 @@
 """
 NetShaper — network discovery: ARP sweep + passive sniff + hostname resolution.
 """
+import glob
 import logging
+import os
+import re
 import socket
 import struct
+import subprocess
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -16,6 +20,14 @@ from netshaper.models import Device
 from netshaper.utils import print_flush
 
 log = logging.getLogger("netshaper")
+
+LEASE_FILE_PATTERNS = (
+    "/var/lib/misc/dnsmasq.leases",
+    "/var/lib/NetworkManager/dnsmasq-*.leases",
+    "/var/lib/libvirt/dnsmasq/*.leases",
+    "/var/lib/dhcp/dhclient*.leases",
+    "/var/lib/dhcp/dhcpd.leases",
+)
 
 ARP = None
 Ether = None
@@ -209,6 +221,233 @@ class NetworkDiscovery:
                       key=lambda d: [int(i) for i in d.ip.split(".")])
 
     # ── Hostname resolution ───────────────────────────────────────────────────
+    @staticmethod
+    def _clean_hostname(name: str, ip: str) -> str:
+        name = (name or "").strip().strip('"').strip("'").rstrip(".")
+        if not name or name == ip:
+            return ""
+        if name.lower() in {"*", "-", "(none)", "(unknown)"}:
+            return ""
+        if re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}", name):
+            return ""
+        return name.lower()
+
+    def _hostname_from_reverse_dns(self, ip: str) -> str:
+        name, _, _ = socket.gethostbyaddr(ip)
+        return self._clean_hostname(name, ip)
+
+    def _hostname_from_getnameinfo(self, ip: str) -> str:
+        name = socket.getnameinfo((ip, 0), socket.NI_NAMEREQD)[0]
+        return self._clean_hostname(name, ip)
+
+    def _hostname_from_hosts_file(self, ip: str) -> str:
+        try:
+            with open("/etc/hosts", encoding="utf-8") as fh:
+                for raw_line in fh:
+                    line = raw_line.split("#", 1)[0].strip()
+                    if not line:
+                        continue
+                    parts = line.split()
+                    if len(parts) < 2 or parts[0] != ip:
+                        continue
+                    for candidate in parts[1:]:
+                        name = self._clean_hostname(candidate, ip)
+                        if name:
+                            return name
+        except OSError:
+            pass
+        return ""
+
+    @staticmethod
+    def _strip_lease_value(value: str) -> str:
+        return value.strip().strip(";").strip('"').strip("'")
+
+    def _hostname_from_lease_files(self, ip: str) -> str:
+        for pattern in LEASE_FILE_PATTERNS:
+            for path in glob.glob(pattern):
+                name = self._hostname_from_lease_file(path, ip)
+                if name:
+                    return name
+        return ""
+
+    def _hostname_from_lease_file(self, path: str, ip: str) -> str:
+        try:
+            with open(path, encoding="utf-8", errors="ignore") as fh:
+                lease_ip = ""
+                lease_name = ""
+                for raw_line in fh:
+                    line = raw_line.strip()
+                    parts = line.split()
+
+                    # dnsmasq: expiry mac ip hostname client-id
+                    if len(parts) >= 4 and parts[2] == ip:
+                        name = self._clean_hostname(parts[3], ip)
+                        if name:
+                            return name
+
+                    # ISC dhclient/dhcpd lease blocks.
+                    if line.startswith("lease "):
+                        lease_ip = (
+                            self._strip_lease_value(parts[1])
+                            if len(parts) > 1 else ""
+                        )
+                        if lease_ip == "{":
+                            lease_ip = ""
+                        lease_name = ""
+                    elif line.startswith("fixed-address "):
+                        lease_ip = self._strip_lease_value(
+                            line.split(None, 1)[1])
+                    elif line.startswith("option host-name "):
+                        lease_name = self._strip_lease_value(
+                            line.split(None, 2)[2])
+                    elif line.startswith("}") and lease_ip == ip:
+                        name = self._clean_hostname(lease_name, ip)
+                        if name:
+                            return name
+        except OSError:
+            pass
+        return ""
+
+    def _hostname_from_system_resolvers(self, ip: str) -> str:
+        commands = (
+            ["getent", "hosts", ip],
+            ["resolvectl", "query", "--legend=no", ip],
+        )
+        for command in commands:
+            try:
+                result = subprocess.run(
+                    command,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=0.8,
+                )
+            except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+                continue
+            if result.returncode != 0:
+                continue
+            name = self._parse_resolver_output(result.stdout, ip)
+            if name:
+                return name
+        return ""
+
+    def _parse_resolver_output(self, output: str, ip: str) -> str:
+        for raw_line in output.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            if ":" in line and line.split(":", 1)[0].strip() == ip:
+                line = line.split(":", 1)[1].strip()
+            parts = [part for part in line.split() if part != ip]
+            for candidate in parts:
+                name = self._clean_hostname(candidate, ip)
+                if name:
+                    return name
+        return ""
+
+    @staticmethod
+    def _encode_netbios_name(name: str) -> bytes:
+        raw_name = name.encode("ascii", errors="ignore")[:15].ljust(15, b" ")
+        raw_name += b"\x00"
+        encoded = bytearray()
+        for char in raw_name:
+            encoded.append(ord("A") + ((char >> 4) & 0x0F))
+            encoded.append(ord("A") + (char & 0x0F))
+        return bytes([len(encoded)]) + bytes(encoded) + b"\x00"
+
+    @staticmethod
+    def _skip_dns_name(data: bytes, offset: int) -> int:
+        while offset < len(data):
+            length = data[offset]
+            if length & 0xC0 == 0xC0:
+                return offset + 2
+            offset += 1
+            if length == 0:
+                return offset
+            offset += length
+        return offset
+
+    def _hostname_from_nbns(self, ip: str) -> str:
+        transaction_id = os.urandom(2)
+        query = (
+            transaction_id
+            + b"\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00"
+            + self._encode_netbios_name("*")
+            + b"\x00\x21\x00\x01"
+        )
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+                sock.settimeout(0.6)
+                sock.sendto(query, (ip, 137))
+                data, _ = sock.recvfrom(1024)
+        except OSError:
+            return ""
+        return self._parse_nbns_response(data, ip)
+
+    def _parse_nbns_response(self, data: bytes, ip: str) -> str:
+        if len(data) < 12:
+            return ""
+        qdcount = int.from_bytes(data[4:6], "big")
+        ancount = int.from_bytes(data[6:8], "big")
+        offset = 12
+
+        for _ in range(qdcount):
+            offset = self._skip_dns_name(data, offset) + 4
+            if offset > len(data):
+                return ""
+
+        candidates: List[str] = []
+        for _ in range(ancount):
+            offset = self._skip_dns_name(data, offset)
+            if offset + 10 > len(data):
+                break
+            rr_type = int.from_bytes(data[offset:offset + 2], "big")
+            rdlength = int.from_bytes(data[offset + 8:offset + 10], "big")
+            offset += 10
+            rdata = data[offset:offset + rdlength]
+            offset += rdlength
+            if rr_type != 0x21 or len(rdata) < 1:
+                continue
+
+            name_count = rdata[0]
+            for idx in range(name_count):
+                start = 1 + idx * 18
+                entry = rdata[start:start + 18]
+                if len(entry) < 18:
+                    break
+                raw_name = entry[:15].decode("ascii", errors="ignore").strip()
+                suffix = entry[15]
+                flags = int.from_bytes(entry[16:18], "big")
+                if not raw_name or raw_name == "__MSBROWSE__":
+                    continue
+                name = self._clean_hostname(raw_name, ip)
+                if not name:
+                    continue
+                is_group = bool(flags & 0x8000)
+                if suffix in (0x00, 0x20) and not is_group:
+                    return name
+                candidates.append(name)
+
+        return candidates[0] if candidates else ""
+
+    def _resolve_hostname(self, ip: str) -> str:
+        resolvers = (
+            self._hostname_from_reverse_dns,
+            self._hostname_from_getnameinfo,
+            self._hostname_from_hosts_file,
+            self._hostname_from_lease_files,
+            self._hostname_from_system_resolvers,
+            self._hostname_from_nbns,
+        )
+        for resolver in resolvers:
+            try:
+                name = self._clean_hostname(resolver(ip), ip)
+            except Exception:
+                continue
+            if name:
+                return name
+        return ""
+
     def resolve_hostnames(self, devices: List[Device]) -> None:
         """
         Async hostname resolution — single flat ThreadPoolExecutor.
@@ -219,8 +458,7 @@ class NetworkDiscovery:
         The try/except is now correctly wrapped around the for statement.
         """
         def resolve_worker(d: Device) -> str:
-            name, _, _ = socket.gethostbyaddr(d.ip)
-            return name.lower() if name != d.ip else ""
+            return self._resolve_hostname(d.ip)
 
         with ThreadPoolExecutor(max_workers=20) as pool:
             future_to_device = {pool.submit(resolve_worker, d): d

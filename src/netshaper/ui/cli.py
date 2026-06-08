@@ -104,8 +104,9 @@ def pick_targets_ui(devices: List[Device]) -> List[Device]:
     print_flush(f"  {'#':<4} {'IP':<16} {'Hostname':<28} MAC")
     print_flush("-" * 90)
     for idx, dev in enumerate(devices, 1):
+        hostname = (dev.hostname or "-")[:28]
         print_flush(
-            f"  {idx:<4} {dev.ip:<16} {(dev.hostname or ''):<28} {dev.mac}"
+            f"  {idx:<4} {dev.ip:<16} {hostname:<28} {dev.mac}"
         )
     print_flush("=" * 90)
 
