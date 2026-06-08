@@ -35,6 +35,7 @@ class CliTests(unittest.TestCase):
     def test_run_active_session_cleans_up_when_sniffer_start_fails(self):
         ns = mock.Mock()
         ns.stop_event = threading.Event()
+        ns.save_state.return_value = True
         ns.launch_sniffer.side_effect = RuntimeError("sniffer failed")
         targets = ["192.0.2.10"]
 
@@ -68,7 +69,32 @@ class CliTests(unittest.TestCase):
             save_pcap=False,
             rolling=False,
         )
-        ns.save_state.assert_not_called()
+        self.assertEqual(ns.save_state.call_count, 3)
+        ns.cleanup.assert_called_once()
+
+    def test_run_active_session_aborts_before_mutation_when_state_save_fails(self):
+        ns = mock.Mock()
+        ns.stop_event = threading.Event()
+        ns.save_state.return_value = False
+
+        with mock.patch("netshaper.ui.cli.print_flush"), \
+             self.assertRaises(RuntimeError):
+            cli.run_active_session(
+                ns,
+                ["192.0.2.10"],
+                arp_on=True,
+                dns_spoof_on=False,
+                captive_portal=False,
+                http_redirect_port=None,
+                throttle_on=False,
+                limit=None,
+                sniff_on=False,
+                save_pcap=False,
+                rolling=False,
+            )
+
+        ns._apply_global_rules.assert_not_called()
+        ns.add_target.assert_not_called()
         ns.cleanup.assert_called_once()
 
 

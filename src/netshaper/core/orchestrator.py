@@ -24,7 +24,7 @@ import psutil
 from netshaper import config
 from netshaper.capture.sniffer import PacketSniffer, RollingPacketSniffer
 from netshaper.core.session import TargetSession
-from netshaper.core.state_manager import StateSnapshotManager
+from netshaper.core.state_manager import NetworkStateSnapshot, StateSnapshotManager
 from netshaper.models import Device, MarkIDPool
 from netshaper.network.discovery import NetworkDiscovery
 from netshaper.network.shaper import TrafficShaper
@@ -44,7 +44,10 @@ class NetShaper:
         self.own_mac     = self.disc.get_own_mac()
         self.own_ipv6    = self.disc.get_own_ipv6()
         self.gw          = self.disc.get_default_gateway()
-        self.gw_mac      = self.disc.resolve_mac(self.gw) if self.gw else None
+        self.gw_mac      = (
+            None if config.DRY_RUN
+            else self.disc.resolve_mac(self.gw) if self.gw else None
+        )
         self.gw_ipv6     = self.disc.get_default_gateway_ipv6()
         self.shaper      = TrafficShaper(interface)
         self.mark_pool   = MarkIDPool()
@@ -109,6 +112,14 @@ class NetShaper:
                 ["sysctl", "-w", f"net.ipv6.conf.all.forwarding={self.state_snapshot.ipv6_forwarding}"],
                 silent=True,
             )
+        if self.state_snapshot.route_localnet is not None:
+            SubprocessRunner.run(
+                [
+                    "sysctl", "-w",
+                    f"net.ipv4.conf.{self.interface}.route_localnet={self.state_snapshot.route_localnet}",
+                ],
+                silent=True,
+            )
 
     def _remove_global_rules(self) -> None:
         self._restore_original_forwarding()
@@ -167,7 +178,10 @@ class NetShaper:
         # Resolve IP -> Device if needed
         if isinstance(target, str):
             ip = target
-            mac = self.disc.resolve_mac(ip) if ip else None
+            mac = (
+                "00:00:00:00:00:00" if config.DRY_RUN
+                else self.disc.resolve_mac(ip) if ip else None
+            )
             if not mac:
                 raise ValueError(
                     f"Could not resolve MAC for target IP {ip}. "
@@ -190,6 +204,9 @@ class NetShaper:
                 self.gw_ipv6,
                 self.shaper,
             )
+            self.sessions[target.ip] = session
+
+        try:
             session.setup(
                 dns_spoof=dns_spoof,
                 captive_portal=captive_portal,
@@ -198,7 +215,15 @@ class NetShaper:
                 mark_base=mark_base,
             )
             session.start_spoof(arp_on=arp_on)
-            self.sessions[target.ip] = session
+        except Exception:
+            with self._lifecycle_lock:
+                if self.sessions.get(target.ip) is session:
+                    del self.sessions[target.ip]
+            try:
+                session.cleanup()
+            finally:
+                self.mark_pool.release(target.ip)
+            raise
 
         log.info(
             f"Target {target.ip} added "
@@ -263,22 +288,30 @@ class NetShaper:
             cleanup_step("global rules", self._remove_global_rules)
             cleanup_step(
                 "state snapshot",
-                lambda: StateSnapshotManager.restore(self.state_snapshot),
+                lambda: (
+                    StateSnapshotManager.restore(self.state_snapshot)
+                    or (_ for _ in ()).throw(RuntimeError("state snapshot restore failed"))
+                ),
             )
             cleanup_step("traffic shaper", self.shaper.cleanup)
 
             state_path = os.path.join(config.STATE_DIR, self.session_id, "state.json")
-            cleanup_step(
-                "state file",
-                lambda: os.remove(state_path) if os.path.exists(state_path) else None,
-            )
             if errors:
                 log.warning(f"Network cleanup completed with {len(errors)} error(s).")
             else:
-                log.info("Network restored.")
+                cleanup_step(
+                    "state file",
+                    lambda: os.remove(state_path) if os.path.exists(state_path) else None,
+                )
+                if errors:
+                    log.warning(
+                        f"Network cleanup completed with {len(errors)} error(s)."
+                    )
+                else:
+                    log.info("Network restored.")
         finally:
             with self._lifecycle_lock:
-                self._cleanup_complete = True
+                self._cleanup_complete = not errors
                 self._cleanup_running = False
 
     # Backward-compatible alias (older CLI expects stop())
@@ -289,6 +322,9 @@ class NetShaper:
     # ── Sniffer ───────────────────────────────────────────────────────────────
     def launch_sniffer(self, target_ips: Optional[List[str]] = None,
                        save_pcap: bool = False, rolling: bool = False) -> None:
+        if config.DRY_RUN:
+            print_flush("[DRY-RUN] Would launch packet sniffer")
+            return
         if self.sniffer:
             self.sniffer.stop()
         if rolling:
@@ -302,6 +338,12 @@ class NetShaper:
     # ── mitmproxy ─────────────────────────────────────────────────────────────
     def launch_mitmproxy(self, port: int = 8088, web_port: int = 8083) -> bool:
         """Launch mitmweb and poll for readiness (no hard-coded sleep)."""
+        if config.DRY_RUN:
+            print_flush(
+                "[DRY-RUN] mitmweb --mode transparent "
+                f"--listen-port {port} --set web_port={web_port}"
+            )
+            return True
         if check_local_port(self.own_ip, port):
             log.info(f"mitmproxy already running on :{port}")
             return True
@@ -325,15 +367,48 @@ class NetShaper:
             return False
 
     # ── State persistence ─────────────────────────────────────────────────────
-    def save_state(self) -> None:
+    @staticmethod
+    def _snapshot_to_dict(snapshot: NetworkStateSnapshot) -> dict:
+        return {
+            "session_id": snapshot.session_id,
+            "interface": snapshot.interface,
+            "ipv4_forwarding": snapshot.ipv4_forwarding,
+            "ipv6_forwarding": snapshot.ipv6_forwarding,
+            "route_localnet": snapshot.route_localnet,
+            "iptables_rules": snapshot.iptables_rules,
+            "ip6tables_rules": snapshot.ip6tables_rules,
+            "tc_configuration": snapshot.tc_configuration,
+        }
+
+    @staticmethod
+    def _snapshot_from_state(data: dict) -> NetworkStateSnapshot:
+        snapshot = data.get("snapshot") or {}
+        return NetworkStateSnapshot(
+            session_id=snapshot.get("session_id") or data.get("session_id", ""),
+            interface=snapshot.get("interface") or data.get("interface", ""),
+            ipv4_forwarding=snapshot.get("ipv4_forwarding"),
+            ipv6_forwarding=snapshot.get("ipv6_forwarding"),
+            route_localnet=snapshot.get("route_localnet"),
+            iptables_rules=snapshot.get("iptables_rules", ""),
+            ip6tables_rules=snapshot.get("ip6tables_rules", ""),
+            tc_configuration=snapshot.get("tc_configuration", ""),
+        )
+
+    def save_state(self) -> bool:
         data = {
             "session_id": self.session_id,
             "interface": self.interface,
             "targets":   [{"ip": s.target.ip, "dns": s.dns_on,
-                           "limit": s.limit}
+                           "limit": s.limit,
+                           "http_redirect_port": (
+                               getattr(s.firewall, "_http_redirect_port", None)
+                               if s.firewall else None
+                           )}
                           for s in self.sessions.values()],
             "gw":     self.gw,
             "own_ip": self.own_ip,
+            "global_rules_applied": self._global_rules_applied,
+            "snapshot": self._snapshot_to_dict(self.state_snapshot),
         }
         try:
             state_dir = os.path.join(config.STATE_DIR, self.session_id)
@@ -343,49 +418,114 @@ class NetShaper:
                 json.dump(data, tf)
                 tmp = tf.name
             os.replace(tmp, os.path.join(state_dir, "state.json"))   # Atomic write
+            return True
         except Exception as e:
             log.error(f"State save failed: {e}")
+            return False
 
     def load_state_and_cleanup(self) -> None:
         if not os.path.isdir(config.STATE_DIR):
             return
-        try:
-            for state_path in sorted(glob.glob(os.path.join(config.STATE_DIR, "*", "state.json"))):
+        for state_path in sorted(glob.glob(os.path.join(config.STATE_DIR, "*", "state.json"))):
+            cleanup_ok = True
+            try:
                 with open(state_path, encoding="utf-8") as f:
                     data = json.load(f)
                 iface = data.get("interface")
                 if not iface:
                     continue
                 print_flush(f"  [!] Stale session on {iface} — cleaning up…")
+
+                def run_recovery(description: str, command: list[str]) -> None:
+                    nonlocal cleanup_ok
+                    if not SubprocessRunner.run(
+                            command, check=False, silent=True):
+                        cleanup_ok = False
+                        log.error(f"Stale cleanup failed ({description})")
+
+                if data.get("global_rules_applied"):
+                    for binary in ["iptables", "ip6tables"]:
+                        if shutil.which(binary):
+                            run_recovery(
+                                f"{binary} forward same-interface accept",
+                                [binary, "-D", "FORWARD",
+                                 "-i", iface, "-o", iface, "-j", "ACCEPT"],
+                            )
+                            run_recovery(
+                                f"{binary} established forward accept",
+                                [binary, "-D", "FORWARD", "-m", "state",
+                                 "--state", "ESTABLISHED,RELATED", "-j", "ACCEPT"],
+                            )
+                            run_recovery(
+                                f"{binary} masquerade",
+                                [binary, "-t", "nat", "-D", "POSTROUTING",
+                                 "-o", iface, "-j", "MASQUERADE"],
+                            )
+
+                for target in data.get("targets", []):
+                    ip = target.get("ip")
+                    if not ip:
+                        continue
+                    binaries = ["ip6tables"] if ":" in ip else ["iptables"]
+                    for binary in binaries:
+                        if not shutil.which(binary):
+                            continue
+                        if target.get("dns"):
+                            for proto in ["udp", "tcp"]:
+                                run_recovery(
+                                    f"{binary} DNS input {ip}/{proto}",
+                                    [binary, "-D", "INPUT",
+                                     "-i", iface, "-s", ip,
+                                     "-p", proto, "--dport", "53",
+                                     "-j", "ACCEPT"],
+                                )
+                        http_port = target.get("http_redirect_port")
+                        if http_port:
+                            run_recovery(
+                                f"{binary} HTTP input {ip}",
+                                [binary, "-D", "INPUT",
+                                 "-i", iface, "-s", ip,
+                                 "-p", "tcp", "--dport", str(http_port),
+                                 "-j", "ACCEPT"],
+                            )
+
                 for binary in ["iptables", "ip6tables"]:
                     if not shutil.which(binary):
                         continue
-                    for table in ["nat", "mangle"]:
+                    for table, hook in [("nat", "PREROUTING"), ("mangle", "POSTROUTING")]:
                         result = subprocess.run(
                             [binary, "-t", table, "-n", "-L"],
                             capture_output=True, text=True, check=False)
                         for line in result.stdout.splitlines():
                             if line.startswith("Chain NS-"):
                                 chain_name = line.split()[1]
-                                SubprocessRunner.run(
+                                run_recovery(
+                                    f"{binary} unlink {chain_name}",
+                                    [binary, "-t", table, "-D", hook,
+                                     "-j", chain_name],
+                                )
+                                run_recovery(
+                                    f"{binary} flush {chain_name}",
                                     [binary, "-t", table, "-F", chain_name],
-                                    check=False, silent=True)
-                                SubprocessRunner.run(
+                                )
+                                run_recovery(
+                                    f"{binary} delete {chain_name}",
                                     [binary, "-t", table, "-X", chain_name],
-                                    check=False, silent=True)
-                SubprocessRunner.run(
-                    ["tc", "qdisc", "del", "dev", iface, "root"],
-                    check=False, silent=True)
-                SubprocessRunner.run(
-                    ["sysctl", "-w", "net.ipv4.ip_forward=0"], silent=True)
-                log.info("Stale rules cleaned.")
-                os.remove(state_path)
-                try:
-                    os.rmdir(os.path.dirname(state_path))
-                except OSError:
-                    pass
-        except Exception:
-            log.debug("No valid state file to recover.")
+                                )
+
+                snapshot = self._snapshot_from_state(data)
+                cleanup_ok = StateSnapshotManager.restore(snapshot) and cleanup_ok
+                if cleanup_ok:
+                    log.info("Stale rules cleaned.")
+                    os.remove(state_path)
+                    try:
+                        os.rmdir(os.path.dirname(state_path))
+                    except OSError:
+                        pass
+                else:
+                    log.error(f"Leaving recovery state in place: {state_path}")
+            except Exception as exc:
+                log.debug(f"No valid state file to recover: {exc}")
 
     # ── Bandwidth monitor ─────────────────────────────────────────────────────
     def monitor(self) -> None:

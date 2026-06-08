@@ -23,6 +23,21 @@ class TrafficShaperTests(unittest.TestCase):
 
     @mock.patch("netshaper.network.shaper.SubprocessRunner.run")
     @mock.patch("netshaper.network.shaper.subprocess.run")
+    def test_apply_target_refuses_preexisting_htb_root_qdisc(
+            self, run_mock, runner_mock):
+        run_mock.return_value = SimpleNamespace(
+            returncode=0,
+            stdout="qdisc htb 1: root refcnt 2",
+        )
+        shaper = TrafficShaper("eth0")
+
+        with self.assertRaisesRegex(RuntimeError, "Refusing to replace"):
+            shaper.apply_target("192.0.2.10", 5.0)
+
+        runner_mock.assert_not_called()
+
+    @mock.patch("netshaper.network.shaper.SubprocessRunner.run")
+    @mock.patch("netshaper.network.shaper.subprocess.run")
     def test_cleanup_ignores_foreign_root_qdisc(self, run_mock, runner_mock):
         run_mock.return_value = SimpleNamespace(
             returncode=0,
@@ -43,6 +58,7 @@ class TrafficShaperTests(unittest.TestCase):
             stdout="qdisc htb 1: root refcnt 2",
         )
         shaper = TrafficShaper("eth0")
+        shaper._base_initialized = True
 
         shaper.cleanup()
 

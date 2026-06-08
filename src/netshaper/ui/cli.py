@@ -201,7 +201,11 @@ def run_active_session(
     rolling: bool,
 ) -> None:
     try:
+        if not ns.save_state():
+            raise RuntimeError("Could not write recovery state before setup.")
         ns._apply_global_rules()
+        if not ns.save_state():
+            raise RuntimeError("Could not update recovery state after global rules.")
         for target in targets:
             ns.add_target(
                 target,
@@ -211,6 +215,8 @@ def run_active_session(
                 http_redirect_port=http_redirect_port,
                 limit=limit if throttle_on else None,
             )
+            if not ns.save_state():
+                raise RuntimeError("Could not update recovery state after target setup.")
 
         if sniff_on:
             ns.launch_sniffer(
@@ -219,7 +225,8 @@ def run_active_session(
                 rolling=rolling,
             )
 
-        ns.save_state()
+        if not ns.save_state():
+            raise RuntimeError("Could not update recovery state after startup.")
         threading.Thread(target=ns.monitor, daemon=True).start()
         print_flush("[*] Active. Press Ctrl+C to stop.")
         while not ns.stop_event.wait(1):

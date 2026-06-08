@@ -32,13 +32,13 @@ python -m pip install -e ".[dev]"
 Run the CLI:
 
 ```bash
-python __main__.py -i <your-interface>
+python -m netshaper -i <your-interface>
 ```
 
 Safe preview mode:
 
 ```bash
-python __main__.py -i <your-interface> --dry-run
+python -m netshaper -i <your-interface> --dry-run
 ```
 
 ## Testing

@@ -28,22 +28,14 @@ class TrafficShaper:
             return ""
         return result.stdout.strip() if result.returncode == 0 else ""
 
-    @staticmethod
-    def _is_netshaper_root(qdisc: str) -> bool:
-        return qdisc.startswith("qdisc htb 1:")
-
     def _init_root(self) -> None:
         if not self._base_initialized:
             root_qdisc = self._root_qdisc()
-            if root_qdisc and not self._is_netshaper_root(root_qdisc):
+            if root_qdisc:
                 raise RuntimeError(
                     "Refusing to replace existing root qdisc on "
                     f"{self.interface}: {root_qdisc}"
                 )
-            if root_qdisc:
-                SubprocessRunner.run(
-                    ["tc", "qdisc", "del", "dev", self.interface, "root"],
-                    check=False, silent=True)
             if not SubprocessRunner.run(
                 ["tc", "qdisc", "add", "dev", self.interface,
                  "root", "handle", "1:", "htb"]):
@@ -86,7 +78,7 @@ class TrafficShaper:
         self._active_marks.discard(mark_base)
 
     def cleanup(self) -> None:
-        if self._base_initialized or self._is_netshaper_root(self._root_qdisc()):
+        if self._base_initialized:
             SubprocessRunner.run(
                 ["tc", "qdisc", "del", "dev", self.interface, "root"],
                 check=False, silent=True)
