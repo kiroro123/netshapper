@@ -233,7 +233,10 @@ def run_active_session(
             pass
     finally:
         ns.cleanup()
-        print_flush("[+] Teardown complete. Goodbye.")
+        if getattr(ns, "_cleanup_complete", True):
+            print_flush("[+] Teardown complete. Goodbye.")
+        else:
+            print_flush("[!] Teardown finished with cleanup errors. Check logs.")
 
 
 def main() -> None:
@@ -242,8 +245,8 @@ def main() -> None:
         print(VERSION)
         return
 
-    config.configure_logging()
     config.DRY_RUN = args.dry_run
+    config.configure_logging(console_only=config.DRY_RUN)
     if config.DRY_RUN:
         print_flush("[*] DRY RUN MODE - no system changes.\n")
 

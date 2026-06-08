@@ -109,25 +109,47 @@ class NetworkDiscovery:
 
     def get_default_gateway(self) -> Optional[str]:
         try:
+            best = None
             with open("/proc/net/route") as f:
                 for line in f.readlines()[1:]:
                     parts = line.strip().split()
-                    if parts[1] == '00000000':
-                        return socket.inet_ntoa(
+                    if (len(parts) >= 7
+                            and parts[0] == self.interface
+                            and parts[1] == '00000000'):
+                        gateway = socket.inet_ntoa(
                             struct.pack("<L", int(parts[2], 16)))
+                        try:
+                            metric = int(parts[6])
+                        except ValueError:
+                            metric = 0
+                        if best is None or metric < best[0]:
+                            best = (metric, gateway)
+            if best is not None:
+                return best[1]
         except Exception:
             pass
         return None
 
     def get_default_gateway_ipv6(self) -> Optional[str]:
         try:
+            best = None
             with open("/proc/net/ipv6_route") as f:
                 for line in f:
                     parts = line.strip().split()
-                    if (parts[0] == '00000000000000000000000000000000'
+                    if (len(parts) >= 10
+                            and parts[-1] == self.interface
+                            and parts[0] == '00000000000000000000000000000000'
                             and parts[1] == '00'):
                         blocks = [parts[4][i:i+4] for i in range(0, 32, 4)]
-                        return ':'.join(blocks)
+                        gateway = ':'.join(blocks)
+                        try:
+                            metric = int(parts[5], 16)
+                        except ValueError:
+                            metric = 0
+                        if best is None or metric < best[0]:
+                            best = (metric, gateway)
+            if best is not None:
+                return best[1]
         except Exception:
             pass
         return None

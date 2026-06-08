@@ -61,6 +61,7 @@ class NetShaper:
         self._mitm_proc  = None
         self._cleanup_running = False
         self._cleanup_complete = False
+        self._dry_run_state = None
         self.state_snapshot = StateSnapshotManager.capture(interface, self.session_id)
 
     # ── Helpers ───────────────────────────────────────────────────────────────
@@ -76,69 +77,76 @@ class NetShaper:
     def _apply_global_rules(self) -> None:
         if self._global_rules_applied:
             return
-        SubprocessRunner.run(
-            ["sysctl", "-w", "net.ipv4.ip_forward=1"], silent=True)
-        SubprocessRunner.run(
-            ["sysctl", "-w", "net.ipv6.conf.all.forwarding=1"], silent=True)
-        SubprocessRunner.run(
+        ok = True
+        ok = SubprocessRunner.run(
+            ["sysctl", "-w", "net.ipv4.ip_forward=1"], silent=True) and ok
+        ok = SubprocessRunner.run(
+            ["sysctl", "-w", "net.ipv6.conf.all.forwarding=1"],
+            silent=True) and ok
+        ok = SubprocessRunner.run(
             ["sysctl", "-w",
              f"net.ipv4.conf.{self.interface}.route_localnet=1"],
-            silent=True)
+            silent=True) and ok
         for binary in ["iptables", "ip6tables"]:
             if shutil.which(binary):
-                SubprocessRunner.run(
+                ok = SubprocessRunner.run(
                     [binary, "-I", "FORWARD", "1",
                      "-i", self.interface, "-o", self.interface,
-                     "-j", "ACCEPT"], silent=True)
-                SubprocessRunner.run(
+                     "-j", "ACCEPT"], silent=True) and ok
+                ok = SubprocessRunner.run(
                     [binary, "-I", "FORWARD", "1", "-m", "state",
                      "--state", "ESTABLISHED,RELATED",
-                     "-j", "ACCEPT"], silent=True)
-                SubprocessRunner.run(
+                     "-j", "ACCEPT"], silent=True) and ok
+                ok = SubprocessRunner.run(
                     [binary, "-t", "nat", "-A", "POSTROUTING",
                      "-o", self.interface, "-j", "MASQUERADE"],
-                    silent=True)
+                    silent=True) and ok
+        if not ok:
+            raise RuntimeError("Failed to apply global forwarding rules")
         self._global_rules_applied = True
         log.info("Global dual-stack forwarding + MASQUERADE enabled")
 
-    def _restore_original_forwarding(self) -> None:
+    def _restore_original_forwarding(self) -> bool:
+        ok = True
         if self.state_snapshot.ipv4_forwarding is not None:
-            SubprocessRunner.run(
+            ok = SubprocessRunner.run(
                 ["sysctl", "-w", f"net.ipv4.ip_forward={self.state_snapshot.ipv4_forwarding}"],
                 silent=True,
-            )
+            ) and ok
         if self.state_snapshot.ipv6_forwarding is not None:
-            SubprocessRunner.run(
+            ok = SubprocessRunner.run(
                 ["sysctl", "-w", f"net.ipv6.conf.all.forwarding={self.state_snapshot.ipv6_forwarding}"],
                 silent=True,
-            )
+            ) and ok
         if self.state_snapshot.route_localnet is not None:
-            SubprocessRunner.run(
+            ok = SubprocessRunner.run(
                 [
                     "sysctl", "-w",
                     f"net.ipv4.conf.{self.interface}.route_localnet={self.state_snapshot.route_localnet}",
                 ],
                 silent=True,
-            )
+            ) and ok
+        return ok
 
-    def _remove_global_rules(self) -> None:
-        self._restore_original_forwarding()
+    def _remove_global_rules(self) -> bool:
+        ok = self._restore_original_forwarding()
         for binary in ["iptables", "ip6tables"]:
             if shutil.which(binary):
-                SubprocessRunner.run(
+                ok = SubprocessRunner.run(
                     [binary, "-D", "FORWARD",
                      "-i", self.interface, "-o", self.interface,
-                     "-j", "ACCEPT"], check=False, silent=True)
-                SubprocessRunner.run(
+                     "-j", "ACCEPT"], check=False, silent=True) and ok
+                ok = SubprocessRunner.run(
                     [binary, "-D", "FORWARD", "-m", "state",
                      "--state", "ESTABLISHED,RELATED",
-                     "-j", "ACCEPT"], check=False, silent=True)
-                SubprocessRunner.run(
+                     "-j", "ACCEPT"], check=False, silent=True) and ok
+                ok = SubprocessRunner.run(
                     [binary, "-t", "nat", "-D", "POSTROUTING",
                      "-o", self.interface, "-j", "MASQUERADE"],
-                    check=False, silent=True)
+                    check=False, silent=True) and ok
         self._global_rules_applied = False
         log.info("Global forwarding + MASQUERADE removed")
+        return ok
 
     # ── Discovery ─────────────────────────────────────────────────────────────
     def discover(self) -> List[Device]:
@@ -203,6 +211,7 @@ class NetShaper:
                 self.gw_mac,
                 self.gw_ipv6,
                 self.shaper,
+                getattr(self, "session_id", None),
             )
             self.sessions[target.ip] = session
 
@@ -232,20 +241,25 @@ class NetShaper:
         )
 
 
-    def remove_target(self, ip: str) -> None:
+    def remove_target(self, ip: str) -> bool:
         with self._lifecycle_lock:
             session = self.sessions.get(ip)
             if not session:
-                return
+                return True
             session.active           = False
             session.is_shutting_down = True
             del self.sessions[ip]
         # Cleanup outside lock — spoof threads exit naturally via flag check
+        ok = True
         try:
-            session.cleanup()
+            ok = session.cleanup()
         finally:
             self.mark_pool.release(ip)
-        log.info(f"Target {ip} removed")
+        if ok:
+            log.info(f"Target {ip} removed")
+        else:
+            log.warning(f"Target {ip} removed with cleanup errors")
+        return ok
 
     def cleanup(self) -> None:
         with self._lifecycle_lock:
@@ -260,7 +274,9 @@ class NetShaper:
 
         def cleanup_step(description: str, action) -> None:
             try:
-                action()
+                result = action()
+                if result is False:
+                    raise RuntimeError("cleanup command failed")
             except Exception as exc:
                 errors.append((description, exc))
                 log.error(f"Cleanup step failed ({description}): {exc}")
@@ -299,10 +315,11 @@ class NetShaper:
             if errors:
                 log.warning(f"Network cleanup completed with {len(errors)} error(s).")
             else:
-                cleanup_step(
-                    "state file",
-                    lambda: os.remove(state_path) if os.path.exists(state_path) else None,
-                )
+                if not config.DRY_RUN:
+                    cleanup_step(
+                        "state file",
+                        lambda: os.remove(state_path) if os.path.exists(state_path) else None,
+                    )
                 if errors:
                     log.warning(
                         f"Network cleanup completed with {len(errors)} error(s)."
@@ -403,13 +420,26 @@ class NetShaper:
                            "http_redirect_port": (
                                getattr(s.firewall, "_http_redirect_port", None)
                                if s.firewall else None
+                           ),
+                           "mangle_chain": (
+                               getattr(s.firewall, "MANGLE", None)
+                               if s.firewall else None
+                           ),
+                           "nat_chain": (
+                               getattr(s.firewall, "NAT", None)
+                               if s.firewall else None
                            )}
                           for s in self.sessions.values()],
             "gw":     self.gw,
             "own_ip": self.own_ip,
             "global_rules_applied": self._global_rules_applied,
+            "shaper_base_initialized": getattr(
+                getattr(self, "shaper", None), "_base_initialized", False),
             "snapshot": self._snapshot_to_dict(self.state_snapshot),
         }
+        if config.DRY_RUN:
+            self._dry_run_state = data
+            return True
         try:
             state_dir = os.path.join(config.STATE_DIR, self.session_id)
             os.makedirs(state_dir, mode=0o700, exist_ok=True)
@@ -467,6 +497,13 @@ class NetShaper:
                     if not ip:
                         continue
                     binaries = ["ip6tables"] if ":" in ip else ["iptables"]
+                    suffix = ip.replace(".", "_").replace(":", "_")
+                    chain_specs = [
+                        ("mangle", "POSTROUTING",
+                         target.get("mangle_chain") or f"NS-MNG-{suffix}"),
+                        ("nat", "PREROUTING",
+                         target.get("nat_chain") or f"NS-NAT-{suffix}"),
+                    ]
                     for binary in binaries:
                         if not shutil.which(binary):
                             continue
@@ -488,30 +525,26 @@ class NetShaper:
                                  "-p", "tcp", "--dport", str(http_port),
                                  "-j", "ACCEPT"],
                             )
+                        for table, hook, chain_name in chain_specs:
+                            run_recovery(
+                                f"{binary} unlink {chain_name}",
+                                [binary, "-t", table, "-D", hook,
+                                 "-j", chain_name],
+                            )
+                            run_recovery(
+                                f"{binary} flush {chain_name}",
+                                [binary, "-t", table, "-F", chain_name],
+                            )
+                            run_recovery(
+                                f"{binary} delete {chain_name}",
+                                [binary, "-t", table, "-X", chain_name],
+                            )
 
-                for binary in ["iptables", "ip6tables"]:
-                    if not shutil.which(binary):
-                        continue
-                    for table, hook in [("nat", "PREROUTING"), ("mangle", "POSTROUTING")]:
-                        result = subprocess.run(
-                            [binary, "-t", table, "-n", "-L"],
-                            capture_output=True, text=True, check=False)
-                        for line in result.stdout.splitlines():
-                            if line.startswith("Chain NS-"):
-                                chain_name = line.split()[1]
-                                run_recovery(
-                                    f"{binary} unlink {chain_name}",
-                                    [binary, "-t", table, "-D", hook,
-                                     "-j", chain_name],
-                                )
-                                run_recovery(
-                                    f"{binary} flush {chain_name}",
-                                    [binary, "-t", table, "-F", chain_name],
-                                )
-                                run_recovery(
-                                    f"{binary} delete {chain_name}",
-                                    [binary, "-t", table, "-X", chain_name],
-                                )
+                if data.get("shaper_base_initialized"):
+                    run_recovery(
+                        "tc root qdisc",
+                        ["tc", "qdisc", "del", "dev", iface, "root"],
+                    )
 
                 snapshot = self._snapshot_from_state(data)
                 cleanup_ok = StateSnapshotManager.restore(snapshot) and cleanup_ok

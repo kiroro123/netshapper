@@ -1,3 +1,5 @@
+import json
+import os
 import tempfile
 import threading
 import unittest
@@ -100,6 +102,49 @@ class NetShaperCleanupTests(unittest.TestCase):
 
         self.assertTrue(result)
         popen_mock.assert_not_called()
+
+    def test_stale_cleanup_removes_recorded_tc_root_qdisc(self):
+        ns = NetShaper.__new__(NetShaper)
+        snapshot = {
+            "session_id": "NS-OLD",
+            "interface": "eth0",
+            "ipv4_forwarding": None,
+            "ipv6_forwarding": None,
+            "route_localnet": None,
+            "iptables_rules": "",
+            "ip6tables_rules": "",
+            "tc_configuration": "",
+        }
+        state = {
+            "session_id": "NS-OLD",
+            "interface": "eth0",
+            "targets": [],
+            "global_rules_applied": False,
+            "shaper_base_initialized": True,
+            "snapshot": snapshot,
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = os.path.join(tmp, "NS-OLD")
+            os.makedirs(state_dir)
+            state_path = os.path.join(state_dir, "state.json")
+            with open(state_path, "w", encoding="utf-8") as fh:
+                json.dump(state, fh)
+
+            with mock.patch("netshaper.core.orchestrator.config.STATE_DIR", tmp), \
+                 mock.patch("netshaper.core.orchestrator.print_flush"), \
+                 mock.patch("netshaper.core.orchestrator.SubprocessRunner.run",
+                            return_value=True) as runner_mock, \
+                 mock.patch("netshaper.core.orchestrator.StateSnapshotManager.restore",
+                            return_value=True):
+                ns.load_state_and_cleanup()
+
+            runner_mock.assert_any_call(
+                ["tc", "qdisc", "del", "dev", "eth0", "root"],
+                check=False,
+                silent=True,
+            )
+            self.assertFalse(os.path.exists(state_path))
 
 
 if __name__ == "__main__":

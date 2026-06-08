@@ -7,6 +7,38 @@ from netshaper.network.discovery import NetworkDiscovery
 
 
 class DiscoveryHostnameTests(unittest.TestCase):
+    def test_default_gateway_uses_selected_interface_and_lowest_metric(self):
+        route_table = (
+            "Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT\n"
+            "lo\t00000000\t0100007F\t0003\t0\t0\t0\t00000000\t0\t0\t0\n"
+            "wlan0\t00000000\t0102A8C0\t0003\t0\t0\t5\t00000000\t0\t0\t0\n"
+            "eth0\t00000000\t010200C0\t0003\t0\t0\t200\t00000000\t0\t0\t0\n"
+            "eth0\t00000000\tFE0200C0\t0003\t0\t0\t50\t00000000\t0\t0\t0\n"
+        )
+        disc = NetworkDiscovery("eth0")
+
+        with mock.patch("builtins.open", mock.mock_open(read_data=route_table)):
+            gateway = disc.get_default_gateway()
+
+        self.assertEqual(gateway, "192.0.2.254")
+
+    def test_default_gateway_ipv6_uses_selected_interface_and_lowest_metric(self):
+        zero = "00000000000000000000000000000000"
+        route_table = (
+            f"{zero} 00 {zero} 00 fe800000000000000000000000000001 "
+            "00000001 00000000 00000000 00000000 lo\n"
+            f"{zero} 00 {zero} 00 20010db8000000000000000000000001 "
+            "00000020 00000000 00000000 00000000 eth0\n"
+            f"{zero} 00 {zero} 00 20010db8000000000000000000000002 "
+            "00000010 00000000 00000000 00000000 eth0\n"
+        )
+        disc = NetworkDiscovery("eth0")
+
+        with mock.patch("builtins.open", mock.mock_open(read_data=route_table)):
+            gateway = disc.get_default_gateway_ipv6()
+
+        self.assertEqual(gateway, "2001:0db8:0000:0000:0000:0000:0000:0002")
+
     def test_resolve_hostnames_uses_lan_fallbacks(self):
         disc = NetworkDiscovery("eth0")
         device = Device(ip="192.0.2.20", mac="00:11:22:33:44:55")

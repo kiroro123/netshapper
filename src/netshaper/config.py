@@ -18,17 +18,20 @@ LOG_FILE  = "netshaper.log"
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 
-def configure_logging() -> None:
+def configure_logging(console_only: bool = False) -> None:
     """Attach handlers lazily so importing config does not create files."""
     if logging.getLogger().handlers:
         return
-    _fh = logging.FileHandler(LOG_FILE)
     _ch = logging.StreamHandler()
-    _fh.setFormatter(logging.Formatter(
-        '%(asctime)s [%(levelname)s] %(message)s', datefmt='%H:%M:%S'))
     _ch.setFormatter(logging.Formatter(
         '[NetShaper] %(asctime)s - %(levelname)s - %(message)s', datefmt='%H:%M:%S'))
-    logging.basicConfig(level=logging.INFO, handlers=[_fh, _ch])
+    handlers = [_ch]
+    if not console_only:
+        _fh = logging.FileHandler(LOG_FILE)
+        _fh.setFormatter(logging.Formatter(
+            '%(asctime)s [%(levelname)s] %(message)s', datefmt='%H:%M:%S'))
+        handlers.insert(0, _fh)
+    logging.basicConfig(level=logging.INFO, handlers=handlers)
 
 # ── Banner ────────────────────────────────────────────────────────────────────
 BANNER = r"""

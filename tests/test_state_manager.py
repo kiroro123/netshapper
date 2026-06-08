@@ -33,7 +33,11 @@ class StateSnapshotTests(unittest.TestCase):
                     target=SimpleNamespace(ip="192.0.2.20"),
                     dns_on=False,
                     limit=None,
-                    firewall=None,
+                    firewall=SimpleNamespace(
+                        _http_redirect_port=None,
+                        MANGLE="NS-MNG-TEST",
+                        NAT="NS-NAT-TEST",
+                    ),
                 )
             }
 
@@ -48,7 +52,39 @@ class StateSnapshotTests(unittest.TestCase):
             self.assertEqual(data["session_id"], "NS-TEST")
             self.assertEqual(data["interface"], "eth0")
             self.assertFalse(data["global_rules_applied"])
+            self.assertFalse(data["shaper_base_initialized"])
             self.assertEqual(data["snapshot"]["route_localnet"], 0)
+            self.assertEqual(
+                data["targets"][0]["mangle_chain"], "NS-MNG-TEST")
+            self.assertEqual(data["targets"][0]["nat_chain"], "NS-NAT-TEST")
+
+    def test_dry_run_save_state_stays_in_memory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ns = NetShaper.__new__(NetShaper)
+            ns.interface = "eth0"
+            ns.gw = "192.0.2.1"
+            ns.own_ip = "192.0.2.10"
+            ns.session_id = "NS-TEST"
+            ns._global_rules_applied = False
+            ns.state_snapshot = NetworkStateSnapshot(
+                session_id="NS-TEST",
+                interface="eth0",
+                ipv4_forwarding=0,
+                ipv6_forwarding=0,
+                route_localnet=0,
+                iptables_rules="",
+                ip6tables_rules="",
+                tc_configuration="",
+            )
+            ns.sessions = {}
+
+            with mock.patch("netshaper.core.orchestrator.config.STATE_DIR", tmp), \
+                 mock.patch("netshaper.core.orchestrator.config.DRY_RUN", True):
+                result = ns.save_state()
+
+            self.assertTrue(result)
+            self.assertEqual(ns._dry_run_state["session_id"], "NS-TEST")
+            self.assertFalse(os.path.exists(os.path.join(tmp, "NS-TEST")))
 
     @mock.patch("netshaper.core.state_manager.subprocess.run")
     def test_capture_records_original_forwarding_values(self, run_mock):
@@ -72,6 +108,23 @@ class StateSnapshotTests(unittest.TestCase):
             ["iptables-save"], capture_output=True, text=True, check=False)
         run_mock.assert_any_call(
             ["ip6tables-save"], capture_output=True, text=True, check=False)
+
+    @mock.patch("netshaper.core.state_manager.subprocess.run")
+    def test_capture_keeps_failed_sysctl_reads_unknown(self, run_mock):
+        run_mock.side_effect = [
+            SimpleNamespace(returncode=1, stdout=""),
+            SimpleNamespace(returncode=0, stdout="0\n"),
+            SimpleNamespace(returncode=1, stdout=""),
+            SimpleNamespace(returncode=0, stdout="*filter\nCOMMIT\n"),
+            SimpleNamespace(returncode=0, stdout="*filter\nCOMMIT\n"),
+            SimpleNamespace(returncode=0, stdout="qdisc ok\n"),
+        ]
+
+        snapshot = StateSnapshotManager.capture("wlp0s20f3", "NS-TEST")
+
+        self.assertIsNone(snapshot.ipv4_forwarding)
+        self.assertEqual(snapshot.ipv6_forwarding, 0)
+        self.assertIsNone(snapshot.route_localnet)
 
     @mock.patch("netshaper.core.state_manager.subprocess.run")
     def test_restore_reapplies_saved_forwarding_and_rules(self, run_mock):

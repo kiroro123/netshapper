@@ -24,7 +24,7 @@ class TargetSessionCleanupTests(unittest.TestCase):
         session.shaper = mock.Mock()
 
         with mock.patch("netshaper.core.session.log"):
-            session.cleanup()
+            result = session.cleanup()
 
         arp_spoof.shutdown.assert_called_once()
         ndp_spoof.shutdown.assert_called_once()
@@ -37,6 +37,7 @@ class TargetSessionCleanupTests(unittest.TestCase):
         self.assertIsNone(session.firewall)
         self.assertFalse(session.throttle_on)
         self.assertIsNone(session._mark_id)
+        self.assertFalse(result)
 
 
 if __name__ == "__main__":

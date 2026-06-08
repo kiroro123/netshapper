@@ -32,6 +32,15 @@ class StateSnapshotManager:
         except FileNotFoundError:
             return ""
 
+    @staticmethod
+    def _parse_optional_int(value: str) -> Optional[int]:
+        if value == "":
+            return None
+        try:
+            return int(value)
+        except ValueError:
+            return None
+
     @classmethod
     def restore(cls, snapshot: NetworkStateSnapshot,
                 restore_firewall: bool = False) -> bool:
@@ -93,26 +102,15 @@ class StateSnapshotManager:
 
     @classmethod
     def capture(cls, interface: str, session_id: str) -> NetworkStateSnapshot:
-        ipv4_forwarding = None
-        ipv6_forwarding = None
-        route_localnet = None
-
-        try:
-            ipv4_forwarding = int(cls._run(["sysctl", "-n", "net.ipv4.ip_forward"]) or 0)
-        except ValueError:
-            ipv4_forwarding = None
-
-        try:
-            ipv6_forwarding = int(cls._run(["sysctl", "-n", "net.ipv6.conf.all.forwarding"]) or 0)
-        except ValueError:
-            ipv6_forwarding = None
-
-        try:
-            route_localnet = int(
-                cls._run(["sysctl", "-n", f"net.ipv4.conf.{interface}.route_localnet"]) or 0
-            )
-        except ValueError:
-            route_localnet = None
+        ipv4_forwarding = cls._parse_optional_int(
+            cls._run(["sysctl", "-n", "net.ipv4.ip_forward"])
+        )
+        ipv6_forwarding = cls._parse_optional_int(
+            cls._run(["sysctl", "-n", "net.ipv6.conf.all.forwarding"])
+        )
+        route_localnet = cls._parse_optional_int(
+            cls._run(["sysctl", "-n", f"net.ipv4.conf.{interface}.route_localnet"])
+        )
 
         return NetworkStateSnapshot(
             session_id=session_id,

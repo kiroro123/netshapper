@@ -45,8 +45,9 @@ class TrafficShaperTests(unittest.TestCase):
         )
         shaper = TrafficShaper("eth0")
 
-        shaper.cleanup()
+        result = shaper.cleanup()
 
+        self.assertTrue(result)
         runner_mock.assert_not_called()
 
     @mock.patch("netshaper.network.shaper.SubprocessRunner.run")
@@ -60,8 +61,9 @@ class TrafficShaperTests(unittest.TestCase):
         shaper = TrafficShaper("eth0")
         shaper._base_initialized = True
 
-        shaper.cleanup()
+        result = shaper.cleanup()
 
+        self.assertTrue(result)
         runner_mock.assert_called_once_with(
             ["tc", "qdisc", "del", "dev", "eth0", "root"],
             check=False,
@@ -80,6 +82,24 @@ class TrafficShaperTests(unittest.TestCase):
             shaper.apply_target("192.0.2.10", 5.0)
 
         self.assertFalse(shaper._base_initialized)
+
+    @mock.patch("netshaper.network.shaper.SubprocessRunner.run")
+    @mock.patch("netshaper.network.shaper.subprocess.run")
+    def test_apply_target_rolls_back_partial_setup(
+            self, run_mock, runner_mock):
+        run_mock.return_value = SimpleNamespace(returncode=0, stdout="")
+        runner_mock.side_effect = [True, True, False, True]
+        shaper = TrafficShaper("eth0")
+
+        with self.assertRaisesRegex(RuntimeError, "traffic filter"):
+            shaper.apply_target("192.0.2.10", 5.0)
+
+        self.assertEqual(shaper._active_marks, set())
+        runner_mock.assert_any_call(
+            ["tc", "class", "del", "dev", "eth0", "classid", "1:10"],
+            check=False,
+            silent=True,
+        )
 
 
 if __name__ == "__main__":

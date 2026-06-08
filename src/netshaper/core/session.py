@@ -31,9 +31,11 @@ class TargetSession:
                  own_mac: str, own_ip: str, own_ipv6: Optional[str],
                  gateway_ip: str, gateway_mac: str,
                  gateway_ipv6: Optional[str],
-                 shaper: TrafficShaper):
+                 shaper: TrafficShaper,
+                 session_id: Optional[str] = None):
         self.target       = target
         self.interface    = interface
+        self.session_id   = session_id
         self.own_mac      = own_mac
         self.own_ip       = own_ip
         self.own_ipv6     = own_ipv6
@@ -58,15 +60,27 @@ class TargetSession:
               http_redirect_port: Optional[int] = None,
               limit: Optional[float] = None,
               mark_base: int = 10) -> None:
-        self.firewall = FirewallManager(self.target.ip, self.interface)
+        session_id = getattr(self, "session_id", None)
+        self.firewall = FirewallManager(
+            self.target.ip,
+            self.interface,
+            session_id=session_id,
+        )
         if dns_spoof or captive_portal or http_redirect_port:
-            self.firewall.add_redirect_rules(
-                dns_spoof=dns_spoof,
-                http_redirect_port=http_redirect_port)
+            if not self.firewall.add_redirect_rules(
+                    dns_spoof=dns_spoof,
+                    http_redirect_port=http_redirect_port):
+                raise RuntimeError(
+                    f"Failed to add redirect rules for {self.target.ip}"
+                )
             self.dns_on = dns_spoof
         if limit is not None:
             self.shaper.apply_target(self.target.ip, limit, mark_base)
-            self.firewall.add_shaping(self.target.ip, mark_base)
+            if not self.firewall.add_shaping(self.target.ip, mark_base):
+                self.shaper.cleanup_target(mark_base)
+                raise RuntimeError(
+                    f"Failed to add shaping firewall marks for {self.target.ip}"
+                )
             self.throttle_on = True
             self.limit        = limit
             self._mark_id     = mark_base
@@ -96,14 +110,16 @@ class TargetSession:
         if self.ndp_spoof:
             self.ndp_spoof.shutdown()
 
-    def cleanup(self) -> None:
+    def cleanup(self) -> bool:
         self.active = False
         self.is_shutting_down = True
         errors = []
 
         def cleanup_step(description: str, action) -> None:
             try:
-                action()
+                result = action()
+                if result is False:
+                    raise RuntimeError("cleanup command failed")
             except Exception as exc:
                 errors.append((description, exc))
                 log.error(
@@ -133,3 +149,4 @@ class TargetSession:
                 f"Target {self.target.ip} cleanup completed with "
                 f"{len(errors)} error(s)."
             )
+        return not errors

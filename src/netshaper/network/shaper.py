@@ -3,7 +3,7 @@ NetShaper — Linux tc HTB traffic shaper.
 """
 import logging
 import subprocess
-from typing import Set
+from typing import List, Set, Tuple
 
 from netshaper.system import SubprocessRunner
 
@@ -48,39 +48,71 @@ class TrafficShaper:
                      mark_base: int = 10) -> None:
         k = int(mbps * 1000)
         self._init_root()
+        created_classes: List[int] = []
+        created_filters: List[Tuple[int, str]] = []
         for mark in [mark_base, mark_base + 10]:
             classid = f"1:{mark}"
-            SubprocessRunner.run(
+            if not SubprocessRunner.run(
                 ["tc", "class", "add", "dev", self.interface,
                  "parent", "1:", "classid", classid,
-                 "htb", "rate", f"{k}kbit", "burst", "15k"])
+                 "htb", "rate", f"{k}kbit", "burst", "15k"]):
+                self._rollback_created(created_filters, created_classes)
+                raise RuntimeError(
+                    f"Failed to create traffic class {classid}"
+                )
+            created_classes.append(mark)
             for proto in ["ip", "ipv6"]:
-                SubprocessRunner.run(
+                if not SubprocessRunner.run(
                     ["tc", "filter", "add", "dev", self.interface,
                      "parent", "1:", "protocol", proto,
                      "handle", str(mark), "fw", "flowid", classid],
-                    silent=True)
+                    silent=True):
+                    self._rollback_created(created_filters, created_classes)
+                    raise RuntimeError(
+                        f"Failed to create traffic filter for mark {mark}"
+                    )
+                created_filters.append((mark, proto))
         self._active_marks.add(mark_base)
         log.info(
             f"Shaping {target_ip}: {mbps} Mbps "
             f"(marks {mark_base}/{mark_base + 10})")
 
-    def cleanup_target(self, mark_base: int) -> None:
-        for mark in [mark_base, mark_base + 10]:
+    def _rollback_created(
+            self,
+            filters: List[Tuple[int, str]],
+            classes: List[int]) -> None:
+        for mark, proto in reversed(filters):
             SubprocessRunner.run(
                 ["tc", "filter", "del", "dev", self.interface,
-                 "parent", "1:", "handle", str(mark), "fw"],
+                 "parent", "1:", "protocol", proto,
+                 "handle", str(mark), "fw"],
                 check=False, silent=True)
+        for mark in reversed(classes):
             SubprocessRunner.run(
                 ["tc", "class", "del", "dev", self.interface,
                  "classid", f"1:{mark}"],
                 check=False, silent=True)
-        self._active_marks.discard(mark_base)
 
-    def cleanup(self) -> None:
+    def cleanup_target(self, mark_base: int) -> bool:
+        ok = True
+        for mark in [mark_base, mark_base + 10]:
+            ok = SubprocessRunner.run(
+                ["tc", "filter", "del", "dev", self.interface,
+                 "parent", "1:", "handle", str(mark), "fw"],
+                check=False, silent=True) and ok
+            ok = SubprocessRunner.run(
+                ["tc", "class", "del", "dev", self.interface,
+                 "classid", f"1:{mark}"],
+                check=False, silent=True) and ok
+        self._active_marks.discard(mark_base)
+        return ok
+
+    def cleanup(self) -> bool:
+        ok = True
         if self._base_initialized:
-            SubprocessRunner.run(
+            ok = SubprocessRunner.run(
                 ["tc", "qdisc", "del", "dev", self.interface, "root"],
                 check=False, silent=True)
         self._base_initialized = False
         self._active_marks.clear()
+        return ok
