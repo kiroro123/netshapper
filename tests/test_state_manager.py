@@ -52,11 +52,47 @@ class StateSnapshotTests(unittest.TestCase):
             self.assertEqual(data["session_id"], "NS-TEST")
             self.assertEqual(data["interface"], "eth0")
             self.assertFalse(data["global_rules_applied"])
+            self.assertIsNone(data["global_rule_comment"])
             self.assertFalse(data["shaper_base_initialized"])
             self.assertEqual(data["snapshot"]["route_localnet"], 0)
             self.assertEqual(
                 data["targets"][0]["mangle_chain"], "NS-MNG-TEST")
             self.assertEqual(data["targets"][0]["nat_chain"], "NS-NAT-TEST")
+
+    def test_save_state_records_global_rule_comment(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ns = NetShaper.__new__(NetShaper)
+            ns.interface = "eth0"
+            ns.gw = "192.0.2.1"
+            ns.own_ip = "192.0.2.10"
+            ns.session_id = "NS-TEST"
+            ns._global_rules_applied = True
+            ns._global_firewall_binaries_applied = ["iptables"]
+            ns.state_snapshot = NetworkStateSnapshot(
+                session_id="NS-TEST",
+                interface="eth0",
+                ipv4_forwarding=0,
+                ipv6_forwarding=0,
+                route_localnet=0,
+                iptables_rules="",
+                ip6tables_rules="",
+                tc_configuration="",
+            )
+            ns.sessions = {}
+
+            with mock.patch("netshaper.core.orchestrator.config.STATE_DIR", tmp):
+                result = ns.save_state()
+
+            self.assertTrue(result)
+            state_path = os.path.join(tmp, ns.session_id, "state.json")
+            with open(state_path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            self.assertTrue(data["global_rules_applied"])
+            self.assertEqual(
+                data["global_rule_comment"],
+                "netshaper:NS-TEST:global",
+            )
+            self.assertEqual(data["global_firewall_binaries"], ["iptables"])
 
     def test_dry_run_save_state_stays_in_memory(self):
         with tempfile.TemporaryDirectory() as tmp:

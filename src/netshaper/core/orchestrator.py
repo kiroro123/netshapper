@@ -137,11 +137,90 @@ class NetShaper:
         return f"{val:.1f} TB"
 
     # ── Global forwarding rules ───────────────────────────────────────────────
+    def _global_rule_comment(self) -> str:
+        return f"netshaper:{self.session_id}:global"
+
+    @staticmethod
+    def _global_firewall_rule_specs(
+            binary: str,
+            iface: str,
+            comment: Optional[str]) -> List[dict]:
+        comment_args = (
+            ["-m", "comment", "--comment", comment]
+            if comment else []
+        )
+        return [
+            {
+                "description": f"{binary} forward same-interface accept",
+                "apply": [
+                    binary, "-I", "FORWARD", "1",
+                    "-i", iface, "-o", iface,
+                    *comment_args,
+                    "-j", "ACCEPT",
+                ],
+                "delete": [
+                    binary, "-D", "FORWARD",
+                    "-i", iface, "-o", iface,
+                    *comment_args,
+                    "-j", "ACCEPT",
+                ],
+                "check": [
+                    binary, "-C", "FORWARD",
+                    "-i", iface, "-o", iface,
+                    *comment_args,
+                    "-j", "ACCEPT",
+                ],
+            },
+            {
+                "description": f"{binary} established forward accept",
+                "apply": [
+                    binary, "-I", "FORWARD", "1",
+                    "-m", "state", "--state", "ESTABLISHED,RELATED",
+                    *comment_args,
+                    "-j", "ACCEPT",
+                ],
+                "delete": [
+                    binary, "-D", "FORWARD",
+                    "-m", "state", "--state", "ESTABLISHED,RELATED",
+                    *comment_args,
+                    "-j", "ACCEPT",
+                ],
+                "check": [
+                    binary, "-C", "FORWARD",
+                    "-m", "state", "--state", "ESTABLISHED,RELATED",
+                    *comment_args,
+                    "-j", "ACCEPT",
+                ],
+            },
+            {
+                "description": f"{binary} masquerade",
+                "apply": [
+                    binary, "-t", "nat", "-A", "POSTROUTING",
+                    "-o", iface,
+                    *comment_args,
+                    "-j", "MASQUERADE",
+                ],
+                "delete": [
+                    binary, "-t", "nat", "-D", "POSTROUTING",
+                    "-o", iface,
+                    *comment_args,
+                    "-j", "MASQUERADE",
+                ],
+                "check": [
+                    binary, "-t", "nat", "-C", "POSTROUTING",
+                    "-o", iface,
+                    *comment_args,
+                    "-j", "MASQUERADE",
+                ],
+            },
+        ]
+
     def _apply_global_rules(self) -> None:
         if self._global_rules_applied:
             return
         ok = True
         applied_binaries = []
+        comment = self._global_rule_comment()
         ok = SubprocessRunner.run(
             ["sysctl", "-w", "net.ipv4.ip_forward=1"], silent=True) and ok
         ok = SubprocessRunner.run(
@@ -154,18 +233,10 @@ class NetShaper:
         for binary in ["iptables", "ip6tables"]:
             if shutil.which(binary):
                 applied_binaries.append(binary)
-                ok = SubprocessRunner.run(
-                    [binary, "-I", "FORWARD", "1",
-                     "-i", self.interface, "-o", self.interface,
-                     "-j", "ACCEPT"], silent=True) and ok
-                ok = SubprocessRunner.run(
-                    [binary, "-I", "FORWARD", "1", "-m", "state",
-                     "--state", "ESTABLISHED,RELATED",
-                     "-j", "ACCEPT"], silent=True) and ok
-                ok = SubprocessRunner.run(
-                    [binary, "-t", "nat", "-A", "POSTROUTING",
-                     "-o", self.interface, "-j", "MASQUERADE"],
-                    silent=True) and ok
+                for spec in self._global_firewall_rule_specs(
+                        binary, self.interface, comment):
+                    ok = SubprocessRunner.run(
+                        spec["apply"], silent=True) and ok
         if not ok:
             raise RuntimeError("Failed to apply global forwarding rules")
         self._global_firewall_binaries_applied = applied_binaries
@@ -210,18 +281,10 @@ class NetShaper:
                     )
                     ok = False
                 continue
-            ok = SubprocessRunner.run(
-                [binary, "-D", "FORWARD",
-                 "-i", self.interface, "-o", self.interface,
-                 "-j", "ACCEPT"], check=False, silent=True) and ok
-            ok = SubprocessRunner.run(
-                [binary, "-D", "FORWARD", "-m", "state",
-                 "--state", "ESTABLISHED,RELATED",
-                 "-j", "ACCEPT"], check=False, silent=True) and ok
-            ok = SubprocessRunner.run(
-                [binary, "-t", "nat", "-D", "POSTROUTING",
-                 "-o", self.interface, "-j", "MASQUERADE"],
-                check=False, silent=True) and ok
+            for spec in self._global_firewall_rule_specs(
+                    binary, self.interface, self._global_rule_comment()):
+                ok = SubprocessRunner.run(
+                    spec["delete"], check=False, silent=True) and ok
         if ok:
             self._global_rules_applied = False
             self._global_firewall_binaries_applied = []
@@ -561,6 +624,10 @@ class NetShaper:
             "gw":     self.gw,
             "own_ip": self.own_ip,
             "global_rules_applied": self._global_rules_applied,
+            "global_rule_comment": (
+                self._global_rule_comment()
+                if self._global_rules_applied else None
+            ),
             "global_firewall_binaries": list(
                 getattr(self, "_global_firewall_binaries_applied", [])),
             "shaper_base_initialized": getattr(
@@ -667,30 +734,17 @@ class NetShaper:
                             binary for binary in ["iptables", "ip6tables"]
                             if shutil.which(binary)
                         ]
+                    comment = data.get("global_rule_comment")
                     for binary in binaries:
                         if not require_binary(binary, "global firewall rules"):
                             continue
-                        run_recovery_if_present(
-                            f"{binary} forward same-interface accept",
-                            [binary, "-D", "FORWARD",
-                             "-i", iface, "-o", iface, "-j", "ACCEPT"],
-                            [binary, "-C", "FORWARD",
-                             "-i", iface, "-o", iface, "-j", "ACCEPT"],
-                        )
-                        run_recovery_if_present(
-                            f"{binary} established forward accept",
-                            [binary, "-D", "FORWARD", "-m", "state",
-                             "--state", "ESTABLISHED,RELATED", "-j", "ACCEPT"],
-                            [binary, "-C", "FORWARD", "-m", "state",
-                             "--state", "ESTABLISHED,RELATED", "-j", "ACCEPT"],
-                        )
-                        run_recovery_if_present(
-                            f"{binary} masquerade",
-                            [binary, "-t", "nat", "-D", "POSTROUTING",
-                             "-o", iface, "-j", "MASQUERADE"],
-                            [binary, "-t", "nat", "-C", "POSTROUTING",
-                             "-o", iface, "-j", "MASQUERADE"],
-                        )
+                        for spec in self._global_firewall_rule_specs(
+                                binary, iface, comment):
+                            run_recovery_if_present(
+                                spec["description"],
+                                spec["delete"],
+                                spec["check"],
+                            )
 
                 for target in data.get("targets", []):
                     ip = target.get("ip")
