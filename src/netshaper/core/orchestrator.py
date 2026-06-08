@@ -159,6 +159,11 @@ class NetShaper:
         Backward-compatibility: the CLI passes `target` as an IP string.
         Newer internal code may pass a `Device`.
         """
+        target_ip = target if isinstance(target, str) else target.ip
+        with self._lifecycle_lock:
+            if target_ip in self.sessions:
+                raise ValueError(f"Target {target_ip} is already active.")
+
         # Resolve IP -> Device if needed
         if isinstance(target, str):
             ip = target
@@ -171,6 +176,8 @@ class NetShaper:
             target = Device(ip=ip, mac=mac)
 
         with self._lifecycle_lock:
+            if target.ip in self.sessions:
+                raise ValueError(f"Target {target.ip} is already active.")
             mark_base = self.mark_pool.acquire(target.ip)
             session = TargetSession(
                 target,

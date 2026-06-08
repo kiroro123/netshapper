@@ -62,6 +62,8 @@ def parse_args() -> argparse.Namespace:
             for item in token.split(",")
             if item.strip()
         ]
+    if args.limit is not None and not 0.1 <= args.limit <= 1000:
+        parser.error("--limit must be between 0.1 and 1000 Mbps")
     return args
 
 

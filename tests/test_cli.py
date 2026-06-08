@@ -21,6 +21,12 @@ class CliTests(unittest.TestCase):
             args = cli.parse_args()
         self.assertEqual(args.limit, 7.5)
 
+    def test_parse_args_rejects_limit_outside_interactive_range(self):
+        with mock.patch("sys.argv", ["netshaper", "--limit", "0.01"]), \
+             mock.patch("sys.stderr"), \
+             self.assertRaises(SystemExit):
+            cli.parse_args()
+
     def test_normalize_feature_choices_rejects_bad_input(self):
         features, invalid = cli.normalize_feature_choices("1 9 x")
         self.assertEqual(features, {1})

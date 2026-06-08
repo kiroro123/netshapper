@@ -4,9 +4,18 @@ import unittest
 from unittest import mock
 
 from netshaper.core.orchestrator import NetShaper
+from netshaper.models import Device
 
 
 class NetShaperCleanupTests(unittest.TestCase):
+    def test_add_target_rejects_duplicate_target(self):
+        ns = NetShaper.__new__(NetShaper)
+        ns._lifecycle_lock = threading.RLock()
+        ns.sessions = {"192.0.2.10": mock.Mock()}
+
+        with self.assertRaisesRegex(ValueError, "already active"):
+            ns.add_target(Device(ip="192.0.2.10", mac="00:11:22:33:44:55"))
+
     def test_cleanup_runs_all_steps_once_even_when_steps_fail(self):
         ns = NetShaper.__new__(NetShaper)
         ns._lifecycle_lock = threading.RLock()

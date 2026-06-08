@@ -385,17 +385,7 @@ def configure_dns(args) -> None:
 
 
 # ── Fake DNS Server (UDP, dual-stack, parameterised port) ──────────────────
-def dns_server(port: int = 53):
-    """
-    Dual-stack UDP DNS server.
-      - selected A queries  → YOUR_IP
-      - selected non-A      → NOERROR/NODATA
-      - all other queries   → upstream DNS
-    RFC 1035 §4.1.4 pointer-compression handled.
-    QDCOUNT echoed verbatim for strict-resolver compatibility.
-
-    port param allows unprivileged override (e.g. 5353) in CI/test runs.
-    """
+def bind_dns_socket(port: int = 53) -> socket.socket:
     sock = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
 
     if hasattr(socket, "IPV6_V6ONLY"):
@@ -407,8 +397,16 @@ def dns_server(port: int = 53):
     try:
         sock.bind(("::", port))
     except PermissionError:
+        sock.close()
         sys.exit(f"[DNS] Error: Root privileges required to bind to port {port}.")
+    except OSError as e:
+        sock.close()
+        sys.exit(f"[DNS] Error: Could not bind to port {port}: {e}")
 
+    return sock
+
+
+def print_dns_startup(port: int) -> None:
     if DNS_SPOOF_ALL:
         mode = "ALL DOMAINS"
     elif DNS_SMART_SPOOF_ALL:
@@ -422,6 +420,8 @@ def dns_server(port: int = 53):
     print(f"[DNS] Upstream={DNS_UPSTREAM}  Spoof={mode}")
     print(f"[DNS] Forward={forwarded}  Block={blocked}  SmartCategories={categories}")
 
+
+def serve_dns(sock: socket.socket) -> None:
     while True:
         try:
             data, addr = sock.recvfrom(1024)
@@ -458,6 +458,22 @@ def dns_server(port: int = 53):
 
         except Exception:
             continue              # Never crash on a bad packet
+
+
+def dns_server(port: int = 53):
+    """
+    Dual-stack UDP DNS server.
+      - selected A queries  → YOUR_IP
+      - selected non-A      → NOERROR/NODATA
+      - all other queries   → upstream DNS
+    RFC 1035 §4.1.4 pointer-compression handled.
+    QDCOUNT echoed verbatim for strict-resolver compatibility.
+
+    port param allows unprivileged override (e.g. 5353) in CI/test runs.
+    """
+    sock = bind_dns_socket(port)
+    print_dns_startup(port)
+    serve_dns(sock)
 
 
 # ── HTTP Server (Captive Portal, dual-stack) ───────────────────────────────
@@ -563,24 +579,31 @@ class DualStackHTTPServer(ThreadedHTTPServer):
         super().server_bind()
 
 
-# ── Entry point ────────────────────────────────────────────────────────────
-if __name__ == "__main__":
+def main() -> None:
+    global YOUR_IP
+
     args = parse_args()
     configure_dns(args)
     YOUR_IP = args.host_ip or get_own_ip()
 
     # Phase 1: bind privileged ports
-    threading.Thread(target=dns_server, args=(args.dns_port,), daemon=True).start()
+    dns_sock = bind_dns_socket(args.dns_port)
 
     try:
         httpd = DualStackHTTPServer(("::", args.http_port), CaptivePortalHandler)
     except PermissionError:
+        dns_sock.close()
         sys.exit(
             f"[Portal] Error: Root privileges required to bind to port {args.http_port}."
         )
+    except OSError as e:
+        dns_sock.close()
+        sys.exit(f"[Portal] Error: Could not bind to port {args.http_port}: {e}")
 
     # Phase 2: drop root now that sockets are bound
     drop_privileges("nobody")
+    print_dns_startup(args.dns_port)
+    threading.Thread(target=serve_dns, args=(dns_sock,), daemon=True).start()
 
     print(
         f"[Portal] Combined server running — DNS :{args.dns_port}  "
@@ -590,3 +613,8 @@ if __name__ == "__main__":
         httpd.serve_forever()
     except KeyboardInterrupt:
         print("\n[Portal] Shutting down gracefully.")
+
+
+# ── Entry point ────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    main()

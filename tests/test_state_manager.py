@@ -51,6 +51,10 @@ class StateSnapshotTests(unittest.TestCase):
         self.assertEqual(snapshot.interface, "wlp0s20f3")
         self.assertEqual(snapshot.ipv4_forwarding, 1)
         self.assertEqual(snapshot.ipv6_forwarding, 0)
+        run_mock.assert_any_call(
+            ["iptables-save"], capture_output=True, text=True, check=False)
+        run_mock.assert_any_call(
+            ["ip6tables-save"], capture_output=True, text=True, check=False)
 
     @mock.patch("netshaper.core.state_manager.subprocess.run")
     def test_restore_reapplies_saved_forwarding_and_rules(self, run_mock):
@@ -89,6 +93,10 @@ class StateSnapshotTests(unittest.TestCase):
             input="*filter\n-A FORWARD -j ACCEPT\nCOMMIT\n",
             text=True,
             check=False,
+        )
+        self.assertFalse(
+            any(call.args[0][:3] == ["tc", "qdisc", "del"]
+                for call in run_mock.call_args_list)
         )
 
 

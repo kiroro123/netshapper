@@ -59,17 +59,6 @@ class StateSnapshotManager:
                 except FileNotFoundError:
                     continue
 
-        if snapshot.tc_configuration.strip():
-            try:
-                subprocess.run(
-                    ["tc", "qdisc", "del", "dev", snapshot.interface, "root"],
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                )
-            except FileNotFoundError:
-                return
-
     @classmethod
     def capture(cls, interface: str, session_id: str) -> NetworkStateSnapshot:
         ipv4_forwarding = None
@@ -90,7 +79,7 @@ class StateSnapshotManager:
             interface=interface,
             ipv4_forwarding=ipv4_forwarding,
             ipv6_forwarding=ipv6_forwarding,
-            iptables_rules=cls._run(["iptables", "-S"]),
-            ip6tables_rules=cls._run(["ip6tables", "-S"]),
+            iptables_rules=cls._run(["iptables-save"]),
+            ip6tables_rules=cls._run(["ip6tables-save"]),
             tc_configuration=cls._run(["tc", "qdisc", "show", "dev", interface]),
         )

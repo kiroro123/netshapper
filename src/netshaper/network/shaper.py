@@ -2,6 +2,7 @@
 NetShaper — Linux tc HTB traffic shaper.
 """
 import logging
+import subprocess
 from typing import Set
 
 from netshaper.system import SubprocessRunner
@@ -15,14 +16,40 @@ class TrafficShaper:
         self._base_initialized = False
         self._active_marks: Set[int] = set()
 
+    def _root_qdisc(self) -> str:
+        try:
+            result = subprocess.run(
+                ["tc", "qdisc", "show", "dev", self.interface, "root"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except FileNotFoundError:
+            return ""
+        return result.stdout.strip() if result.returncode == 0 else ""
+
+    @staticmethod
+    def _is_netshaper_root(qdisc: str) -> bool:
+        return qdisc.startswith("qdisc htb 1:")
+
     def _init_root(self) -> None:
         if not self._base_initialized:
-            SubprocessRunner.run(
-                ["tc", "qdisc", "del", "dev", self.interface, "root"],
-                check=False, silent=True)
-            SubprocessRunner.run(
+            root_qdisc = self._root_qdisc()
+            if root_qdisc and not self._is_netshaper_root(root_qdisc):
+                raise RuntimeError(
+                    "Refusing to replace existing root qdisc on "
+                    f"{self.interface}: {root_qdisc}"
+                )
+            if root_qdisc:
+                SubprocessRunner.run(
+                    ["tc", "qdisc", "del", "dev", self.interface, "root"],
+                    check=False, silent=True)
+            if not SubprocessRunner.run(
                 ["tc", "qdisc", "add", "dev", self.interface,
-                 "root", "handle", "1:", "htb"])
+                 "root", "handle", "1:", "htb"]):
+                raise RuntimeError(
+                    f"Failed to create NetShaper root qdisc on {self.interface}"
+                )
             self._base_initialized = True
 
     def apply_target(self, target_ip: str, mbps: float,
@@ -59,8 +86,9 @@ class TrafficShaper:
         self._active_marks.discard(mark_base)
 
     def cleanup(self) -> None:
-        SubprocessRunner.run(
-            ["tc", "qdisc", "del", "dev", self.interface, "root"],
-            check=False, silent=True)
+        if self._base_initialized or self._is_netshaper_root(self._root_qdisc()):
+            SubprocessRunner.run(
+                ["tc", "qdisc", "del", "dev", self.interface, "root"],
+                check=False, silent=True)
         self._base_initialized = False
         self._active_marks.clear()
