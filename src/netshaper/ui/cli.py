@@ -184,6 +184,49 @@ def pick_limit_ui() -> float:
                 print_flush("  [!] Invalid number.")
 
 
+def run_active_session(
+    ns,
+    targets: List[str],
+    *,
+    arp_on: bool,
+    dns_spoof_on: bool,
+    captive_portal: bool,
+    http_redirect_port: Optional[int],
+    throttle_on: bool,
+    limit: Optional[float],
+    sniff_on: bool,
+    save_pcap: bool,
+    rolling: bool,
+) -> None:
+    try:
+        ns._apply_global_rules()
+        for target in targets:
+            ns.add_target(
+                target,
+                arp_on=arp_on,
+                dns_spoof=dns_spoof_on,
+                captive_portal=captive_portal,
+                http_redirect_port=http_redirect_port,
+                limit=limit if throttle_on else None,
+            )
+
+        if sniff_on:
+            ns.launch_sniffer(
+                target_ips=targets,
+                save_pcap=save_pcap,
+                rolling=rolling,
+            )
+
+        ns.save_state()
+        threading.Thread(target=ns.monitor, daemon=True).start()
+        print_flush("[*] Active. Press Ctrl+C to stop.")
+        while not ns.stop_event.wait(1):
+            pass
+    finally:
+        ns.cleanup()
+        print_flush("[+] Teardown complete. Goodbye.")
+
+
 def main() -> None:
     args = parse_args()
     if args.version:
@@ -315,41 +358,27 @@ def main() -> None:
         sys.exit(0)
 
     def sig_handler(_sig, _frame):
-        ns.cleanup()
-        sys.exit(0)
+        ns.stop_event.set()
 
     signal.signal(signal.SIGINT, sig_handler)
     signal.signal(signal.SIGTERM, sig_handler)
 
-    ns._apply_global_rules()
-    for target in targets:
-        ns.add_target(
-            target,
+    try:
+        run_active_session(
+            ns,
+            targets,
             arp_on=arp_on,
-            dns_spoof=dns_spoof_on,
+            dns_spoof_on=dns_spoof_on,
             captive_portal=captive_portal,
             http_redirect_port=http_redirect_port,
-            limit=limit if throttle_on else None,
-        )
-
-    if sniff_on:
-        ns.launch_sniffer(
-            target_ips=[target.ip for target in targets],
+            throttle_on=throttle_on,
+            limit=limit,
+            sniff_on=sniff_on,
             save_pcap=save_pcap,
             rolling=rolling,
         )
-
-    ns.save_state()
-    threading.Thread(target=ns.monitor, daemon=True).start()
-    print_flush("[*] Active. Press Ctrl+C to stop.")
-    try:
-        while not ns.stop_event.wait(1):
-            pass
     except KeyboardInterrupt:
-        pass
-    finally:
-        ns.cleanup()
-        print_flush("[+] Teardown complete. Goodbye.")
+        ns.stop_event.set()
 
 
 if __name__ == "__main__":

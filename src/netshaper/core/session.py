@@ -98,8 +98,38 @@ class TargetSession:
 
     def cleanup(self) -> None:
         self.active = False
-        self.stop_spoof()
+        self.is_shutting_down = True
+        errors = []
+
+        def cleanup_step(description: str, action) -> None:
+            try:
+                action()
+            except Exception as exc:
+                errors.append((description, exc))
+                log.error(
+                    f"Target {self.target.ip} cleanup failed "
+                    f"({description}): {exc}"
+                )
+
+        if self.arp_spoof:
+            cleanup_step("ARP spoof shutdown", self.arp_spoof.shutdown)
+            self.arp_spoof = None
+        if self.ndp_spoof:
+            cleanup_step("NDP spoof shutdown", self.ndp_spoof.shutdown)
+            self.ndp_spoof = None
         if self.firewall:
-            self.firewall.cleanup()
+            cleanup_step("firewall cleanup", self.firewall.cleanup)
+            self.firewall = None
         if self.throttle_on and self._mark_id is not None:
-            self.shaper.cleanup_target(self._mark_id)
+            cleanup_step(
+                "traffic shaping cleanup",
+                lambda: self.shaper.cleanup_target(self._mark_id),
+            )
+            self.throttle_on = False
+            self._mark_id = None
+            self.limit = None
+        if errors:
+            log.warning(
+                f"Target {self.target.ip} cleanup completed with "
+                f"{len(errors)} error(s)."
+            )

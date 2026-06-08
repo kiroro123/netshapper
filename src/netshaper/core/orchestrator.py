@@ -56,6 +56,8 @@ class NetShaper:
         self.stop_event  = threading.Event()
         self._global_rules_applied = False
         self._mitm_proc  = None
+        self._cleanup_running = False
+        self._cleanup_complete = False
         self.state_snapshot = StateSnapshotManager.capture(interface, self.session_id)
 
     # ── Helpers ───────────────────────────────────────────────────────────────
@@ -207,32 +209,70 @@ class NetShaper:
             session.is_shutting_down = True
             del self.sessions[ip]
         # Cleanup outside lock — spoof threads exit naturally via flag check
-        session.cleanup()
-        self.mark_pool.release(ip)
+        try:
+            session.cleanup()
+        finally:
+            self.mark_pool.release(ip)
         log.info(f"Target {ip} removed")
 
     def cleanup(self) -> None:
-        print_flush("\n--- NetShaper Shutdown ---")
-        self.stop_event.set()
         with self._lifecycle_lock:
+            if getattr(self, "_cleanup_complete", False):
+                return
+            if getattr(self, "_cleanup_running", False):
+                return
+            self._cleanup_running = True
             self.is_shutting_down = True
-            for s in self.sessions.values():
-                s.active           = False
-                s.is_shutting_down = True
-        for ip in list(self.sessions.keys()):
-            self.remove_target(ip)
-        if self.sniffer and hasattr(self.sniffer, 'stop'):
-            self.sniffer.stop()
-        if self._mitm_proc:
-            self._mitm_proc.terminate()
-            log.info("mitmproxy terminated")
-        self._remove_global_rules()
-        StateSnapshotManager.restore(self.state_snapshot)
-        self.shaper.cleanup()
-        state_path = os.path.join(config.STATE_DIR, self.session_id, "state.json")
-        if os.path.exists(state_path):
-            os.remove(state_path)
-        log.info("Network restored.")
+
+        errors = []
+
+        def cleanup_step(description: str, action) -> None:
+            try:
+                action()
+            except Exception as exc:
+                errors.append((description, exc))
+                log.error(f"Cleanup step failed ({description}): {exc}")
+
+        try:
+            print_flush("\n--- NetShaper Shutdown ---")
+            self.stop_event.set()
+            with self._lifecycle_lock:
+                for s in self.sessions.values():
+                    s.active           = False
+                    s.is_shutting_down = True
+
+            for ip in list(self.sessions.keys()):
+                cleanup_step(f"target {ip}", lambda ip=ip: self.remove_target(ip))
+            cleanup_step(
+                "sniffer",
+                lambda: self.sniffer.stop()
+                if self.sniffer and hasattr(self.sniffer, "stop") else None,
+            )
+            cleanup_step(
+                "mitmproxy",
+                lambda: (self._mitm_proc.terminate(), log.info("mitmproxy terminated"))
+                if self._mitm_proc else None,
+            )
+            cleanup_step("global rules", self._remove_global_rules)
+            cleanup_step(
+                "state snapshot",
+                lambda: StateSnapshotManager.restore(self.state_snapshot),
+            )
+            cleanup_step("traffic shaper", self.shaper.cleanup)
+
+            state_path = os.path.join(config.STATE_DIR, self.session_id, "state.json")
+            cleanup_step(
+                "state file",
+                lambda: os.remove(state_path) if os.path.exists(state_path) else None,
+            )
+            if errors:
+                log.warning(f"Network cleanup completed with {len(errors)} error(s).")
+            else:
+                log.info("Network restored.")
+        finally:
+            with self._lifecycle_lock:
+                self._cleanup_complete = True
+                self._cleanup_running = False
 
     # Backward-compatible alias (older CLI expects stop())
     def stop(self) -> None:
