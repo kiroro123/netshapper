@@ -28,8 +28,10 @@ class NetShaperCleanupTests(unittest.TestCase):
         ns.sessions = {}
         ns.sniffer = mock.Mock()
         ns.sniffer.stop.side_effect = RuntimeError("sniffer stop failed")
-        ns._mitm_proc = mock.Mock()
-        ns._mitm_proc.terminate.side_effect = RuntimeError("mitm stop failed")
+        mitm_proc = mock.Mock()
+        mitm_proc.poll.return_value = None
+        mitm_proc.terminate.side_effect = RuntimeError("mitm stop failed")
+        ns._mitm_proc = mitm_proc
         ns._remove_global_rules = mock.Mock(side_effect=RuntimeError("rules failed"))
         ns.state_snapshot = mock.Mock()
         ns.shaper = mock.Mock()
@@ -45,7 +47,7 @@ class NetShaperCleanupTests(unittest.TestCase):
             ns.cleanup()
 
         ns.sniffer.stop.assert_called_once()
-        ns._mitm_proc.terminate.assert_called_once()
+        mitm_proc.terminate.assert_called_once()
         ns._remove_global_rules.assert_called_once()
         restore_mock.assert_called_once_with(ns.state_snapshot)
         ns.shaper.cleanup.assert_called_once()
@@ -78,6 +80,52 @@ class NetShaperCleanupTests(unittest.TestCase):
         session.cleanup.assert_called_once()
         ns.mark_pool.release.assert_called_once_with("192.0.2.10")
 
+    def test_failed_rollback_keeps_session_for_retry(self):
+        ns = NetShaper.__new__(NetShaper)
+        ns._lifecycle_lock = threading.RLock()
+        ns.sessions = {}
+        ns.mark_pool = mock.Mock()
+        ns.mark_pool.acquire.return_value = 10
+        ns.interface = "eth0"
+        ns.own_mac = "aa:bb:cc:dd:ee:ff"
+        ns.own_ip = "192.0.2.1"
+        ns.own_ipv6 = None
+        ns.gw = "192.0.2.254"
+        ns.gw_mac = "ff:ee:dd:cc:bb:aa"
+        ns.gw_ipv6 = None
+        ns.shaper = mock.Mock()
+        ns.save_state = mock.Mock(return_value=True)
+        target = Device(ip="192.0.2.10", mac="00:11:22:33:44:55")
+
+        with mock.patch("netshaper.core.orchestrator.TargetSession") as session_cls, \
+             mock.patch("netshaper.core.orchestrator.log"):
+            session = session_cls.return_value
+            session.setup.side_effect = RuntimeError("setup failed")
+            session.cleanup.return_value = False
+
+            with self.assertRaises(RuntimeError):
+                ns.add_target(target)
+
+        self.assertIs(ns.sessions["192.0.2.10"], session)
+        session.cleanup.assert_called_once()
+        ns.mark_pool.release.assert_not_called()
+        ns.save_state.assert_called_once()
+
+    def test_remove_target_keeps_failed_cleanup_registered(self):
+        ns = NetShaper.__new__(NetShaper)
+        ns._lifecycle_lock = threading.RLock()
+        session = mock.Mock()
+        session.cleanup.return_value = False
+        ns.sessions = {"192.0.2.10": session}
+        ns.mark_pool = mock.Mock()
+
+        with mock.patch("netshaper.core.orchestrator.log"):
+            result = ns.remove_target("192.0.2.10")
+
+        self.assertFalse(result)
+        self.assertIs(ns.sessions["192.0.2.10"], session)
+        ns.mark_pool.release.assert_not_called()
+
     def test_dry_run_launch_sniffer_does_not_start_capture(self):
         ns = NetShaper.__new__(NetShaper)
         ns.interface = "eth0"
@@ -102,6 +150,45 @@ class NetShaperCleanupTests(unittest.TestCase):
 
         self.assertTrue(result)
         popen_mock.assert_not_called()
+
+    def test_launch_mitmproxy_reaps_process_when_readiness_fails(self):
+        ns = NetShaper.__new__(NetShaper)
+        ns.own_ip = "192.0.2.1"
+        proc = mock.Mock()
+        proc.poll.return_value = None
+
+        with mock.patch("netshaper.core.orchestrator.config.DRY_RUN", False), \
+             mock.patch("netshaper.core.orchestrator.check_local_port",
+                        return_value=False), \
+             mock.patch("netshaper.core.orchestrator.subprocess.Popen",
+                        return_value=proc), \
+             mock.patch("netshaper.core.orchestrator.time.sleep"), \
+             mock.patch("netshaper.core.orchestrator.log"):
+            result = ns.launch_mitmproxy()
+
+        self.assertFalse(result)
+        proc.terminate.assert_called_once()
+        proc.wait.assert_called_once_with(timeout=5)
+        self.assertIsNone(ns._mitm_proc)
+
+    def test_instance_lock_rejects_second_holder(self):
+        first = NetShaper.__new__(NetShaper)
+        second = NetShaper.__new__(NetShaper)
+        first._lock_file = None
+        second._lock_file = None
+        first._owner_metadata = {"pid": 111, "process_start_time": "1"}
+        second._owner_metadata = {"pid": 222, "process_start_time": "2"}
+
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch("netshaper.core.orchestrator.config.STATE_DIR", tmp), \
+             mock.patch("netshaper.core.orchestrator.config.DRY_RUN", False):
+            first._acquire_instance_lock()
+            try:
+                with self.assertRaisesRegex(RuntimeError, "already running"):
+                    second._acquire_instance_lock()
+            finally:
+                first._release_instance_lock()
+                second._release_instance_lock()
 
     def test_stale_cleanup_removes_recorded_tc_root_qdisc(self):
         ns = NetShaper.__new__(NetShaper)
@@ -145,6 +232,51 @@ class NetShaperCleanupTests(unittest.TestCase):
                 silent=True,
             )
             self.assertFalse(os.path.exists(state_path))
+
+    def test_stale_cleanup_keeps_manifest_when_target_binary_missing(self):
+        ns = NetShaper.__new__(NetShaper)
+        snapshot = {
+            "session_id": "NS-OLD",
+            "interface": "eth0",
+            "ipv4_forwarding": None,
+            "ipv6_forwarding": None,
+            "route_localnet": None,
+            "iptables_rules": "",
+            "ip6tables_rules": "",
+            "tc_configuration": "",
+        }
+        state = {
+            "session_id": "NS-OLD",
+            "interface": "eth0",
+            "targets": [{
+                "ip": "192.0.2.10",
+                "dns": False,
+                "http_redirect_port": None,
+                "mangle_chain": "NS-MNG-TEST",
+                "nat_chain": "NS-NAT-TEST",
+            }],
+            "global_rules_applied": False,
+            "shaper_base_initialized": False,
+            "snapshot": snapshot,
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = os.path.join(tmp, "NS-OLD")
+            os.makedirs(state_dir)
+            state_path = os.path.join(state_dir, "state.json")
+            with open(state_path, "w", encoding="utf-8") as fh:
+                json.dump(state, fh)
+
+            with mock.patch("netshaper.core.orchestrator.config.STATE_DIR", tmp), \
+                 mock.patch("netshaper.core.orchestrator.print_flush"), \
+                 mock.patch("netshaper.core.orchestrator.shutil.which",
+                            return_value=None), \
+                 mock.patch("netshaper.core.orchestrator.StateSnapshotManager.restore",
+                            return_value=True), \
+                 mock.patch("netshaper.core.orchestrator.log"):
+                ns.load_state_and_cleanup()
+
+            self.assertTrue(os.path.exists(state_path))
 
 
 if __name__ == "__main__":

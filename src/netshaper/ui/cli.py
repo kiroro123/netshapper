@@ -255,142 +255,149 @@ def main() -> None:
 
     from netshaper.core.orchestrator import NetShaper
 
-    if not config.DRY_RUN:
-        NetShaper(interface).load_state_and_cleanup()
+    try:
+        ns = NetShaper(interface)
+    except RuntimeError as exc:
+        sys.exit(f"[NetShaper] {exc}")
 
-    ns = NetShaper(interface)
-    if not ns.own_ip:
-        sys.exit("[NetShaper] Could not determine own IP.")
-    if not ns.gw:
-        ns.gw = safe_input("  Gateway IP: ")
-    print_flush(f"  Your IP : {ns.own_ip}\n  Gateway : {ns.gw}")
-    if ns.gw_ipv6:
-        print_flush(f"  IPv6 GW : {ns.gw_ipv6}")
+    try:
+        if not config.DRY_RUN:
+            ns.load_state_and_cleanup()
 
-    if args.targets:
-        raw_targets = []
-        for token in args.targets:
-            raw_targets.extend(part.strip() for part in token.split(",") if part.strip())
-        targets = raw_targets
-        print_flush(f"  Targets from --targets: {', '.join(targets)}")
-    else:
-        devices = ns.discover()
-        targets = [dev.ip for dev in pick_targets_ui(devices)]
+        if not ns.own_ip:
+            sys.exit("[NetShaper] Could not determine own IP.")
+        if not ns.gw:
+            ns.gw = safe_input("  Gateway IP: ")
+        print_flush(f"  Your IP : {ns.own_ip}\n  Gateway : {ns.gw}")
+        if ns.gw_ipv6:
+            print_flush(f"  IPv6 GW : {ns.gw_ipv6}")
 
-    print_flush("\n  -- Features (enter numbers e.g. 1 3 5) ------------------")
-    print_flush("  [1] ARP spoofing (core MITM)")
-    print_flush("  [2] DNS spoofing")
-    print_flush("  [3] Captive portal (index.html for HTTP)")
-    print_flush("  [4] Bandwidth throttle")
-    print_flush("  [5] Packet sniffer")
-    print_flush("  [6] mitmproxy HTTPS inspection")
-
-    raw_choices = safe_input("  Choices: ")
-    features, invalid = normalize_feature_choices(raw_choices)
-    if invalid:
-        print_flush("  [!] Ignoring invalid feature choices: " + ", ".join(invalid))
-    if not features:
-        print_flush("  [!] No valid features selected.")
-        sys.exit(0)
-
-    arp_on = 1 in features
-    dns_spoof_on = 2 in features
-    captive_portal = 3 in features
-    throttle_on = 4 in features
-    sniff_on = 5 in features
-    mitm_on = 6 in features
-
-    if dns_spoof_on and not captive_portal:
-        print_flush("  [!] DNS spoofing without captive portal can break HTTP.")
-        if safe_input("  Enable captive portal too? (y/n): ").lower() == "y":
-            captive_portal = True
-
-    if captive_portal and mitm_on:
-        http_redirect_port: Optional[int] = 8088
-    elif captive_portal:
-        http_redirect_port = 80
-    elif mitm_on:
-        http_redirect_port = 8088
-    else:
-        http_redirect_port = None
-
-    if http_redirect_port:
-        print_flush("  [!] HTTP redirect captures plain HTTP only.")
-        print_flush("      For HTTPS, install the mitmproxy CA on the target device.")
-
-    limit = args.limit if throttle_on and args.limit is not None else pick_limit_ui() if throttle_on else None
-    save_pcap = False
-    rolling = False
-    if sniff_on:
-        save_pcap = safe_input("  Save to .pcap? (y/n): ").lower() == "y"
-        if save_pcap:
-            rolling = safe_input("  Use rolling 50 MB files? (y/n): ").lower() == "y"
-
-    if dns_spoof_on and not check_local_port(ns.own_ip, 53, socket.SOCK_DGRAM):
-        print_flush("  [!] Fake DNS (port 53) not reachable.")
-        print_flush("      sudo python3 fake_server3.py")
-        if safe_input("  Continue anyway? (y/n): ").lower() != "y":
-            sys.exit(0)
-
-    if http_redirect_port == 80 and not check_local_port(ns.own_ip, 80):
-        print_flush("  [!] Fake HTTP (port 80) not reachable.")
-        print_flush("      sudo python3 fake_server3.py")
-        if safe_input("  Continue anyway? (y/n): ").lower() != "y":
-            sys.exit(0)
-
-    if http_redirect_port == 8088 and not check_local_port(ns.own_ip, 8088):
-        print_flush("  [!] mitmproxy (port 8088) not reachable.")
-        if safe_input("  Auto-launch mitmproxy? (y/n): ").lower() == "y":
-            if not ns.launch_mitmproxy(port=8088, web_port=8083):
-                if safe_input("  Continue without mitmproxy? (y/n): ").lower() != "y":
-                    sys.exit(0)
+        if args.targets:
+            raw_targets = []
+            for token in args.targets:
+                raw_targets.extend(part.strip() for part in token.split(",") if part.strip())
+            targets = raw_targets
+            print_flush(f"  Targets from --targets: {', '.join(targets)}")
         else:
-            print_flush(
-                "      mitmweb --mode transparent --listen-port 8088 "
-                "--set web_port=8083"
-            )
+            devices = ns.discover()
+            targets = [dev.ip for dev in pick_targets_ui(devices)]
+
+        print_flush("\n  -- Features (enter numbers e.g. 1 3 5) ------------------")
+        print_flush("  [1] ARP spoofing (core MITM)")
+        print_flush("  [2] DNS spoofing")
+        print_flush("  [3] Captive portal (index.html for HTTP)")
+        print_flush("  [4] Bandwidth throttle")
+        print_flush("  [5] Packet sniffer")
+        print_flush("  [6] mitmproxy HTTPS inspection")
+
+        raw_choices = safe_input("  Choices: ")
+        features, invalid = normalize_feature_choices(raw_choices)
+        if invalid:
+            print_flush("  [!] Ignoring invalid feature choices: " + ", ".join(invalid))
+        if not features:
+            print_flush("  [!] No valid features selected.")
+            sys.exit(0)
+
+        arp_on = 1 in features
+        dns_spoof_on = 2 in features
+        captive_portal = 3 in features
+        throttle_on = 4 in features
+        sniff_on = 5 in features
+        mitm_on = 6 in features
+
+        if dns_spoof_on and not captive_portal:
+            print_flush("  [!] DNS spoofing without captive portal can break HTTP.")
+            if safe_input("  Enable captive portal too? (y/n): ").lower() == "y":
+                captive_portal = True
+
+        if captive_portal and mitm_on:
+            http_redirect_port: Optional[int] = 8088
+        elif captive_portal:
+            http_redirect_port = 80
+        elif mitm_on:
+            http_redirect_port = 8088
+        else:
+            http_redirect_port = None
+
+        if http_redirect_port:
+            print_flush("  [!] HTTP redirect captures plain HTTP only.")
+            print_flush("      For HTTPS, install the mitmproxy CA on the target device.")
+
+        limit = args.limit if throttle_on and args.limit is not None else pick_limit_ui() if throttle_on else None
+        save_pcap = False
+        rolling = False
+        if sniff_on:
+            save_pcap = safe_input("  Save to .pcap? (y/n): ").lower() == "y"
+            if save_pcap:
+                rolling = safe_input("  Use rolling 50 MB files? (y/n): ").lower() == "y"
+
+        if dns_spoof_on and not check_local_port(ns.own_ip, 53, socket.SOCK_DGRAM):
+            print_flush("  [!] Fake DNS (port 53) not reachable.")
+            print_flush("      sudo python3 fake_server3.py")
             if safe_input("  Continue anyway? (y/n): ").lower() != "y":
                 sys.exit(0)
 
-    print_flush(f"\n{'=' * 58}")
-    print_flush(f"  Targets       : {', '.join(targets)}")
-    print_flush(f"  ARP spoof     : {'Yes' if arp_on else 'No'}")
-    print_flush(f"  DNS spoof     : {'Yes' if dns_spoof_on else 'No'}")
-    print_flush(f"  Captive portal: {'Yes' if captive_portal else 'No'}")
-    if captive_portal:
-        print_flush(f"    HTTP -> port: {http_redirect_port}")
-    print_flush(f"  Throttle      : {f'{limit} Mbps' if throttle_on else 'No'}")
-    print_flush(f"  mitmproxy     : {'Yes' if mitm_on else 'No'}")
-    print_flush(f"  Sniffer       : {'Yes' if sniff_on else 'No'}")
-    if sniff_on and save_pcap:
-        print_flush(f"    Rolling pcap: {'Yes' if rolling else 'No'}")
-    print_flush(f"{'=' * 58}")
+        if http_redirect_port == 80 and not check_local_port(ns.own_ip, 80):
+            print_flush("  [!] Fake HTTP (port 80) not reachable.")
+            print_flush("      sudo python3 fake_server3.py")
+            if safe_input("  Continue anyway? (y/n): ").lower() != "y":
+                sys.exit(0)
 
-    if safe_input("\n  Proceed? (y/n): ").lower() != "y":
-        sys.exit(0)
+        if http_redirect_port == 8088 and not check_local_port(ns.own_ip, 8088):
+            print_flush("  [!] mitmproxy (port 8088) not reachable.")
+            if safe_input("  Auto-launch mitmproxy? (y/n): ").lower() == "y":
+                if not ns.launch_mitmproxy(port=8088, web_port=8083):
+                    if safe_input("  Continue without mitmproxy? (y/n): ").lower() != "y":
+                        sys.exit(0)
+            else:
+                print_flush(
+                    "      mitmweb --mode transparent --listen-port 8088 "
+                    "--set web_port=8083"
+                )
+                if safe_input("  Continue anyway? (y/n): ").lower() != "y":
+                    sys.exit(0)
 
-    def sig_handler(_sig, _frame):
-        ns.stop_event.set()
+        print_flush(f"\n{'=' * 58}")
+        print_flush(f"  Targets       : {', '.join(targets)}")
+        print_flush(f"  ARP spoof     : {'Yes' if arp_on else 'No'}")
+        print_flush(f"  DNS spoof     : {'Yes' if dns_spoof_on else 'No'}")
+        print_flush(f"  Captive portal: {'Yes' if captive_portal else 'No'}")
+        if captive_portal:
+            print_flush(f"    HTTP -> port: {http_redirect_port}")
+        print_flush(f"  Throttle      : {f'{limit} Mbps' if throttle_on else 'No'}")
+        print_flush(f"  mitmproxy     : {'Yes' if mitm_on else 'No'}")
+        print_flush(f"  Sniffer       : {'Yes' if sniff_on else 'No'}")
+        if sniff_on and save_pcap:
+            print_flush(f"    Rolling pcap: {'Yes' if rolling else 'No'}")
+        print_flush(f"{'=' * 58}")
 
-    signal.signal(signal.SIGINT, sig_handler)
-    signal.signal(signal.SIGTERM, sig_handler)
+        if safe_input("\n  Proceed? (y/n): ").lower() != "y":
+            sys.exit(0)
 
-    try:
-        run_active_session(
-            ns,
-            targets,
-            arp_on=arp_on,
-            dns_spoof_on=dns_spoof_on,
-            captive_portal=captive_portal,
-            http_redirect_port=http_redirect_port,
-            throttle_on=throttle_on,
-            limit=limit,
-            sniff_on=sniff_on,
-            save_pcap=save_pcap,
-            rolling=rolling,
-        )
-    except KeyboardInterrupt:
-        ns.stop_event.set()
+        def sig_handler(_sig, _frame):
+            ns.stop_event.set()
+
+        signal.signal(signal.SIGINT, sig_handler)
+        signal.signal(signal.SIGTERM, sig_handler)
+
+        try:
+            run_active_session(
+                ns,
+                targets,
+                arp_on=arp_on,
+                dns_spoof_on=dns_spoof_on,
+                captive_portal=captive_portal,
+                http_redirect_port=http_redirect_port,
+                throttle_on=throttle_on,
+                limit=limit,
+                sniff_on=sniff_on,
+                save_pcap=save_pcap,
+                rolling=rolling,
+            )
+        except KeyboardInterrupt:
+            ns.stop_event.set()
+    finally:
+        ns.close()
 
 
 if __name__ == "__main__":

@@ -8,6 +8,7 @@ sniffer management, and the bandwidth monitor thread.
 from __future__ import annotations
 
 import glob
+import fcntl
 import json
 import logging
 import os
@@ -58,13 +59,75 @@ class NetShaper:
         self.sniffer: Optional[Union[PacketSniffer, RollingPacketSniffer]] = None
         self.stop_event  = threading.Event()
         self._global_rules_applied = False
+        self._global_firewall_binaries_applied: List[str] = []
         self._mitm_proc  = None
         self._cleanup_running = False
         self._cleanup_complete = False
         self._dry_run_state = None
+        self._lock_file = None
+        self._owner_metadata = self._current_owner_metadata()
+        self._acquire_instance_lock()
         self.state_snapshot = StateSnapshotManager.capture(interface, self.session_id)
 
     # ── Helpers ───────────────────────────────────────────────────────────────
+    @staticmethod
+    def _process_start_time(pid: int) -> Optional[str]:
+        try:
+            with open(f"/proc/{pid}/stat", encoding="utf-8") as fh:
+                return fh.read().split()[21]
+        except Exception:
+            return None
+
+    @classmethod
+    def _process_is_live(cls, pid: Optional[int],
+                         start_time: Optional[str]) -> bool:
+        if not pid or not start_time:
+            return False
+        current_start = cls._process_start_time(pid)
+        return current_start == str(start_time)
+
+    def _current_owner_metadata(self) -> dict:
+        pid = os.getpid()
+        return {
+            "pid": pid,
+            "process_start_time": self._process_start_time(pid),
+            "created_at": time.time(),
+        }
+
+    def _acquire_instance_lock(self) -> None:
+        if config.DRY_RUN:
+            return
+        lock_path = os.path.join(config.STATE_DIR, "netshaper.lock")
+        self._lock_file = open(lock_path, "a+", encoding="utf-8")
+        try:
+            fcntl.flock(self._lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            self._lock_file.seek(0)
+            owner = self._lock_file.read().strip() or "another process"
+            self._lock_file.close()
+            self._lock_file = None
+            raise RuntimeError(
+                "Another NetShaper instance is already running: "
+                f"{owner}"
+            )
+        self._lock_file.seek(0)
+        self._lock_file.truncate()
+        json.dump(self._owner_metadata, self._lock_file)
+        self._lock_file.flush()
+        os.fsync(self._lock_file.fileno())
+
+    def _release_instance_lock(self) -> None:
+        lock_file = getattr(self, "_lock_file", None)
+        if not lock_file:
+            return
+        try:
+            lock_file.seek(0)
+            lock_file.truncate()
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            lock_file.close()
+        finally:
+            self._lock_file = None
+
     @staticmethod
     def scale_bytes(val: float) -> str:
         for unit in ["KB", "MB", "GB"]:
@@ -78,6 +141,7 @@ class NetShaper:
         if self._global_rules_applied:
             return
         ok = True
+        applied_binaries = []
         ok = SubprocessRunner.run(
             ["sysctl", "-w", "net.ipv4.ip_forward=1"], silent=True) and ok
         ok = SubprocessRunner.run(
@@ -89,6 +153,7 @@ class NetShaper:
             silent=True) and ok
         for binary in ["iptables", "ip6tables"]:
             if shutil.which(binary):
+                applied_binaries.append(binary)
                 ok = SubprocessRunner.run(
                     [binary, "-I", "FORWARD", "1",
                      "-i", self.interface, "-o", self.interface,
@@ -103,6 +168,7 @@ class NetShaper:
                     silent=True) and ok
         if not ok:
             raise RuntimeError("Failed to apply global forwarding rules")
+        self._global_firewall_binaries_applied = applied_binaries
         self._global_rules_applied = True
         log.info("Global dual-stack forwarding + MASQUERADE enabled")
 
@@ -145,6 +211,7 @@ class NetShaper:
                      "-o", self.interface, "-j", "MASQUERADE"],
                     check=False, silent=True) and ok
         self._global_rules_applied = False
+        self._global_firewall_binaries_applied = []
         log.info("Global forwarding + MASQUERADE removed")
         return ok
 
@@ -224,14 +291,25 @@ class NetShaper:
                 mark_base=mark_base,
             )
             session.start_spoof(arp_on=arp_on)
-        except Exception:
-            with self._lifecycle_lock:
-                if self.sessions.get(target.ip) is session:
-                    del self.sessions[target.ip]
+        except Exception as exc:
+            cleanup_ok = False
             try:
-                session.cleanup()
-            finally:
+                cleanup_ok = session.cleanup()
+            except Exception as cleanup_exc:
+                log.error(
+                    f"Rollback cleanup for {target.ip} failed: {cleanup_exc}"
+                )
+            if cleanup_ok:
+                with self._lifecycle_lock:
+                    if self.sessions.get(target.ip) is session:
+                        del self.sessions[target.ip]
                 self.mark_pool.release(target.ip)
+            else:
+                log.error(
+                    f"Keeping failed target {target.ip} in recovery state "
+                    f"after setup error: {exc}"
+                )
+                self.save_state()
             raise
 
         log.info(
@@ -248,14 +326,13 @@ class NetShaper:
                 return True
             session.active           = False
             session.is_shutting_down = True
-            del self.sessions[ip]
         # Cleanup outside lock — spoof threads exit naturally via flag check
-        ok = True
-        try:
-            ok = session.cleanup()
-        finally:
-            self.mark_pool.release(ip)
+        ok = session.cleanup()
         if ok:
+            with self._lifecycle_lock:
+                if self.sessions.get(ip) is session:
+                    del self.sessions[ip]
+            self.mark_pool.release(ip)
             log.info(f"Target {ip} removed")
         else:
             log.warning(f"Target {ip} removed with cleanup errors")
@@ -298,8 +375,7 @@ class NetShaper:
             )
             cleanup_step(
                 "mitmproxy",
-                lambda: (self._mitm_proc.terminate(), log.info("mitmproxy terminated"))
-                if self._mitm_proc else None,
+                self._terminate_mitmproxy,
             )
             cleanup_step("global rules", self._remove_global_rules)
             cleanup_step(
@@ -330,6 +406,7 @@ class NetShaper:
             with self._lifecycle_lock:
                 self._cleanup_complete = not errors
                 self._cleanup_running = False
+            self._release_instance_lock()
 
     # Backward-compatible alias (older CLI expects stop())
     def stop(self) -> None:
@@ -378,10 +455,37 @@ class NetShaper:
                 log.debug(f"Waiting for mitmproxy… (attempt {attempt+1}/10)")
                 time.sleep(0.5)
             log.error(f"mitmproxy did not bind to :{port} within 5 s")
+            self._terminate_mitmproxy()
             return False
         except FileNotFoundError:
             print_flush("  [!] mitmweb not found.  pip install mitmproxy")
             return False
+
+    def _terminate_mitmproxy(self) -> bool:
+        proc = getattr(self, "_mitm_proc", None)
+        if not proc:
+            return True
+        ok = True
+        try:
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=5)
+            log.info("mitmproxy terminated")
+        except Exception as exc:
+            ok = False
+            log.error(f"mitmproxy cleanup failed: {exc}")
+        finally:
+            self._mitm_proc = None
+        return ok
+
+    def close(self) -> None:
+        """Release non-network resources when a session never started."""
+        self._terminate_mitmproxy()
+        self._release_instance_lock()
 
     # ── State persistence ─────────────────────────────────────────────────────
     @staticmethod
@@ -433,8 +537,11 @@ class NetShaper:
             "gw":     self.gw,
             "own_ip": self.own_ip,
             "global_rules_applied": self._global_rules_applied,
+            "global_firewall_binaries": list(
+                getattr(self, "_global_firewall_binaries_applied", [])),
             "shaper_base_initialized": getattr(
                 getattr(self, "shaper", None), "_base_initialized", False),
+            "owner": getattr(self, "_owner_metadata", {}),
             "snapshot": self._snapshot_to_dict(self.state_snapshot),
         }
         if config.DRY_RUN:
@@ -464,6 +571,13 @@ class NetShaper:
                 iface = data.get("interface")
                 if not iface:
                     continue
+                owner = data.get("owner") or {}
+                if self._process_is_live(
+                        owner.get("pid"), owner.get("process_start_time")):
+                    log.info(
+                        f"Skipping live NetShaper session: {state_path}"
+                    )
+                    continue
                 print_flush(f"  [!] Stale session on {iface} — cleaning up…")
 
                 def run_recovery(description: str, command: list[str]) -> None:
@@ -473,24 +587,42 @@ class NetShaper:
                         cleanup_ok = False
                         log.error(f"Stale cleanup failed ({description})")
 
+                def require_binary(binary: str, reason: str) -> bool:
+                    nonlocal cleanup_ok
+                    if shutil.which(binary):
+                        return True
+                    cleanup_ok = False
+                    log.error(
+                        f"Stale cleanup failed ({reason}): "
+                        f"{binary} unavailable"
+                    )
+                    return False
+
                 if data.get("global_rules_applied"):
-                    for binary in ["iptables", "ip6tables"]:
-                        if shutil.which(binary):
-                            run_recovery(
-                                f"{binary} forward same-interface accept",
-                                [binary, "-D", "FORWARD",
-                                 "-i", iface, "-o", iface, "-j", "ACCEPT"],
-                            )
-                            run_recovery(
-                                f"{binary} established forward accept",
-                                [binary, "-D", "FORWARD", "-m", "state",
-                                 "--state", "ESTABLISHED,RELATED", "-j", "ACCEPT"],
-                            )
-                            run_recovery(
-                                f"{binary} masquerade",
-                                [binary, "-t", "nat", "-D", "POSTROUTING",
-                                 "-o", iface, "-j", "MASQUERADE"],
-                            )
+                    binaries = data.get("global_firewall_binaries")
+                    if binaries is None:
+                        binaries = [
+                            binary for binary in ["iptables", "ip6tables"]
+                            if shutil.which(binary)
+                        ]
+                    for binary in binaries:
+                        if not require_binary(binary, "global firewall rules"):
+                            continue
+                        run_recovery(
+                            f"{binary} forward same-interface accept",
+                            [binary, "-D", "FORWARD",
+                             "-i", iface, "-o", iface, "-j", "ACCEPT"],
+                        )
+                        run_recovery(
+                            f"{binary} established forward accept",
+                            [binary, "-D", "FORWARD", "-m", "state",
+                             "--state", "ESTABLISHED,RELATED", "-j", "ACCEPT"],
+                        )
+                        run_recovery(
+                            f"{binary} masquerade",
+                            [binary, "-t", "nat", "-D", "POSTROUTING",
+                             "-o", iface, "-j", "MASQUERADE"],
+                        )
 
                 for target in data.get("targets", []):
                     ip = target.get("ip")
@@ -505,7 +637,7 @@ class NetShaper:
                          target.get("nat_chain") or f"NS-NAT-{suffix}"),
                     ]
                     for binary in binaries:
-                        if not shutil.which(binary):
+                        if not require_binary(binary, f"target firewall {ip}"):
                             continue
                         if target.get("dns"):
                             for proto in ["udp", "tcp"]:
@@ -541,10 +673,11 @@ class NetShaper:
                             )
 
                 if data.get("shaper_base_initialized"):
-                    run_recovery(
-                        "tc root qdisc",
-                        ["tc", "qdisc", "del", "dev", iface, "root"],
-                    )
+                    if require_binary("tc", "traffic shaper"):
+                        run_recovery(
+                            "tc root qdisc",
+                            ["tc", "qdisc", "del", "dev", iface, "root"],
+                        )
 
                 snapshot = self._snapshot_from_state(data)
                 cleanup_ok = StateSnapshotManager.restore(snapshot) and cleanup_ok

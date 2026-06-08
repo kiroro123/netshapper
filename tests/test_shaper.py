@@ -88,18 +88,49 @@ class TrafficShaperTests(unittest.TestCase):
     def test_apply_target_rolls_back_partial_setup(
             self, run_mock, runner_mock):
         run_mock.return_value = SimpleNamespace(returncode=0, stdout="")
-        runner_mock.side_effect = [True, True, False, True]
+        runner_mock.side_effect = [True, True, False, True, True]
         shaper = TrafficShaper("eth0")
 
         with self.assertRaisesRegex(RuntimeError, "traffic filter"):
             shaper.apply_target("192.0.2.10", 5.0)
 
         self.assertEqual(shaper._active_marks, set())
+        self.assertFalse(shaper._base_initialized)
         runner_mock.assert_any_call(
             ["tc", "class", "del", "dev", "eth0", "classid", "1:10"],
             check=False,
             silent=True,
         )
+        runner_mock.assert_any_call(
+            ["tc", "qdisc", "del", "dev", "eth0", "root"],
+            check=False,
+            silent=True,
+        )
+
+    @mock.patch("netshaper.network.shaper.SubprocessRunner.run")
+    def test_cleanup_target_removes_protocol_specific_filters(self, runner_mock):
+        runner_mock.return_value = True
+        shaper = TrafficShaper("eth0")
+        shaper._active_marks.add(10)
+
+        result = shaper.cleanup_target(10)
+
+        self.assertTrue(result)
+        runner_mock.assert_any_call(
+            ["tc", "filter", "del", "dev", "eth0",
+             "parent", "1:", "protocol", "ip",
+             "handle", "10", "fw"],
+            check=False,
+            silent=True,
+        )
+        runner_mock.assert_any_call(
+            ["tc", "filter", "del", "dev", "eth0",
+             "parent", "1:", "protocol", "ipv6",
+             "handle", "20", "fw"],
+            check=False,
+            silent=True,
+        )
+        self.assertNotIn(10, shaper._active_marks)
 
 
 if __name__ == "__main__":

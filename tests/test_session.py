@@ -6,6 +6,18 @@ from netshaper.core.session import TargetSession
 
 
 class TargetSessionCleanupTests(unittest.TestCase):
+    def test_dry_run_start_spoof_does_not_construct_spoofers(self):
+        session = TargetSession.__new__(TargetSession)
+        session.target = SimpleNamespace(ip="192.0.2.10")
+
+        with mock.patch("netshaper.core.session.config.DRY_RUN", True), \
+             mock.patch("netshaper.core.session.ARPSpoofer") as arp_cls, \
+             mock.patch("netshaper.core.session.NDPSpoofer") as ndp_cls:
+            session.start_spoof(arp_on=True)
+
+        arp_cls.assert_not_called()
+        ndp_cls.assert_not_called()
+
     def test_cleanup_continues_after_spoofer_failure(self):
         session = TargetSession.__new__(TargetSession)
         session.target = SimpleNamespace(ip="192.0.2.10")

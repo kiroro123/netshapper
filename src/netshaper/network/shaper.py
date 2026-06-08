@@ -56,7 +56,7 @@ class TrafficShaper:
                 ["tc", "class", "add", "dev", self.interface,
                  "parent", "1:", "classid", classid,
                  "htb", "rate", f"{k}kbit", "burst", "15k"]):
-                self._rollback_created(created_filters, created_classes)
+                self._rollback_failed_target(created_filters, created_classes)
                 raise RuntimeError(
                     f"Failed to create traffic class {classid}"
                 )
@@ -67,7 +67,7 @@ class TrafficShaper:
                      "parent", "1:", "protocol", proto,
                      "handle", str(mark), "fw", "flowid", classid],
                     silent=True):
-                    self._rollback_created(created_filters, created_classes)
+                    self._rollback_failed_target(created_filters, created_classes)
                     raise RuntimeError(
                         f"Failed to create traffic filter for mark {mark}"
                     )
@@ -76,6 +76,14 @@ class TrafficShaper:
         log.info(
             f"Shaping {target_ip}: {mbps} Mbps "
             f"(marks {mark_base}/{mark_base + 10})")
+
+    def _rollback_failed_target(
+            self,
+            filters: List[Tuple[int, str]],
+            classes: List[int]) -> None:
+        self._rollback_created(filters, classes)
+        if self._base_initialized and not self._active_marks:
+            self.cleanup()
 
     def _rollback_created(
             self,
@@ -96,10 +104,12 @@ class TrafficShaper:
     def cleanup_target(self, mark_base: int) -> bool:
         ok = True
         for mark in [mark_base, mark_base + 10]:
-            ok = SubprocessRunner.run(
-                ["tc", "filter", "del", "dev", self.interface,
-                 "parent", "1:", "handle", str(mark), "fw"],
-                check=False, silent=True) and ok
+            for proto in ["ip", "ipv6"]:
+                ok = SubprocessRunner.run(
+                    ["tc", "filter", "del", "dev", self.interface,
+                     "parent", "1:", "protocol", proto,
+                     "handle", str(mark), "fw"],
+                    check=False, silent=True) and ok
             ok = SubprocessRunner.run(
                 ["tc", "class", "del", "dev", self.interface,
                  "classid", f"1:{mark}"],
