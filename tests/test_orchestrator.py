@@ -271,8 +271,9 @@ class NetShaperCleanupTests(unittest.TestCase):
                             return_value=True), \
                  mock.patch("netshaper.core.orchestrator.StateSnapshotManager.capture",
                             return_value=recaptured) as capture_mock:
-                ns.load_state_and_cleanup()
+                result = ns.load_state_and_cleanup()
 
+        self.assertTrue(result)
         capture_mock.assert_called_once_with("eth0", "NS-NEW")
         self.assertIs(ns.state_snapshot, recaptured)
 
@@ -317,9 +318,73 @@ class NetShaperCleanupTests(unittest.TestCase):
                  mock.patch("netshaper.core.orchestrator.StateSnapshotManager.restore",
                             return_value=True), \
                  mock.patch("netshaper.core.orchestrator.log"):
-                ns.load_state_and_cleanup()
+                result = ns.load_state_and_cleanup()
 
+            self.assertFalse(result)
             self.assertTrue(os.path.exists(state_path))
+
+    def test_stale_cleanup_does_not_recapture_after_failure(self):
+        ns = NetShaper.__new__(NetShaper)
+        ns.interface = "eth0"
+        ns.session_id = "NS-NEW"
+        snapshot = {
+            "session_id": "NS-OLD",
+            "interface": "eth0",
+            "ipv4_forwarding": None,
+            "ipv6_forwarding": None,
+            "route_localnet": None,
+            "iptables_rules": "",
+            "ip6tables_rules": "",
+            "tc_configuration": "",
+        }
+        state = {
+            "session_id": "NS-OLD",
+            "interface": "eth0",
+            "targets": [],
+            "global_rules_applied": False,
+            "shaper_base_initialized": True,
+            "snapshot": snapshot,
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = os.path.join(tmp, "NS-OLD")
+            os.makedirs(state_dir)
+            state_path = os.path.join(state_dir, "state.json")
+            with open(state_path, "w", encoding="utf-8") as fh:
+                json.dump(state, fh)
+
+            with mock.patch("netshaper.core.orchestrator.config.STATE_DIR", tmp), \
+                 mock.patch("netshaper.core.orchestrator.print_flush"), \
+                 mock.patch("netshaper.core.orchestrator.shutil.which",
+                            return_value=None), \
+                 mock.patch("netshaper.core.orchestrator.StateSnapshotManager.restore",
+                            return_value=True), \
+                 mock.patch("netshaper.core.orchestrator.StateSnapshotManager.capture") as capture_mock, \
+                 mock.patch("netshaper.core.orchestrator.log"):
+                result = ns.load_state_and_cleanup()
+
+        self.assertFalse(result)
+        capture_mock.assert_not_called()
+
+    def test_remove_global_rules_fails_when_recorded_binary_missing(self):
+        ns = NetShaper.__new__(NetShaper)
+        ns.interface = "eth0"
+        ns.state_snapshot = mock.Mock(
+            ipv4_forwarding=None,
+            ipv6_forwarding=None,
+            route_localnet=None,
+        )
+        ns._global_rules_applied = True
+        ns._global_firewall_binaries_applied = ["iptables"]
+
+        with mock.patch("netshaper.core.orchestrator.shutil.which",
+                        return_value=None), \
+             mock.patch("netshaper.core.orchestrator.log"):
+            result = ns._remove_global_rules()
+
+        self.assertFalse(result)
+        self.assertTrue(ns._global_rules_applied)
+        self.assertEqual(ns._global_firewall_binaries_applied, ["iptables"])
 
     def test_remove_state_file_removes_empty_session_directory(self):
         with tempfile.TemporaryDirectory() as tmp:

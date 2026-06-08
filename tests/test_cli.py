@@ -97,6 +97,24 @@ class CliTests(unittest.TestCase):
         ns.add_target.assert_not_called()
         ns.cleanup.assert_called_once()
 
+    def test_main_exits_when_stale_recovery_fails(self):
+        ns = mock.Mock()
+        ns.load_state_and_cleanup.return_value = False
+
+        with mock.patch("sys.argv", ["netshaper", "-i", "eth0"]), \
+             mock.patch("netshaper.ui.cli.config.configure_logging"), \
+             mock.patch("netshaper.ui.cli.print_flush"), \
+             mock.patch("netshaper.core.orchestrator.NetShaper",
+                        return_value=ns), \
+             self.assertRaises(SystemExit) as cm:
+            cli.main()
+
+        self.assertIn(
+            "stale NetShaper session could not be fully recovered",
+            str(cm.exception),
+        )
+        ns.close.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

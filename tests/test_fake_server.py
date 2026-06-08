@@ -2,15 +2,14 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
-import fake_server3
-from netshaper import fake_server3 as packaged_fake_server
+from netshaper import fake_server3
 
 
 class FakeServerStartupTests(unittest.TestCase):
     def test_packaged_fake_server_exposes_main(self):
-        self.assertTrue(callable(packaged_fake_server.main))
+        self.assertTrue(callable(fake_server3.main))
 
-    @mock.patch("fake_server3.socket.socket")
+    @mock.patch("netshaper.fake_server3.socket.socket")
     def test_bind_dns_socket_binds_before_returning(self, socket_mock):
         sock = mock.Mock()
         socket_mock.return_value = sock
@@ -24,7 +23,7 @@ class FakeServerStartupTests(unittest.TestCase):
         )
         sock.bind.assert_called_once_with(("::", 5353))
 
-    @mock.patch("fake_server3.socket.socket")
+    @mock.patch("netshaper.fake_server3.socket.socket")
     def test_bind_dns_socket_exits_on_bind_failure(self, socket_mock):
         sock = mock.Mock()
         sock.bind.side_effect = OSError("in use")
@@ -62,13 +61,13 @@ class FakeServerStartupTests(unittest.TestCase):
             events.append(("thread", target, args, daemon))
             return thread_obj
 
-        with mock.patch("fake_server3.parse_args", return_value=args), \
-             mock.patch("fake_server3.configure_dns"), \
-             mock.patch("fake_server3.bind_dns_socket", side_effect=bind_dns), \
-             mock.patch("fake_server3.DualStackHTTPServer", side_effect=http_server), \
-             mock.patch("fake_server3.drop_privileges", side_effect=drop), \
-             mock.patch("fake_server3.print_dns_startup"), \
-             mock.patch("fake_server3.threading.Thread", side_effect=make_thread), \
+        with mock.patch("netshaper.fake_server3.parse_args", return_value=args), \
+             mock.patch("netshaper.fake_server3.configure_dns"), \
+             mock.patch("netshaper.fake_server3.bind_dns_socket", side_effect=bind_dns), \
+             mock.patch("netshaper.fake_server3.DualStackHTTPServer", side_effect=http_server), \
+             mock.patch("netshaper.fake_server3.drop_privileges", side_effect=drop), \
+             mock.patch("netshaper.fake_server3.print_dns_startup"), \
+             mock.patch("netshaper.fake_server3.threading.Thread", side_effect=make_thread), \
              mock.patch("builtins.print"):
             fake_server3.main()
 

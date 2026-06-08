@@ -196,23 +196,36 @@ class NetShaper:
 
     def _remove_global_rules(self) -> bool:
         ok = self._restore_original_forwarding()
-        for binary in ["iptables", "ip6tables"]:
-            if shutil.which(binary):
-                ok = SubprocessRunner.run(
-                    [binary, "-D", "FORWARD",
-                     "-i", self.interface, "-o", self.interface,
-                     "-j", "ACCEPT"], check=False, silent=True) and ok
-                ok = SubprocessRunner.run(
-                    [binary, "-D", "FORWARD", "-m", "state",
-                     "--state", "ESTABLISHED,RELATED",
-                     "-j", "ACCEPT"], check=False, silent=True) and ok
-                ok = SubprocessRunner.run(
-                    [binary, "-t", "nat", "-D", "POSTROUTING",
-                     "-o", self.interface, "-j", "MASQUERADE"],
-                    check=False, silent=True) and ok
-        self._global_rules_applied = False
-        self._global_firewall_binaries_applied = []
-        log.info("Global forwarding + MASQUERADE removed")
+        binaries = (
+            self._global_firewall_binaries_applied
+            if self._global_firewall_binaries_applied
+            else ["iptables", "ip6tables"]
+        )
+        for binary in binaries:
+            if not shutil.which(binary):
+                if binary in self._global_firewall_binaries_applied:
+                    log.error(
+                        f"Cannot remove global firewall rules: "
+                        f"{binary} unavailable"
+                    )
+                    ok = False
+                continue
+            ok = SubprocessRunner.run(
+                [binary, "-D", "FORWARD",
+                 "-i", self.interface, "-o", self.interface,
+                 "-j", "ACCEPT"], check=False, silent=True) and ok
+            ok = SubprocessRunner.run(
+                [binary, "-D", "FORWARD", "-m", "state",
+                 "--state", "ESTABLISHED,RELATED",
+                 "-j", "ACCEPT"], check=False, silent=True) and ok
+            ok = SubprocessRunner.run(
+                [binary, "-t", "nat", "-D", "POSTROUTING",
+                 "-o", self.interface, "-j", "MASQUERADE"],
+                check=False, silent=True) and ok
+        if ok:
+            self._global_rules_applied = False
+            self._global_firewall_binaries_applied = []
+            log.info("Global forwarding + MASQUERADE removed")
         return ok
 
     # ── Discovery ─────────────────────────────────────────────────────────────
@@ -568,9 +581,10 @@ class NetShaper:
             log.error(f"State save failed: {e}")
             return False
 
-    def load_state_and_cleanup(self) -> None:
+    def load_state_and_cleanup(self) -> bool:
         if not os.path.isdir(config.STATE_DIR):
-            return
+            return True
+        recovery_ok = True
         recovery_attempted = False
         for state_path in sorted(glob.glob(os.path.join(config.STATE_DIR, "*", "state.json"))):
             cleanup_ok = True
@@ -586,6 +600,7 @@ class NetShaper:
                     log.info(
                         f"Skipping live NetShaper session: {state_path}"
                     )
+                    recovery_ok = False
                     continue
                 print_flush(f"  [!] Stale session on {iface} — cleaning up…")
                 recovery_attempted = True
@@ -699,15 +714,18 @@ class NetShaper:
                     except OSError:
                         pass
                 else:
+                    recovery_ok = False
                     log.error(f"Leaving recovery state in place: {state_path}")
             except Exception as exc:
-                log.debug(f"No valid state file to recover: {exc}")
+                recovery_ok = False
+                log.error(f"Could not recover state file {state_path}: {exc}")
         current_interface = getattr(self, "interface", None)
-        if recovery_attempted and current_interface:
+        if recovery_attempted and recovery_ok and current_interface:
             self.state_snapshot = StateSnapshotManager.capture(
                 current_interface,
                 getattr(self, "session_id", ""),
             )
+        return recovery_ok
 
     # ── Bandwidth monitor ─────────────────────────────────────────────────────
     def monitor(self) -> None:

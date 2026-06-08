@@ -262,7 +262,10 @@ def main() -> None:
 
     try:
         if not config.DRY_RUN:
-            ns.load_state_and_cleanup()
+            if not ns.load_state_and_cleanup():
+                raise RuntimeError(
+                    "A stale NetShaper session could not be fully recovered."
+                )
 
         if not ns.own_ip:
             sys.exit("[NetShaper] Could not determine own IP.")
@@ -396,6 +399,8 @@ def main() -> None:
             )
         except KeyboardInterrupt:
             ns.stop_event.set()
+    except RuntimeError as exc:
+        sys.exit(f"[NetShaper] {exc}")
     finally:
         ns.close()
 
