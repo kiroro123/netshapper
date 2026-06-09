@@ -230,6 +230,25 @@ class FirewallManagerTests(unittest.TestCase):
         self.assertEqual(fw._http_input_rules, {("iptables", 8088)})
 
     @mock.patch("netshaper.network.firewall.SubprocessRunner.run")
+    def test_setup_journals_each_created_chain_resource(self, runner_mock):
+        runner_mock.return_value = True
+        journal = mock.Mock(return_value=True)
+        fw = FirewallManager(
+            "192.0.2.10",
+            "eth0",
+            session_id="NS-TEST",
+            auto_setup=False,
+            journal=journal,
+        )
+
+        with mock.patch.object(
+                fw, "_chain_state",
+                return_value=InspectionStatus.ABSENT):
+            fw.setup()
+
+        self.assertEqual(journal.call_count, 4)
+
+    @mock.patch("netshaper.network.firewall.SubprocessRunner.run")
     def test_failed_explicit_setup_keeps_resources_tracked(self, runner_mock):
         runner_mock.side_effect = [
             True, True,

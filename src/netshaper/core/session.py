@@ -11,7 +11,7 @@ from within the orchestrator's _lifecycle_lock (RLock).
 from __future__ import annotations
 
 import logging
-from typing import Optional, TYPE_CHECKING
+from typing import Callable, Optional, TYPE_CHECKING
 
 from netshaper import config
 from netshaper.models import Device
@@ -32,7 +32,8 @@ class TargetSession:
                  gateway_ip: str, gateway_mac: str,
                  gateway_ipv6: Optional[str],
                  shaper: TrafficShaper,
-                 session_id: Optional[str] = None):
+                 session_id: Optional[str] = None,
+                 journal: Optional[Callable[[], bool]] = None):
         self.target       = target
         self.interface    = interface
         self.session_id   = session_id
@@ -43,6 +44,7 @@ class TargetSession:
         self.gateway_mac  = gateway_mac
         self.gateway_ipv6 = gateway_ipv6
         self.shaper       = shaper
+        self._journal     = journal
 
         # Lockless state flags — write only under orchestrator._lifecycle_lock
         self.active           = True
@@ -61,11 +63,13 @@ class TargetSession:
               limit: Optional[float] = None,
               mark_base: int = 10) -> None:
         session_id = getattr(self, "session_id", None)
+        journal = getattr(self, "_journal", None)
         firewall = FirewallManager(
             self.target.ip,
             self.interface,
             session_id=session_id,
             auto_setup=False,
+            journal=journal,
         )
         self.firewall = firewall
         firewall.setup()
@@ -78,7 +82,12 @@ class TargetSession:
                 )
             self.dns_on = dns_spoof
         if limit is not None:
-            self.shaper.apply_target(self.target.ip, limit, mark_base)
+            self.shaper.apply_target(
+                self.target.ip,
+                limit,
+                mark_base,
+                journal=journal,
+            )
             if not self.firewall.add_shaping(self.target.ip, mark_base):
                 self.shaper.cleanup_target(mark_base)
                 raise RuntimeError(

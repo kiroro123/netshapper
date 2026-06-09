@@ -8,7 +8,7 @@ import hashlib
 import logging
 import shutil
 import subprocess
-from typing import List, Optional, Set, Tuple
+from typing import Callable, List, Optional, Set, Tuple
 
 from netshaper import config
 from netshaper.system import InspectionStatus, SubprocessRunner, inspect_resource
@@ -27,7 +27,8 @@ class FirewallManager:
     def __init__(
             self, target_ip: str, interface: str,
             session_id: Optional[str] = None,
-            auto_setup: bool = True):
+            auto_setup: bool = True,
+            journal: Optional[Callable[[], bool]] = None):
         self.target_ip = target_ip
         self.interface = interface
         self.session_id = session_id
@@ -38,6 +39,7 @@ class FirewallManager:
         self._rule_comment = (
             f"netshaper:{session_id}:{target_ip}" if session_id else None
         )
+        self._journal = journal
         self._managed_chains: Set[Tuple[str, str, str]] = set()
         self._linked_chains: Set[Tuple[str, str, str]] = set()
         self._created_chains: Set[Tuple[str, str, str]] = set()
@@ -52,6 +54,11 @@ class FirewallManager:
         self._shaping_mark_base: Optional[int] = None
         if auto_setup:
             self.setup()
+
+    def _journal_resource(self) -> bool:
+        if not self._journal:
+            return True
+        return self._journal()
 
     def setup(self) -> None:
         if not self._setup():
@@ -222,12 +229,17 @@ class FirewallManager:
                     linked = False
                     if created:
                         self._created_chains.add((b, t, c))
+                        if not self._journal_resource():
+                            ok = False
+                            continue
                         linked = SubprocessRunner.run(
                             [b, "-t", t, "-I", hook, "1", "-j", c],
                             silent=True,
                         )
                         if linked:
                             self._linked_chains.add((b, t, c))
+                            if not self._journal_resource():
+                                ok = False
                     ok = created and linked and ok
         return ok
 
@@ -237,15 +249,21 @@ class FirewallManager:
         for b in binaries:
             self._shaping_added = True
             self._shaping_mark_base = mark_base
-            ok = SubprocessRunner.run(
+            if SubprocessRunner.run(
                 [b, "-t", "mangle", "-A", self.MANGLE,
                  "-d", target_ip, "-j", "MARK", "--set-mark", str(mark_base)],
-                silent=True) and ok
-            ok = SubprocessRunner.run(
+                    silent=True):
+                ok = self._journal_resource() and ok
+            else:
+                ok = False
+            if SubprocessRunner.run(
                 [b, "-t", "mangle", "-A", self.MANGLE,
                  "-s", target_ip, "-j", "MARK",
                  "--set-mark", str(mark_base + 10)],
-                silent=True) and ok
+                    silent=True):
+                ok = self._journal_resource() and ok
+            else:
+                ok = False
         return ok
 
     def add_redirect_rules(self, dns_spoof: bool = False,
@@ -259,13 +277,17 @@ class FirewallManager:
                             self._input_accept_rule(b, "-I", proto, 53),
                             silent=True):
                         self._dns_input_rules.add((b, proto))
+                        ok = self._journal_resource() and ok
                     else:
                         ok = False
-                    ok = SubprocessRunner.run(
+                    if SubprocessRunner.run(
                         [b, "-t", "nat", "-A", self.NAT,
                          "-s", self.target_ip, "-p", proto, "--dport", "53",
                          "-j", "REDIRECT", "--to-port", "53"],
-                        silent=True) and ok
+                            silent=True):
+                        ok = self._journal_resource() and ok
+                    else:
+                        ok = False
 
             if http_redirect_port:
                 self._http_added = True
@@ -275,13 +297,17 @@ class FirewallManager:
                             b, "-I", "tcp", http_redirect_port),
                         silent=True):
                     self._http_input_rules.add((b, http_redirect_port))
+                    ok = self._journal_resource() and ok
                 else:
                     ok = False
-                ok = SubprocessRunner.run(
+                if SubprocessRunner.run(
                     [b, "-t", "nat", "-A", self.NAT,
                      "-s", self.target_ip, "-p", "tcp", "--dport", "80",
                      "-j", "REDIRECT", "--to-port", str(http_redirect_port)],
-                    silent=True) and ok
+                        silent=True):
+                    ok = self._journal_resource() and ok
+                else:
+                    ok = False
 
         log.info(
             f"Redirect rules applied: DNS={dns_spoof} "

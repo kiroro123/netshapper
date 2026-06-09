@@ -3,7 +3,7 @@ NetShaper — Linux tc HTB traffic shaper.
 """
 import logging
 import subprocess
-from typing import List, Set, Tuple
+from typing import Callable, List, Optional, Set, Tuple
 
 from netshaper.system import SubprocessRunner
 
@@ -19,6 +19,12 @@ class TrafficShaper:
         self._target_classes: Set[int] = set()
         self._tracked_mark_bases: Set[int] = set()
 
+    @staticmethod
+    def _journal_resource(journal: Optional[Callable[[], bool]]) -> bool:
+        if not journal:
+            return True
+        return journal()
+
     def _root_qdisc(self) -> str:
         try:
             result = subprocess.run(
@@ -31,7 +37,7 @@ class TrafficShaper:
             return ""
         return result.stdout.strip() if result.returncode == 0 else ""
 
-    def _init_root(self) -> None:
+    def _init_root(self, journal: Optional[Callable[[], bool]] = None) -> None:
         if not self._base_initialized:
             root_qdisc = self._root_qdisc()
             if root_qdisc:
@@ -46,11 +52,17 @@ class TrafficShaper:
                     f"Failed to create NetShaper root qdisc on {self.interface}"
                 )
             self._base_initialized = True
+            if not self._journal_resource(journal):
+                self.cleanup()
+                raise RuntimeError(
+                    f"Failed to journal NetShaper root qdisc on {self.interface}"
+                )
 
     def apply_target(self, target_ip: str, mbps: float,
-                     mark_base: int = 10) -> None:
+                     mark_base: int = 10,
+                     journal: Optional[Callable[[], bool]] = None) -> None:
         k = int(mbps * 1000)
-        self._init_root()
+        self._init_root(journal)
         created_classes: List[int] = []
         created_filters: List[Tuple[int, str]] = []
         for mark in [mark_base, mark_base + 10]:
@@ -67,6 +79,13 @@ class TrafficShaper:
                 raise RuntimeError(message)
             created_classes.append(mark)
             self._target_classes.add(mark)
+            if not self._journal_resource(journal):
+                rollback_ok = self._rollback_failed_target(
+                    created_filters, created_classes)
+                message = f"Failed to journal traffic class {classid}"
+                if not rollback_ok:
+                    message += "; rollback incomplete"
+                raise RuntimeError(message)
             for proto in ["ip", "ipv6"]:
                 if not SubprocessRunner.run(
                     ["tc", "filter", "add", "dev", self.interface,
@@ -81,6 +100,13 @@ class TrafficShaper:
                     raise RuntimeError(message)
                 created_filters.append((mark, proto))
                 self._target_filters.add((mark, proto))
+                if not self._journal_resource(journal):
+                    rollback_ok = self._rollback_failed_target(
+                        created_filters, created_classes)
+                    message = f"Failed to journal traffic filter for mark {mark}"
+                    if not rollback_ok:
+                        message += "; rollback incomplete"
+                    raise RuntimeError(message)
         self._tracked_mark_bases.add(mark_base)
         self._active_marks.add(mark_base)
         log.info(

@@ -268,7 +268,7 @@ class NetShaperCleanupTests(unittest.TestCase):
         self.assertTrue(ns._global_rules_applied)
         self.assertEqual(ns._global_firewall_binaries_applied, ["iptables"])
         self.assertEqual(len(ns._global_rules_created), 1)
-        ns.save_state.assert_called_once()
+        self.assertEqual(ns.save_state.call_count, 4)
 
         runner_mock.reset_mock()
         runner_mock.return_value = True

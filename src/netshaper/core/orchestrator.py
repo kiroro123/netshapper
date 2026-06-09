@@ -299,15 +299,16 @@ class NetShaper:
             return
         ok = True
         comment = self._global_rule_comment()
-        ok = SubprocessRunner.run(
-            ["sysctl", "-w", "net.ipv4.ip_forward=1"], silent=True) and ok
-        ok = SubprocessRunner.run(
-            ["sysctl", "-w", "net.ipv6.conf.all.forwarding=1"],
-            silent=True) and ok
-        ok = SubprocessRunner.run(
-            ["sysctl", "-w",
-             f"net.ipv4.conf.{self.interface}.route_localnet=1"],
-            silent=True) and ok
+        for command in [
+                ["sysctl", "-w", "net.ipv4.ip_forward=1"],
+                ["sysctl", "-w", "net.ipv6.conf.all.forwarding=1"],
+                ["sysctl", "-w",
+                 f"net.ipv4.conf.{self.interface}.route_localnet=1"],
+        ]:
+            if SubprocessRunner.run(command, silent=True):
+                ok = self._journal_state_if_ready() and ok
+            else:
+                ok = False
         for binary in ["iptables", "ip6tables"]:
             if shutil.which(binary):
                 for spec in self._global_firewall_rule_specs(
@@ -446,6 +447,7 @@ class NetShaper:
                 self.gw_ipv6,
                 self.shaper,
                 getattr(self, "session_id", None),
+                journal=self._journal_state_if_ready,
             )
             self.sessions[target.ip] = session
 

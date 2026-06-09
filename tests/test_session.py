@@ -120,6 +120,7 @@ class TargetSessionCleanupTests(unittest.TestCase):
             "eth0",
             session_id="NS-TEST",
             auto_setup=False,
+            journal=None,
         )
         self.assertIs(session.firewall, firewall)
 

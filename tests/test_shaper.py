@@ -144,6 +144,23 @@ class TrafficShaperTests(unittest.TestCase):
         self.assertEqual(shaper._active_marks, set())
 
     @mock.patch("netshaper.network.shaper.SubprocessRunner.run")
+    @mock.patch("netshaper.network.shaper.subprocess.run")
+    def test_apply_target_journals_each_created_resource(
+            self, run_mock, runner_mock):
+        run_mock.return_value = SimpleNamespace(returncode=0, stdout="")
+        runner_mock.return_value = True
+        journal = mock.Mock(return_value=True)
+        shaper = TrafficShaper("eth0")
+
+        shaper.apply_target(
+            "192.0.2.10",
+            5.0,
+            journal=journal,
+        )
+
+        self.assertEqual(journal.call_count, 7)
+
+    @mock.patch("netshaper.network.shaper.SubprocessRunner.run")
     def test_cleanup_target_removes_protocol_specific_filters(self, runner_mock):
         runner_mock.return_value = True
         shaper = TrafficShaper("eth0")
