@@ -11,7 +11,7 @@ import subprocess
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from ipaddress import IPv4Network
+from ipaddress import IPv4Network, ip_address
 from typing import Dict, List, Optional
 
 import psutil
@@ -28,6 +28,9 @@ LEASE_FILE_PATTERNS = (
     "/var/lib/dhcp/dhclient*.leases",
     "/var/lib/dhcp/dhcpd.leases",
 )
+
+ARP_BATCH_SIZE = 32
+ARP_SEND_INTERVAL = 0.03
 
 ARP = None
 Ether = None
@@ -167,6 +170,94 @@ class NetworkDiscovery:
         return None
 
     # ── ARP sweep ────────────────────────────────────────────────────────────
+    @staticmethod
+    def _valid_mac(mac: str) -> bool:
+        mac = (mac or "").lower()
+        if mac in {"", "00:00:00:00:00:00", "ff:ff:ff:ff:ff:ff"}:
+            return False
+        return bool(re.fullmatch(r"[0-9a-f]{2}(?::[0-9a-f]{2}){5}", mac))
+
+    @staticmethod
+    def _target_batches(targets: List[str],
+                        batch_size: int = ARP_BATCH_SIZE) -> List[List[str]]:
+        return [
+            targets[idx:idx + batch_size]
+            for idx in range(0, len(targets), batch_size)
+        ]
+
+    def _remember_device(
+            self,
+            ip: str,
+            mac: str,
+            gateway_ip: Optional[str] = None,
+            subnet: Optional[IPv4Network] = None) -> None:
+        if not ip or ip == gateway_ip:
+            return
+        if subnet is not None:
+            try:
+                if ip_address(ip) not in subnet:
+                    return
+            except ValueError:
+                return
+        mac = (mac or "").lower()
+        if not self._valid_mac(mac):
+            return
+        with self.lock:
+            if ip not in self.devices_dict:
+                self.devices_dict[ip] = Device(ip=ip, mac=mac)
+
+    def _merge_proc_arp_cache(
+            self,
+            subnet: IPv4Network,
+            gateway_ip: Optional[str]) -> None:
+        try:
+            with open("/proc/net/arp", encoding="utf-8") as fh:
+                for raw_line in fh.readlines()[1:]:
+                    parts = raw_line.split()
+                    if len(parts) < 6:
+                        continue
+                    ip, _, _, mac, _, device = parts[:6]
+                    if device != self.interface:
+                        continue
+                    self._remember_device(ip, mac, gateway_ip, subnet)
+        except OSError:
+            pass
+
+    def _merge_ip_neighbor_cache(
+            self,
+            subnet: IPv4Network,
+            gateway_ip: Optional[str]) -> None:
+        try:
+            result = subprocess.run(
+                ["ip", "-4", "neigh", "show", "dev", self.interface],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=1.0,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+            return
+        if result.returncode != 0:
+            return
+        for raw_line in result.stdout.splitlines():
+            parts = raw_line.split()
+            if not parts:
+                continue
+            ip = parts[0]
+            if "lladdr" not in parts:
+                continue
+            mac_index = parts.index("lladdr") + 1
+            if mac_index >= len(parts):
+                continue
+            self._remember_device(ip, parts[mac_index], gateway_ip, subnet)
+
+    def _merge_neighbor_caches(
+            self,
+            subnet: IPv4Network,
+            gateway_ip: Optional[str]) -> None:
+        self._merge_proc_arp_cache(subnet, gateway_ip)
+        self._merge_ip_neighbor_cache(subnet, gateway_ip)
+
     def _passive_sniff_callback(self, pkt) -> None:
         """
         ARP passive-sniff callback — thread-safe write to devices_dict.
@@ -180,14 +271,7 @@ class NetworkDiscovery:
             return
         src_ip  = pkt[ARP].psrc
         src_mac = pkt[Ether].src.lower()
-        # Skip ARP probes (sender IP = 0.0.0.0) and broadcast MACs
-        if not src_ip or src_ip == '0.0.0.0':
-            return
-        if src_mac == 'ff:ff:ff:ff:ff:ff':
-            return
-        with self.lock:
-            if src_ip not in self.devices_dict:
-                self.devices_dict[src_ip] = Device(ip=src_ip, mac=src_mac)
+        self._remember_device(src_ip, src_mac)
 
     def arp_sweep(self, subnet: str, gateway_ip: str) -> List[Device]:
         log.info(f"ARP sweep on {subnet}")
@@ -199,18 +283,26 @@ class NetworkDiscovery:
             if not targets:
                 return []
 
+            self._merge_neighbor_caches(net, gateway_ip)
+
             # Three passes with increasing timeouts to catch slow responders
             for timeout_val in [2, 3, 4]:
-                ans, _ = srp(
-                    Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=targets),
-                    iface=self.interface, timeout=timeout_val, verbose=0)
-                for _, rcv in ans:
-                    ip  = rcv[ARP].psrc
-                    mac = rcv[Ether].src.lower()
-                    if ip != gateway_ip:
-                        with self.lock:
-                            if ip not in self.devices_dict:
-                                self.devices_dict[ip] = Device(ip=ip, mac=mac)
+                for batch in self._target_batches(targets):
+                    ans, _ = srp(
+                        Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=batch),
+                        iface=self.interface,
+                        timeout=timeout_val,
+                        inter=ARP_SEND_INTERVAL,
+                        verbose=0)
+                    for _, rcv in ans:
+                        self._remember_device(
+                            rcv[ARP].psrc,
+                            rcv[Ether].src,
+                            gateway_ip,
+                            net,
+                        )
+
+            self._merge_neighbor_caches(net, gateway_ip)
 
             # Passive ARP sniff for 15 s to catch quiet devices
             stop_sniff = threading.Event()

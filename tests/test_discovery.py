@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+from ipaddress import IPv4Network
 from unittest import mock
 
 from netshaper.models import Device
@@ -7,6 +8,64 @@ from netshaper.network.discovery import NetworkDiscovery
 
 
 class DiscoveryHostnameTests(unittest.TestCase):
+    def test_target_batches_chunks_large_subnet_probe(self):
+        targets = [f"192.0.2.{idx}" for idx in range(1, 70)]
+
+        batches = NetworkDiscovery._target_batches(targets, batch_size=32)
+
+        self.assertEqual([len(batch) for batch in batches], [32, 32, 5])
+        self.assertEqual(batches[0][0], "192.0.2.1")
+        self.assertEqual(batches[-1][-1], "192.0.2.69")
+
+    def test_merge_proc_arp_cache_adds_valid_neighbors_only(self):
+        arp_table = (
+            "IP address       HW type     Flags       HW address            Mask     Device\n"
+            "192.0.2.1        0x1         0x2         aa:bb:cc:dd:ee:01   *        eth0\n"
+            "192.0.2.20       0x1         0x2         aa:bb:cc:dd:ee:20   *        eth0\n"
+            "192.0.2.21       0x1         0x2         ff:ff:ff:ff:ff:ff   *        eth0\n"
+            "192.0.2.22       0x1         0x2         aa:bb:cc:dd:ee:22   *        wlan0\n"
+            "198.51.100.10    0x1         0x2         aa:bb:cc:dd:ee:10   *        eth0\n"
+        )
+        disc = NetworkDiscovery("eth0")
+
+        with mock.patch("builtins.open", mock.mock_open(read_data=arp_table)):
+            disc._merge_proc_arp_cache(
+                IPv4Network("192.0.2.0/24"),
+                "192.0.2.1",
+            )
+
+        self.assertEqual(list(disc.devices_dict), ["192.0.2.20"])
+        self.assertEqual(
+            disc.devices_dict["192.0.2.20"].mac,
+            "aa:bb:cc:dd:ee:20",
+        )
+
+    @mock.patch("netshaper.network.discovery.subprocess.run")
+    def test_merge_ip_neighbor_cache_adds_lladdr_neighbors(self, run_mock):
+        run_mock.return_value = mock.Mock(
+            returncode=0,
+            stdout=(
+                "192.0.2.20 lladdr aa:bb:cc:dd:ee:20 REACHABLE\n"
+                "192.0.2.21 INCOMPLETE\n"
+                "192.0.2.1 lladdr aa:bb:cc:dd:ee:01 STALE\n"
+            ),
+        )
+        disc = NetworkDiscovery("eth0")
+
+        disc._merge_ip_neighbor_cache(
+            IPv4Network("192.0.2.0/24"),
+            "192.0.2.1",
+        )
+
+        self.assertEqual(list(disc.devices_dict), ["192.0.2.20"])
+        run_mock.assert_called_once_with(
+            ["ip", "-4", "neigh", "show", "dev", "eth0"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=1.0,
+        )
+
     def test_default_gateway_uses_selected_interface_and_lowest_metric(self):
         route_table = (
             "Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT\n"
