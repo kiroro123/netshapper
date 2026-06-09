@@ -49,7 +49,10 @@ class NetShaperCleanupTests(unittest.TestCase):
         ns.sniffer.stop.assert_called_once()
         mitm_proc.terminate.assert_called_once()
         ns._remove_global_rules.assert_called_once()
-        restore_mock.assert_called_once_with(ns.state_snapshot)
+        restore_mock.assert_called_once_with(
+            ns.state_snapshot,
+            restore_firewall=True,
+        )
         ns.shaper.cleanup.assert_called_once()
         self.assertFalse(ns._cleanup_complete)
 
@@ -150,6 +153,18 @@ class NetShaperCleanupTests(unittest.TestCase):
 
         self.assertTrue(result)
         popen_mock.assert_not_called()
+
+    def test_dry_run_discover_does_not_touch_network(self):
+        ns = NetShaper.__new__(NetShaper)
+        ns.disc = mock.Mock()
+
+        with mock.patch("netshaper.core.orchestrator.config.DRY_RUN", True), \
+             mock.patch("netshaper.core.orchestrator.print_flush"):
+            result = ns.discover()
+
+        self.assertEqual(result, [])
+        ns.disc.get_subnet_v4.assert_not_called()
+        ns.disc.arp_sweep.assert_not_called()
 
     def test_launch_mitmproxy_reaps_process_when_readiness_fails(self):
         ns = NetShaper.__new__(NetShaper)
@@ -447,13 +462,17 @@ class NetShaperCleanupTests(unittest.TestCase):
                  mock.patch("netshaper.core.orchestrator.SubprocessRunner.run",
                             return_value=True) as runner_mock, \
                  mock.patch("netshaper.core.orchestrator.StateSnapshotManager.restore",
-                            return_value=True):
+                            return_value=True) as restore_mock:
                 ns.load_state_and_cleanup()
 
             runner_mock.assert_any_call(
                 ["tc", "qdisc", "del", "dev", "eth0", "root"],
                 check=False,
                 silent=True,
+            )
+            restore_mock.assert_called_once_with(
+                mock.ANY,
+                restore_firewall=True,
             )
             self.assertFalse(os.path.exists(state_path))
 

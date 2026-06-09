@@ -386,6 +386,9 @@ class NetShaper:
     # ── Discovery ─────────────────────────────────────────────────────────────
     def discover(self) -> List[Device]:
         import sys
+        if config.DRY_RUN:
+            print_flush("[DRY-RUN] Device discovery skipped")
+            return []
         subnet = self.disc.get_subnet_v4()
         if not subnet:
             sys.exit("[NetShaper] Could not determine subnet.")
@@ -550,7 +553,10 @@ class NetShaper:
             cleanup_step(
                 "state snapshot",
                 lambda: (
-                    StateSnapshotManager.restore(self.state_snapshot)
+                    StateSnapshotManager.restore(
+                        self.state_snapshot,
+                        restore_firewall=True,
+                    )
                     or (_ for _ in ()).throw(RuntimeError("state snapshot restore failed"))
                 ),
             )
@@ -945,7 +951,10 @@ class NetShaper:
                         )
 
                 snapshot = self._snapshot_from_state(data)
-                cleanup_ok = StateSnapshotManager.restore(snapshot) and cleanup_ok
+                cleanup_ok = StateSnapshotManager.restore(
+                    snapshot,
+                    restore_firewall=True,
+                ) and cleanup_ok
                 if cleanup_ok:
                     log.info("Stale rules cleaned.")
                     os.remove(state_path)

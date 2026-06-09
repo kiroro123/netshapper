@@ -38,7 +38,7 @@ python -m netshaper -i <your-interface>
 Safe preview mode:
 
 ```bash
-python -m netshaper -i <your-interface> --dry-run
+python -m netshaper -i <your-interface> --targets <target-ip> --dry-run
 ```
 
 Optional captive-portal / DNS helper:
