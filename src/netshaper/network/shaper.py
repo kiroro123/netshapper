@@ -164,29 +164,70 @@ class TrafficShaper:
             classes: List[int]) -> bool:
         ok = True
         for mark, proto in reversed(filters):
-            if self._delete_filter(mark, proto):
+            status = self._delete_filter(mark, proto)
+            if status in (InspectionStatus.PRESENT, InspectionStatus.ABSENT):
                 self._target_filters.discard((mark, proto))
             else:
                 ok = False
         for mark in reversed(classes):
-            if self._delete_class(mark):
+            status = self._delete_class(mark)
+            if status in (InspectionStatus.PRESENT, InspectionStatus.ABSENT):
                 self._target_classes.discard(mark)
             else:
                 ok = False
         return ok
 
-    def _delete_filter(self, mark: int, proto: str) -> bool:
-        return SubprocessRunner.run(
-            ["tc", "filter", "del", "dev", self.interface,
-             "parent", "1:", "protocol", proto,
-             "handle", str(mark), "fw"],
-            check=False, silent=True)
+    def _filter_state(self, mark: int, proto: str) -> InspectionStatus:
+        result = inspect_resource(
+            ["tc", "filter", "show", "dev", self.interface,
+             "parent", "1:", "protocol", proto])
+        if result.status != InspectionStatus.PRESENT:
+            return result.status
+        output = result.stdout.lower()
+        markers = (
+            f"classid 1:{mark}",
+            f"handle {mark} ",
+            f"handle 0x{mark:x} ",
+        )
+        return (
+            InspectionStatus.PRESENT
+            if any(marker in output for marker in markers)
+            else InspectionStatus.ABSENT
+        )
 
-    def _delete_class(self, mark: int) -> bool:
-        return SubprocessRunner.run(
-            ["tc", "class", "del", "dev", self.interface,
-             "classid", f"1:{mark}"],
-            check=False, silent=True)
+    def _class_state(self, mark: int) -> InspectionStatus:
+        result = inspect_resource(
+            ["tc", "class", "show", "dev", self.interface])
+        if result.status != InspectionStatus.PRESENT:
+            return result.status
+        return (
+            InspectionStatus.PRESENT
+            if f"1:{mark}" in result.stdout
+            else InspectionStatus.ABSENT
+        )
+
+    def _delete_filter(self, mark: int, proto: str) -> InspectionStatus:
+        if SubprocessRunner.run(
+                ["tc", "filter", "del", "dev", self.interface,
+                 "parent", "1:", "protocol", proto,
+                 "handle", str(mark), "fw"],
+                check=False, silent=True):
+            return InspectionStatus.PRESENT
+        status = self._filter_state(mark, proto)
+        if status is InspectionStatus.ABSENT:
+            return InspectionStatus.ABSENT
+        return InspectionStatus.ERROR
+
+    def _delete_class(self, mark: int) -> InspectionStatus:
+        if SubprocessRunner.run(
+                ["tc", "class", "del", "dev", self.interface,
+                 "classid", f"1:{mark}"],
+                check=False, silent=True):
+            return InspectionStatus.PRESENT
+        status = self._class_state(mark)
+        if status is InspectionStatus.ABSENT:
+            return InspectionStatus.ABSENT
+        return InspectionStatus.ERROR
 
     def cleanup_target(self, mark_base: int) -> bool:
         ok = True
@@ -212,12 +253,14 @@ class TrafficShaper:
             self._tracked_mark_bases.add(mark_base)
         for mark, proto in sorted(
                 self._target_filters.intersection(expected_filters)):
-            if self._delete_filter(mark, proto):
+            status = self._delete_filter(mark, proto)
+            if status in (InspectionStatus.PRESENT, InspectionStatus.ABSENT):
                 self._target_filters.discard((mark, proto))
             else:
                 ok = False
         for mark in sorted(self._target_classes.intersection(expected_classes)):
-            if self._delete_class(mark):
+            status = self._delete_class(mark)
+            if status in (InspectionStatus.PRESENT, InspectionStatus.ABSENT):
                 self._target_classes.discard(mark)
             else:
                 ok = False
