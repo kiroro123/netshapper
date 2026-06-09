@@ -2,7 +2,12 @@ import unittest
 from unittest import mock
 
 from netshaper import config
-from netshaper.system import SubprocessRunner, SystemChecker
+from netshaper.system import (
+    InspectionStatus,
+    SubprocessRunner,
+    SystemChecker,
+    inspect_resource,
+)
 
 
 class SystemCheckerTests(unittest.TestCase):
@@ -27,6 +32,34 @@ class SystemCheckerTests(unittest.TestCase):
 
         makedirs_mock.assert_not_called()
         getuid_mock.assert_not_called()
+
+    @mock.patch("netshaper.system.subprocess.run")
+    def test_inspect_resource_classifies_present_absent_and_error(self, run_mock):
+        run_mock.return_value = mock.Mock(returncode=0, stdout="", stderr="")
+        self.assertIs(
+            inspect_resource(["iptables", "-C", "FORWARD"]).status,
+            InspectionStatus.PRESENT,
+        )
+
+        run_mock.return_value = mock.Mock(
+            returncode=1,
+            stdout="",
+            stderr="Bad rule (does a matching rule exist in that chain?).",
+        )
+        self.assertIs(
+            inspect_resource(["iptables", "-C", "FORWARD"]).status,
+            InspectionStatus.ABSENT,
+        )
+
+        run_mock.return_value = mock.Mock(
+            returncode=4,
+            stdout="",
+            stderr="Permission denied (you must be root)",
+        )
+        self.assertIs(
+            inspect_resource(["iptables", "-C", "FORWARD"]).status,
+            InspectionStatus.ERROR,
+        )
 
 
 if __name__ == "__main__":

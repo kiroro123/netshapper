@@ -322,6 +322,37 @@ class NetShaperCleanupTests(unittest.TestCase):
         self.assertFalse(ns._global_rules_applied)
         self.assertEqual(ns._global_firewall_binaries_applied, [])
 
+    def test_remove_global_rules_preserves_state_when_inspection_errors(self):
+        ns = NetShaper.__new__(NetShaper)
+        ns.interface = "eth0"
+        ns.session_id = "NS-TEST"
+        ns.state_snapshot = mock.Mock(
+            ipv4_forwarding=None,
+            ipv6_forwarding=None,
+            route_localnet=None,
+        )
+        ns._global_rules_applied = True
+        ns._global_firewall_binaries_applied = ["iptables"]
+        inspect_error = mock.Mock(
+            returncode=4,
+            stdout="",
+            stderr="Permission denied (you must be root)",
+        )
+
+        with mock.patch("netshaper.core.orchestrator.shutil.which",
+                        return_value="/sbin/iptables"), \
+             mock.patch("netshaper.system.subprocess.run",
+                        return_value=inspect_error), \
+             mock.patch("netshaper.core.orchestrator.SubprocessRunner.run"
+                        ) as runner_mock, \
+             mock.patch("netshaper.core.orchestrator.log"):
+            result = ns._remove_global_rules()
+
+        self.assertFalse(result)
+        runner_mock.assert_not_called()
+        self.assertTrue(ns._global_rules_applied)
+        self.assertEqual(ns._global_firewall_binaries_applied, ["iptables"])
+
     def test_stale_cleanup_removes_recorded_tc_root_qdisc(self):
         ns = NetShaper.__new__(NetShaper)
         snapshot = {
@@ -425,6 +456,58 @@ class NetShaperCleanupTests(unittest.TestCase):
                 delete_commands,
             )
             self.assertFalse(os.path.exists(state_path))
+
+    def test_stale_cleanup_keeps_manifest_when_inspection_errors(self):
+        ns = NetShaper.__new__(NetShaper)
+        snapshot = {
+            "session_id": "NS-OLD",
+            "interface": "eth0",
+            "ipv4_forwarding": None,
+            "ipv6_forwarding": None,
+            "route_localnet": None,
+            "iptables_rules": "",
+            "ip6tables_rules": "",
+            "tc_configuration": "",
+        }
+        state = {
+            "session_id": "NS-OLD",
+            "interface": "eth0",
+            "targets": [],
+            "global_rules_applied": True,
+            "global_rule_comment": "netshaper:NS-OLD:global",
+            "global_firewall_binaries": ["iptables"],
+            "shaper_base_initialized": False,
+            "snapshot": snapshot,
+        }
+        inspect_error = mock.Mock(
+            returncode=4,
+            stdout="",
+            stderr="Permission denied (you must be root)",
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = os.path.join(tmp, "NS-OLD")
+            os.makedirs(state_dir)
+            state_path = os.path.join(state_dir, "state.json")
+            with open(state_path, "w", encoding="utf-8") as fh:
+                json.dump(state, fh)
+
+            with mock.patch("netshaper.core.orchestrator.config.STATE_DIR", tmp), \
+                 mock.patch("netshaper.core.orchestrator.print_flush"), \
+                 mock.patch("netshaper.core.orchestrator.shutil.which",
+                            return_value="/sbin/iptables"), \
+                 mock.patch("netshaper.system.subprocess.run",
+                            return_value=inspect_error), \
+                 mock.patch("netshaper.core.orchestrator.SubprocessRunner.run"
+                            ) as runner_mock, \
+                 mock.patch("netshaper.core.orchestrator.StateSnapshotManager.restore",
+                            return_value=True), \
+                 mock.patch("netshaper.core.orchestrator.log"):
+                result = ns.load_state_and_cleanup()
+
+            self.assertFalse(result)
+            self.assertTrue(os.path.exists(state_path))
+            runner_mock.assert_not_called()
 
     def test_stale_cleanup_uses_target_input_rule_comment(self):
         ns = NetShaper.__new__(NetShaper)

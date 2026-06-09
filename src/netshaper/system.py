@@ -11,10 +11,78 @@ import os
 import socket
 import subprocess
 import sys
+from dataclasses import dataclass
+from enum import Enum
 
 from netshaper import config
 
 log = logging.getLogger("netshaper")
+
+
+class InspectionStatus(Enum):
+    PRESENT = "present"
+    ABSENT = "absent"
+    ERROR = "error"
+
+
+@dataclass(frozen=True)
+class InspectionResult:
+    status: InspectionStatus
+    stdout: str = ""
+    stderr: str = ""
+
+
+_ABSENT_MARKERS = (
+    "does a matching rule exist",
+    "no chain/target/match by that name",
+    "no such file or directory",
+    "cannot find device",
+    "no such qdisc",
+    "no such file",
+    "not found",
+)
+
+_ERROR_MARKERS = (
+    "permission denied",
+    "operation not permitted",
+    "you must be root",
+    "can't initialize",
+    "cannot initialize",
+    "invalid option",
+    "unknown option",
+    "bad argument",
+    "syntax error",
+)
+
+
+def inspect_resource(args) -> InspectionResult:
+    if config.DRY_RUN:
+        return InspectionResult(InspectionStatus.ABSENT)
+    try:
+        result = subprocess.run(
+            args,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except FileNotFoundError as exc:
+        return InspectionResult(InspectionStatus.ERROR, stderr=str(exc))
+    except Exception as exc:
+        return InspectionResult(InspectionStatus.ERROR, stderr=str(exc))
+    stdout = getattr(result, "stdout", "") or ""
+    stderr = getattr(result, "stderr", "") or ""
+    if not isinstance(stdout, str):
+        stdout = ""
+    if not isinstance(stderr, str):
+        stderr = ""
+    if result.returncode == 0:
+        return InspectionResult(InspectionStatus.PRESENT, stdout, stderr)
+    output = f"{stdout}\n{stderr}".lower()
+    if any(marker in output for marker in _ERROR_MARKERS):
+        return InspectionResult(InspectionStatus.ERROR, stdout, stderr)
+    if not output.strip() or any(marker in output for marker in _ABSENT_MARKERS):
+        return InspectionResult(InspectionStatus.ABSENT, stdout, stderr)
+    return InspectionResult(InspectionStatus.ERROR, stdout, stderr)
 
 
 class SystemChecker:

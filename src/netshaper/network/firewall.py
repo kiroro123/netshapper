@@ -11,7 +11,7 @@ import subprocess
 from typing import List, Optional, Set, Tuple
 
 from netshaper import config
-from netshaper.system import SubprocessRunner
+from netshaper.system import InspectionStatus, SubprocessRunner, inspect_resource
 
 log = logging.getLogger("netshaper")
 
@@ -66,17 +66,11 @@ class FirewallManager:
             return []
         return ["-m", "comment", "--comment", self._rule_comment]
 
+    def _rule_state(self, command: List[str]) -> InspectionStatus:
+        return inspect_resource(command).status
+
     def _rule_ok(self, command: List[str]) -> bool:
-        if config.DRY_RUN:
-            return False
-        try:
-            return subprocess.run(
-                command,
-                capture_output=True,
-                check=False,
-            ).returncode == 0
-        except FileNotFoundError:
-            return False
+        return self._rule_state(command) is InspectionStatus.PRESENT
 
     def _input_accept_rule(
             self,
@@ -111,8 +105,14 @@ class FirewallManager:
         )
         if not tracked:
             return True
-        exists = self._chain_ok(b, t, c)
-        if not exists:
+        chain_status = self._chain_state(b, t, c)
+        if chain_status is InspectionStatus.ERROR:
+            log.error(
+                f"Cannot inspect firewall chain for {self.target_ip}: "
+                f"{b} {t}/{c}"
+            )
+            return False
+        if chain_status is InspectionStatus.ABSENT:
             self._drop_chain_tracking(key)
             return True
         ok = True
@@ -123,17 +123,25 @@ class FirewallManager:
         hook = _TABLE_HOOK[t]
         jump_check = [b, "-t", t, "-C", hook, "-j", c]
         if key in self._linked_chains:
-            if self._rule_ok(jump_check):
+            jump_status = self._rule_state(jump_check)
+            if jump_status is InspectionStatus.PRESENT:
                 if SubprocessRunner.run(
                         [b, "-t", t, "-D", hook, "-j", c],
                         check=False, silent=True):
                     self._linked_chains.discard(key)
                 else:
                     ok = False
-            else:
+            elif jump_status is InspectionStatus.ABSENT:
                 self._linked_chains.discard(key)
+            else:
+                log.error(
+                    f"Cannot inspect firewall jump for {self.target_ip}: "
+                    f"{b} {t}/{hook}->{c}"
+                )
+                ok = False
         if key not in self._linked_chains:
-            if self._chain_ok(b, t, c):
+            delete_status = self._chain_state(b, t, c)
+            if delete_status is InspectionStatus.PRESENT:
                 if SubprocessRunner.run(
                         [b, "-t", t, "-X", c],
                         check=False, silent=True):
@@ -141,20 +149,33 @@ class FirewallManager:
                     self._managed_chains.discard(key)
                 else:
                     ok = False
-            else:
+            elif delete_status is InspectionStatus.ABSENT:
                 self._created_chains.discard(key)
                 self._managed_chains.discard(key)
+            else:
+                log.error(
+                    f"Cannot inspect firewall chain for {self.target_ip}: "
+                    f"{b} {t}/{c}"
+                )
+                ok = False
         return ok
 
     def _cleanup_input_rule(
             self,
             b: str,
             proto: str,
-            port: int) -> bool:
+        port: int) -> bool:
         check_cmd = self._input_accept_rule(b, "-C", proto, port)
         delete_cmd = self._input_accept_rule(b, "-D", proto, port)
-        if not self._rule_ok(check_cmd):
+        rule_status = self._rule_state(check_cmd)
+        if rule_status is InspectionStatus.ABSENT:
             return True
+        if rule_status is InspectionStatus.ERROR:
+            log.error(
+                f"Cannot inspect firewall input rule for {self.target_ip}: "
+                f"{proto}/{port}"
+            )
+            return False
         return SubprocessRunner.run(
             delete_cmd,
             check=False,
@@ -178,23 +199,21 @@ class FirewallManager:
         return config.DRY_RUN or shutil.which(b) is not None
 
     def _chain_ok(self, b: str, t: str, c: str) -> bool:
-        if config.DRY_RUN:
-            return False
-        try:
-            return subprocess.run(
-                [b, "-t", t, "-L", c],
-                capture_output=True,
-                check=False,
-            ).returncode == 0
-        except FileNotFoundError:
-            return False
+        return self._chain_state(b, t, c) is InspectionStatus.PRESENT
+
+    def _chain_state(self, b: str, t: str, c: str) -> InspectionStatus:
+        return inspect_resource([b, "-t", t, "-L", c]).status
 
     def _setup(self) -> bool:
         ok = True
         for b in self._binaries:
             for t, c in [("mangle", self.MANGLE), ("nat", self.NAT)]:
                 self._managed_chains.add((b, t, c))
-                if not self._chain_ok(b, t, c):
+                chain_status = self._chain_state(b, t, c)
+                if chain_status is InspectionStatus.ERROR:
+                    ok = False
+                    continue
+                if chain_status is InspectionStatus.ABSENT:
                     hook = _TABLE_HOOK[t]
                     created = SubprocessRunner.run(
                         [b, "-t", t, "-N", c],

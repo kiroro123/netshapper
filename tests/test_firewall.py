@@ -2,6 +2,7 @@ import unittest
 from unittest import mock
 
 from netshaper.network.firewall import FirewallManager
+from netshaper.system import InspectionStatus
 
 
 class FirewallManagerTests(unittest.TestCase):
@@ -46,7 +47,9 @@ class FirewallManagerTests(unittest.TestCase):
         fw._shaping_added = False
         fw._shaping_mark_base = None
 
-        with mock.patch.object(fw, "_chain_ok", return_value=True), \
+        with mock.patch.object(
+                fw, "_chain_state",
+                return_value=InspectionStatus.PRESENT), \
              mock.patch("netshaper.network.firewall.shutil.which",
                         return_value="/sbin/iptables"):
             result = fw.cleanup()
@@ -111,8 +114,12 @@ class FirewallManagerTests(unittest.TestCase):
         fw._shaping_added = False
         fw._shaping_mark_base = None
 
-        with mock.patch.object(fw, "_chain_ok", return_value=True), \
-             mock.patch.object(fw, "_rule_ok", return_value=True), \
+        with mock.patch.object(
+                fw, "_chain_state",
+                return_value=InspectionStatus.PRESENT), \
+             mock.patch.object(
+                 fw, "_rule_state",
+                 return_value=InspectionStatus.PRESENT), \
              mock.patch("netshaper.network.firewall.shutil.which",
                         return_value="/sbin/iptables"):
             first = fw.cleanup()
@@ -124,6 +131,72 @@ class FirewallManagerTests(unittest.TestCase):
         self.assertEqual(fw._linked_chains, set())
         self.assertEqual(fw._created_chains, set())
         self.assertEqual(runner_mock.call_count, 8)
+
+    def test_cleanup_preserves_tracking_when_chain_inspection_errors(self):
+        fw = FirewallManager.__new__(FirewallManager)
+        fw.target_ip = "192.0.2.10"
+        fw.interface = "eth0"
+        fw._v6 = False
+        fw._rule_comment = "netshaper:NS-TEST:192.0.2.10"
+        fw.MANGLE = "NS-MNG-TEST"
+        fw.NAT = "NS-NAT-TEST"
+        fw._managed_chains = {("iptables", "mangle", "NS-MNG-TEST")}
+        fw._linked_chains = set()
+        fw._created_chains = set()
+        fw._dns_added = False
+        fw._http_added = False
+        fw._http_redirect_port = None
+        fw._dns_input_rules = set()
+        fw._http_input_rules = set()
+        fw._shaping_added = False
+        fw._shaping_mark_base = None
+
+        with mock.patch.object(
+                fw, "_chain_state",
+                return_value=InspectionStatus.ERROR), \
+             mock.patch("netshaper.network.firewall.shutil.which",
+                        return_value="/sbin/iptables"), \
+             mock.patch("netshaper.network.firewall.log"):
+            result = fw.cleanup()
+
+        self.assertFalse(result)
+        self.assertEqual(
+            fw._managed_chains,
+            {("iptables", "mangle", "NS-MNG-TEST")},
+        )
+
+    def test_cleanup_preserves_input_rule_when_inspection_errors(self):
+        fw = FirewallManager.__new__(FirewallManager)
+        fw.target_ip = "192.0.2.10"
+        fw.interface = "eth0"
+        fw._v6 = False
+        fw._rule_comment = "netshaper:NS-TEST:192.0.2.10"
+        fw.MANGLE = "NS-MNG-TEST"
+        fw.NAT = "NS-NAT-TEST"
+        fw._managed_chains = set()
+        fw._linked_chains = set()
+        fw._created_chains = set()
+        fw._dns_added = True
+        fw._http_added = False
+        fw._http_redirect_port = None
+        fw._dns_input_rules = {("iptables", "udp")}
+        fw._http_input_rules = set()
+        fw._shaping_added = False
+        fw._shaping_mark_base = None
+
+        with mock.patch.object(
+                fw, "_chain_state",
+                return_value=InspectionStatus.ABSENT), \
+             mock.patch.object(
+                 fw, "_rule_state",
+                 return_value=InspectionStatus.ERROR), \
+             mock.patch("netshaper.network.firewall.shutil.which",
+                        return_value="/sbin/iptables"), \
+             mock.patch("netshaper.network.firewall.log"):
+            result = fw.cleanup()
+
+        self.assertFalse(result)
+        self.assertEqual(fw._dns_input_rules, {("iptables", "udp")})
 
     @mock.patch("netshaper.network.firewall.SubprocessRunner.run")
     def test_redirect_input_rules_use_session_comment(self, runner_mock):
@@ -172,9 +245,19 @@ class FirewallManagerTests(unittest.TestCase):
         )
 
         with mock.patch.object(
-                fw, "_chain_ok",
-                side_effect=[False, False, True, True, True, True, True]), \
-             mock.patch.object(fw, "_rule_ok", return_value=True), \
+                fw, "_chain_state",
+                side_effect=[
+                    InspectionStatus.ABSENT,
+                    InspectionStatus.ABSENT,
+                    InspectionStatus.PRESENT,
+                    InspectionStatus.PRESENT,
+                    InspectionStatus.PRESENT,
+                    InspectionStatus.PRESENT,
+                    InspectionStatus.PRESENT,
+                ]), \
+             mock.patch.object(
+                 fw, "_rule_state",
+                 return_value=InspectionStatus.PRESENT), \
              self.assertRaisesRegex(RuntimeError, "rollback incomplete"):
             fw.setup()
 

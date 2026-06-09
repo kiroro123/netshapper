@@ -29,7 +29,13 @@ from netshaper.core.state_manager import NetworkStateSnapshot, StateSnapshotMana
 from netshaper.models import Device, MarkIDPool
 from netshaper.network.discovery import NetworkDiscovery
 from netshaper.network.shaper import TrafficShaper
-from netshaper.system import SubprocessRunner, SystemChecker, check_local_port
+from netshaper.system import (
+    InspectionStatus,
+    SubprocessRunner,
+    SystemChecker,
+    check_local_port,
+    inspect_resource,
+)
 from netshaper.utils import print_flush
 
 log = logging.getLogger("netshaper")
@@ -216,16 +222,8 @@ class NetShaper:
         ]
 
     @staticmethod
-    def _rule_present(command: List[str]) -> bool:
-        try:
-            return subprocess.run(
-                command,
-                capture_output=True,
-                text=True,
-                check=False,
-            ).returncode == 0
-        except FileNotFoundError:
-            return False
+    def _inspect_rule(command: List[str]) -> InspectionStatus:
+        return inspect_resource(command).status
 
     @staticmethod
     def _target_input_rule_spec(
@@ -316,7 +314,15 @@ class NetShaper:
                 continue
             for spec in self._global_firewall_rule_specs(
                     binary, self.interface, self._global_rule_comment()):
-                if not self._rule_present(spec["check"]):
+                status = self._inspect_rule(spec["check"])
+                if status is InspectionStatus.ABSENT:
+                    continue
+                if status is InspectionStatus.ERROR:
+                    log.error(
+                        f"Cannot inspect global firewall rule: "
+                        f"{spec['description']}"
+                    )
+                    ok = False
                     continue
                 ok = SubprocessRunner.run(
                     spec["delete"], check=False, silent=True) and ok
@@ -737,24 +743,19 @@ class NetShaper:
                         cleanup_ok = False
                         log.error(f"Stale cleanup failed ({description})")
 
-                def resource_present(
+                def inspect_stale_resource(
                         command: list[str],
                         *,
-                        output_contains: Optional[str] = None) -> bool:
-                    try:
-                        result = subprocess.run(
-                            command,
-                            capture_output=True,
-                            text=True,
-                            check=False,
-                        )
-                    except FileNotFoundError:
-                        return False
-                    if result.returncode != 0:
-                        return False
-                    if output_contains is not None:
-                        return output_contains in (result.stdout or "")
-                    return True
+                        output_contains: Optional[str] = None,
+                ) -> InspectionStatus:
+                    inspection = inspect_resource(command)
+                    if inspection.status is not InspectionStatus.PRESENT:
+                        return inspection.status
+                    if (
+                            output_contains is not None
+                            and output_contains not in inspection.stdout):
+                        return InspectionStatus.ABSENT
+                    return InspectionStatus.PRESENT
 
                 def run_recovery_if_present(
                         description: str,
@@ -762,11 +763,20 @@ class NetShaper:
                         exists_command: list[str],
                         *,
                         output_contains: Optional[str] = None) -> None:
-                    if not resource_present(
+                    nonlocal cleanup_ok
+                    status = inspect_stale_resource(
                             exists_command,
-                            output_contains=output_contains):
+                            output_contains=output_contains)
+                    if status is InspectionStatus.ABSENT:
                         log.info(
                             f"Stale cleanup skipped ({description} already absent)"
+                        )
+                        return
+                    if status is InspectionStatus.ERROR:
+                        cleanup_ok = False
+                        log.error(
+                            f"Stale cleanup failed ({description}): "
+                            "resource inspection failed"
                         )
                         return
                     run_recovery(description, command)
