@@ -29,10 +29,9 @@ LEASE_FILE_PATTERNS = (
     "/var/lib/dhcp/dhcpd.leases",
 )
 
-ARP_BATCH_SIZE = 32
-ARP_SEND_INTERVAL = 0.015
-ARP_BATCH_TIMEOUTS = (0.45, 0.65)
-CACHE_FAST_PATH_MIN_DEVICES = 16
+ARP_BATCH_SIZE = 64
+ARP_SEND_INTERVAL = 0.006
+ARP_BATCH_TIMEOUTS = (0.35, 0.45)
 
 ARP = None
 Ether = None
@@ -294,36 +293,34 @@ class NetworkDiscovery:
             if cached_count:
                 print_flush(f"  Cached neighbors: {cached_count} devices")
 
-            if cached_count >= CACHE_FAST_PATH_MIN_DEVICES:
-                print_flush("  ARP sweep: using neighbor cache")
-            else:
-                batches = self._target_batches(targets)
-                # Short visible passes avoid long silent waits on Wi-Fi.
-                for pass_idx, timeout_val in enumerate(
-                        ARP_BATCH_TIMEOUTS, 1):
-                    for batch_idx, batch in enumerate(batches, 1):
-                        print_flush(
-                            "\r  ARP sweep: "
-                            f"pass {pass_idx}/{len(ARP_BATCH_TIMEOUTS)} "
-                            f"batch {batch_idx}/{len(batches)} | "
-                            f"{self._device_count():2d} devices",
-                            end='',
+            batches = self._target_batches(targets)
+            # Short visible passes avoid long silent waits on Wi-Fi while still
+            # refreshing the cached neighbor list with live replies.
+            for pass_idx, timeout_val in enumerate(
+                    ARP_BATCH_TIMEOUTS, 1):
+                for batch_idx, batch in enumerate(batches, 1):
+                    print_flush(
+                        "\r  ARP sweep: "
+                        f"pass {pass_idx}/{len(ARP_BATCH_TIMEOUTS)} "
+                        f"batch {batch_idx}/{len(batches)} | "
+                        f"{self._device_count():2d} devices",
+                        end='',
+                    )
+                    ans, _ = srp(
+                        Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=batch),
+                        iface=self.interface,
+                        timeout=timeout_val,
+                        inter=ARP_SEND_INTERVAL,
+                        verbose=0)
+                    for _, rcv in ans:
+                        self._remember_device(
+                            rcv[ARP].psrc,
+                            rcv[Ether].src,
+                            gateway_ip,
+                            net,
                         )
-                        ans, _ = srp(
-                            Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=batch),
-                            iface=self.interface,
-                            timeout=timeout_val,
-                            inter=ARP_SEND_INTERVAL,
-                            verbose=0)
-                        for _, rcv in ans:
-                            self._remember_device(
-                                rcv[ARP].psrc,
-                                rcv[Ether].src,
-                                gateway_ip,
-                                net,
-                            )
-                print_flush()
-                self._merge_neighbor_caches(net, gateway_ip)
+            print_flush()
+            self._merge_neighbor_caches(net, gateway_ip)
 
             # Passive ARP sniff for 15 s to catch quiet devices
             stop_sniff = threading.Event()

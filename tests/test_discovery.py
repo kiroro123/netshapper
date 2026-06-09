@@ -66,8 +66,18 @@ class DiscoveryHostnameTests(unittest.TestCase):
             timeout=1.0,
         )
 
-    def test_arp_sweep_uses_rich_neighbor_cache_without_active_probe(self):
+    def test_arp_sweep_refreshes_even_when_neighbor_cache_is_rich(self):
         disc = NetworkDiscovery("eth0")
+
+        class FakeLayer:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def __truediv__(self, _other):
+                return self
+
+            def __contains__(self, _item):
+                return False
 
         def seed_cache(_subnet, _gateway_ip):
             for idx in range(20, 36):
@@ -80,14 +90,17 @@ class DiscoveryHostnameTests(unittest.TestCase):
         with mock.patch("netshaper.network.discovery._ensure_scapy_layers"), \
              mock.patch.object(disc, "_merge_neighbor_caches",
                                side_effect=seed_cache), \
+             mock.patch("netshaper.network.discovery.Ether", FakeLayer), \
+             mock.patch("netshaper.network.discovery.ARP", FakeLayer), \
              mock.patch("netshaper.network.discovery.srp") as srp_mock, \
              mock.patch("netshaper.network.discovery.sniff"), \
              mock.patch("netshaper.network.discovery.time.sleep"), \
              mock.patch("netshaper.network.discovery.print_flush"):
+            srp_mock.return_value = ([], None)
             devices = disc.arp_sweep("192.0.2.0/24", "192.0.2.1")
 
         self.assertEqual(len(devices), 16)
-        srp_mock.assert_not_called()
+        self.assertEqual(srp_mock.call_count, 8)
 
     def test_default_gateway_uses_selected_interface_and_lowest_metric(self):
         route_table = (
