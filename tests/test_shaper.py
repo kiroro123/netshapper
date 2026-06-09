@@ -1,17 +1,17 @@
 import unittest
-from types import SimpleNamespace
 from unittest import mock
 
 from netshaper.network.shaper import TrafficShaper
+from netshaper.system import InspectionResult, InspectionStatus
 
 
 class TrafficShaperTests(unittest.TestCase):
     @mock.patch("netshaper.network.shaper.SubprocessRunner.run")
-    @mock.patch("netshaper.network.shaper.subprocess.run")
+    @mock.patch("netshaper.network.shaper.inspect_resource")
     def test_apply_target_refuses_to_replace_foreign_root_qdisc(
-            self, run_mock, runner_mock):
-        run_mock.return_value = SimpleNamespace(
-            returncode=0,
+            self, inspect_mock, runner_mock):
+        inspect_mock.return_value = InspectionResult(
+            InspectionStatus.PRESENT,
             stdout="qdisc fq_codel 0: root refcnt 2",
         )
         shaper = TrafficShaper("eth0")
@@ -22,11 +22,11 @@ class TrafficShaperTests(unittest.TestCase):
         runner_mock.assert_not_called()
 
     @mock.patch("netshaper.network.shaper.SubprocessRunner.run")
-    @mock.patch("netshaper.network.shaper.subprocess.run")
+    @mock.patch("netshaper.network.shaper.inspect_resource")
     def test_apply_target_refuses_preexisting_htb_root_qdisc(
-            self, run_mock, runner_mock):
-        run_mock.return_value = SimpleNamespace(
-            returncode=0,
+            self, inspect_mock, runner_mock):
+        inspect_mock.return_value = InspectionResult(
+            InspectionStatus.PRESENT,
             stdout="qdisc htb 1: root refcnt 2",
         )
         shaper = TrafficShaper("eth0")
@@ -37,25 +37,30 @@ class TrafficShaperTests(unittest.TestCase):
         runner_mock.assert_not_called()
 
     @mock.patch("netshaper.network.shaper.SubprocessRunner.run")
-    @mock.patch("netshaper.network.shaper.subprocess.run")
-    def test_cleanup_ignores_foreign_root_qdisc(self, run_mock, runner_mock):
-        run_mock.return_value = SimpleNamespace(
-            returncode=0,
+    @mock.patch("netshaper.network.shaper.inspect_resource")
+    def test_cleanup_ignores_foreign_root_qdisc(
+            self, inspect_mock, runner_mock):
+        inspect_mock.return_value = InspectionResult(
+            InspectionStatus.PRESENT,
             stdout="qdisc fq_codel 0: root refcnt 2",
         )
         shaper = TrafficShaper("eth0")
+        shaper._base_initialized = True
+        shaper._active_marks.add(10)
 
         result = shaper.cleanup()
 
         self.assertTrue(result)
+        self.assertFalse(shaper._base_initialized)
+        self.assertEqual(shaper._active_marks, set())
         runner_mock.assert_not_called()
 
     @mock.patch("netshaper.network.shaper.SubprocessRunner.run")
-    @mock.patch("netshaper.network.shaper.subprocess.run")
+    @mock.patch("netshaper.network.shaper.inspect_resource")
     def test_cleanup_removes_netshaper_owned_root_qdisc(
-            self, run_mock, runner_mock):
-        run_mock.return_value = SimpleNamespace(
-            returncode=0,
+            self, inspect_mock, runner_mock):
+        inspect_mock.return_value = InspectionResult(
+            InspectionStatus.PRESENT,
             stdout="qdisc htb 1: root refcnt 2",
         )
         shaper = TrafficShaper("eth0")
@@ -71,10 +76,51 @@ class TrafficShaperTests(unittest.TestCase):
         )
 
     @mock.patch("netshaper.network.shaper.SubprocessRunner.run")
-    @mock.patch("netshaper.network.shaper.subprocess.run")
+    @mock.patch("netshaper.network.shaper.inspect_resource")
+    def test_cleanup_clears_ownership_when_root_qdisc_absent(
+            self, inspect_mock, runner_mock):
+        inspect_mock.return_value = InspectionResult(InspectionStatus.ABSENT)
+        shaper = TrafficShaper("eth0")
+        shaper._base_initialized = True
+        shaper._active_marks.add(10)
+        shaper._target_filters.add((10, "ip"))
+        shaper._target_classes.add(10)
+        shaper._tracked_mark_bases.add(10)
+
+        result = shaper.cleanup()
+
+        self.assertTrue(result)
+        self.assertFalse(shaper._base_initialized)
+        self.assertEqual(shaper._active_marks, set())
+        self.assertEqual(shaper._target_filters, set())
+        self.assertEqual(shaper._target_classes, set())
+        self.assertEqual(shaper._tracked_mark_bases, set())
+        runner_mock.assert_not_called()
+
+    @mock.patch("netshaper.network.shaper.SubprocessRunner.run")
+    @mock.patch("netshaper.network.shaper.inspect_resource")
+    def test_cleanup_preserves_ownership_when_root_inspection_errors(
+            self, inspect_mock, runner_mock):
+        inspect_mock.return_value = InspectionResult(
+            InspectionStatus.ERROR,
+            stderr="Operation not permitted",
+        )
+        shaper = TrafficShaper("eth0")
+        shaper._base_initialized = True
+        shaper._active_marks.add(10)
+
+        result = shaper.cleanup()
+
+        self.assertFalse(result)
+        self.assertTrue(shaper._base_initialized)
+        self.assertEqual(shaper._active_marks, {10})
+        runner_mock.assert_not_called()
+
+    @mock.patch("netshaper.network.shaper.SubprocessRunner.run")
+    @mock.patch("netshaper.network.shaper.inspect_resource")
     def test_apply_target_fails_if_root_qdisc_cannot_be_created(
-            self, run_mock, runner_mock):
-        run_mock.return_value = SimpleNamespace(returncode=0, stdout="")
+            self, inspect_mock, runner_mock):
+        inspect_mock.return_value = InspectionResult(InspectionStatus.ABSENT)
         runner_mock.return_value = False
         shaper = TrafficShaper("eth0")
 
@@ -84,10 +130,16 @@ class TrafficShaperTests(unittest.TestCase):
         self.assertFalse(shaper._base_initialized)
 
     @mock.patch("netshaper.network.shaper.SubprocessRunner.run")
-    @mock.patch("netshaper.network.shaper.subprocess.run")
+    @mock.patch("netshaper.network.shaper.inspect_resource")
     def test_apply_target_rolls_back_partial_setup(
-            self, run_mock, runner_mock):
-        run_mock.return_value = SimpleNamespace(returncode=0, stdout="")
+            self, inspect_mock, runner_mock):
+        inspect_mock.side_effect = [
+            InspectionResult(InspectionStatus.ABSENT),
+            InspectionResult(
+                InspectionStatus.PRESENT,
+                stdout="qdisc htb 1: root refcnt 2",
+            ),
+        ]
         runner_mock.side_effect = [True, True, True, False, True, True, True]
         shaper = TrafficShaper("eth0")
 
@@ -108,11 +160,11 @@ class TrafficShaperTests(unittest.TestCase):
         )
 
     @mock.patch("netshaper.network.shaper.SubprocessRunner.run")
-    @mock.patch("netshaper.network.shaper.subprocess.run")
+    @mock.patch("netshaper.network.shaper.inspect_resource")
     def test_failed_root_cleanup_preserves_ownership_for_retry(
-            self, run_mock, runner_mock):
-        run_mock.return_value = SimpleNamespace(
-            returncode=0,
+            self, inspect_mock, runner_mock):
+        inspect_mock.return_value = InspectionResult(
+            InspectionStatus.PRESENT,
             stdout="qdisc htb 1: root refcnt 2",
         )
         runner_mock.side_effect = [False, True]
@@ -130,10 +182,16 @@ class TrafficShaperTests(unittest.TestCase):
         self.assertEqual(runner_mock.call_count, 2)
 
     @mock.patch("netshaper.network.shaper.SubprocessRunner.run")
-    @mock.patch("netshaper.network.shaper.subprocess.run")
+    @mock.patch("netshaper.network.shaper.inspect_resource")
     def test_failed_partial_setup_keeps_root_owned_for_retry(
-            self, run_mock, runner_mock):
-        run_mock.return_value = SimpleNamespace(returncode=0, stdout="")
+            self, inspect_mock, runner_mock):
+        inspect_mock.side_effect = [
+            InspectionResult(InspectionStatus.ABSENT),
+            InspectionResult(
+                InspectionStatus.PRESENT,
+                stdout="qdisc htb 1: root refcnt 2",
+            ),
+        ]
         runner_mock.side_effect = [True, True, True, False, True, True, False]
         shaper = TrafficShaper("eth0")
 
@@ -144,10 +202,10 @@ class TrafficShaperTests(unittest.TestCase):
         self.assertEqual(shaper._active_marks, set())
 
     @mock.patch("netshaper.network.shaper.SubprocessRunner.run")
-    @mock.patch("netshaper.network.shaper.subprocess.run")
+    @mock.patch("netshaper.network.shaper.inspect_resource")
     def test_apply_target_journals_each_created_resource(
-            self, run_mock, runner_mock):
-        run_mock.return_value = SimpleNamespace(returncode=0, stdout="")
+            self, inspect_mock, runner_mock):
+        inspect_mock.return_value = InspectionResult(InspectionStatus.ABSENT)
         runner_mock.return_value = True
         journal = mock.Mock(return_value=True)
         shaper = TrafficShaper("eth0")

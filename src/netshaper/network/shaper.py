@@ -2,10 +2,14 @@
 NetShaper — Linux tc HTB traffic shaper.
 """
 import logging
-import subprocess
 from typing import Callable, List, Optional, Set, Tuple
 
-from netshaper.system import SubprocessRunner
+from netshaper.system import (
+    InspectionResult,
+    InspectionStatus,
+    SubprocessRunner,
+    inspect_resource,
+)
 
 log = logging.getLogger("netshaper")
 
@@ -25,17 +29,43 @@ class TrafficShaper:
             return True
         return journal()
 
+    def _inspect_root_qdisc(self) -> InspectionResult:
+        result = inspect_resource(
+            ["tc", "qdisc", "show", "dev", self.interface, "root"])
+        if (
+                result.status == InspectionStatus.PRESENT
+                and not result.stdout.strip()):
+            return InspectionResult(
+                InspectionStatus.ABSENT, result.stdout, result.stderr)
+        return result
+
     def _root_qdisc(self) -> str:
-        try:
-            result = subprocess.run(
-                ["tc", "qdisc", "show", "dev", self.interface, "root"],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-        except FileNotFoundError:
+        result = self._inspect_root_qdisc()
+        if result.status == InspectionStatus.ERROR:
+            detail = result.stderr.strip() or result.stdout.strip()
+            message = f"Unable to inspect root qdisc on {self.interface}"
+            if detail:
+                message += f": {detail}"
+            raise RuntimeError(message)
+        if result.status == InspectionStatus.ABSENT:
             return ""
-        return result.stdout.strip() if result.returncode == 0 else ""
+        return result.stdout.strip()
+
+    def _owned_root_qdisc_status(self) -> InspectionResult:
+        result = self._inspect_root_qdisc()
+        if result.status != InspectionStatus.PRESENT:
+            return result
+        if "qdisc htb 1:" not in result.stdout:
+            return InspectionResult(
+                InspectionStatus.ABSENT, result.stdout, result.stderr)
+        return result
+
+    def _clear_root_ownership(self) -> None:
+        self._base_initialized = False
+        self._active_marks.clear()
+        self._target_filters.clear()
+        self._target_classes.clear()
+        self._tracked_mark_bases.clear()
 
     def _init_root(self, journal: Optional[Callable[[], bool]] = None) -> None:
         if not self._base_initialized:
@@ -197,13 +227,27 @@ class TrafficShaper:
     def cleanup(self) -> bool:
         if not self._base_initialized:
             return True
+        root_qdisc = self._owned_root_qdisc_status()
+        if root_qdisc.status == InspectionStatus.ERROR:
+            detail = root_qdisc.stderr.strip() or root_qdisc.stdout.strip()
+            if detail:
+                log.error(
+                    "Unable to inspect NetShaper root qdisc on %s: %s",
+                    self.interface,
+                    detail,
+                )
+            else:
+                log.error(
+                    "Unable to inspect NetShaper root qdisc on %s",
+                    self.interface,
+                )
+            return False
+        if root_qdisc.status == InspectionStatus.ABSENT:
+            self._clear_root_ownership()
+            return True
         ok = SubprocessRunner.run(
             ["tc", "qdisc", "del", "dev", self.interface, "root"],
             check=False, silent=True)
         if ok:
-            self._base_initialized = False
-            self._active_marks.clear()
-            self._target_filters.clear()
-            self._target_classes.clear()
-            self._tracked_mark_bases.clear()
+            self._clear_root_ownership()
         return ok
