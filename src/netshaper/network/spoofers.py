@@ -206,7 +206,22 @@ class NDPSpoofer:
         log.info(f"NDP spoofing active → {self.target_ipv6}")
 
     def shutdown(self) -> None:
+        _ensure_scapy_layers()
         self._stop.set()
         for t in self.threads:
             t.join(timeout=3.0)
+        for _ in range(3):
+            self.packet_backend.send(
+                Ether(dst=self.target_mac, src=self.router_mac) /
+                IPv6(dst=self.target_ipv6, src=self.router_ipv6) /
+                ICMPv6ND_NA(tgt=self.router_ipv6, R=1, S=1, O=1) /
+                ICMPv6NDOptSrcLLAddr(lladdr=self.router_mac),
+                self.interface)
+            self.packet_backend.send(
+                Ether(dst=self.router_mac, src=self.target_mac) /
+                IPv6(dst=self.router_ipv6, src=self.target_ipv6) /
+                ICMPv6ND_NA(tgt=self.target_ipv6, R=0, S=1, O=1) /
+                ICMPv6NDOptSrcLLAddr(lladdr=self.target_mac),
+                self.interface)
+            time.sleep(0.3)
         log.info("NDP tables restored")

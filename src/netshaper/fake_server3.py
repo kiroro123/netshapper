@@ -141,22 +141,23 @@ def parse_dns_question(data: bytes):
 
     labels = []
     offset = 12
-    jumped = False
     jumps = 0
+    wire_end = None  # byte position in wire format where QTYPE starts
 
     while offset < len(data):
         length = data[offset]
         if length == 0:
+            if wire_end is None:
+                wire_end = offset + 1
             offset += 1
             break
         if (length & 0xC0) == 0xC0:
             if offset + 1 >= len(data):
                 return None, None, None
             pointer = ((length & 0x3F) << 8) | data[offset + 1]
-            if not jumped:
-                offset += 2
+            if wire_end is None:
+                wire_end = offset + 2  # QTYPE follows the 2-byte pointer in wire
             offset = pointer
-            jumped = True
             jumps += 1
             if jumps > 8:
                 return None, None, None
@@ -170,10 +171,12 @@ def parse_dns_question(data: bytes):
             return None, None, None
         offset += length
 
-    question_end = offset + 4
+    if wire_end is None:
+        return None, None, None
+    question_end = wire_end + 4
     if question_end > len(data):
         return None, None, None
-    qtype = (data[offset] << 8) | data[offset + 1]
+    qtype = (data[wire_end] << 8) | data[wire_end + 1]
     return ".".join(labels).rstrip("."), qtype, question_end
 
 

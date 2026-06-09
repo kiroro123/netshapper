@@ -82,5 +82,67 @@ class FakeServerStartupTests(unittest.TestCase):
         httpd.serve_forever.assert_called_once()
 
 
+class ParseDnsQuestionTests(unittest.TestCase):
+    def _make_query(self, name: str, qtype: int = 1) -> bytes:
+        """Build a minimal DNS query for the given name."""
+        header = b'\x00\x01\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00'
+        labels = b''
+        for part in name.split('.'):
+            encoded = part.encode('ascii')
+            labels += bytes([len(encoded)]) + encoded
+        labels += b'\x00'
+        question = labels + qtype.to_bytes(2, 'big') + b'\x00\x01'
+        return header + question
+
+    def test_parse_simple_name_returns_correct_domain_and_qtype(self):
+        data = self._make_query('example.com', qtype=1)
+        domain, qtype, question_end = fake_server3.parse_dns_question(data)
+        self.assertEqual(domain, 'example.com')
+        self.assertEqual(qtype, 1)
+        self.assertEqual(question_end, len(data))
+
+    def test_parse_aaaa_query_returns_qtype_28(self):
+        data = self._make_query('example.com', qtype=28)
+        domain, qtype, question_end = fake_server3.parse_dns_question(data)
+        self.assertEqual(qtype, 28)
+
+    def test_parse_too_short_returns_none(self):
+        domain, qtype, question_end = fake_server3.parse_dns_question(b'\x00' * 11)
+        self.assertIsNone(domain)
+        self.assertIsNone(qtype)
+        self.assertIsNone(question_end)
+
+    def test_parse_compressed_name_uses_wire_position_for_qtype(self):
+        """
+        Compression pointer in question: wire QTYPE must be read from just after
+        the 2-byte pointer, NOT from the end of the pointed-to label sequence.
+
+        Layout: header(12) | pointer(2) | QTYPE(2) | QCLASS(2) | suffix(12)
+                0..11       | 12,13      | 14,15     | 16,17     | 18..29
+        The pointer at offset 12 points to the suffix at offset 18.
+        """
+        header      = b'\x00\x02\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00'
+        suffix      = b'\x04test\x05local\x00'   # 12 bytes
+        suffix_off  = 18                          # header(12) + pointer(2) + qtype(2) + qclass(2)
+        pointer     = bytes([0xC0, suffix_off])
+        qtype_bytes = b'\x00\x01'                # A record
+        qclass_bytes = b'\x00\x01'               # IN
+        data = header + pointer + qtype_bytes + qclass_bytes + suffix
+
+        domain, qtype, question_end = fake_server3.parse_dns_question(data)
+        self.assertEqual(domain, 'test.local')
+        self.assertEqual(qtype, 1)
+        # wire_end = 14 (pointer offset 12 + 2), question_end = 14 + 4 = 18
+        self.assertEqual(question_end, 18)
+
+    def test_parse_pointer_loop_returns_none(self):
+        """A self-referential pointer must not loop forever."""
+        # Header + a pointer that points to itself (offset 12)
+        header = b'\x00\x03\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00'
+        data = header + b'\xc0\x0c' + b'\x00\x01\x00\x01'
+        domain, qtype, question_end = fake_server3.parse_dns_question(data)
+        self.assertIsNone(domain)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

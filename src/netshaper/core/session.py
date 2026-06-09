@@ -101,7 +101,7 @@ class TargetSession:
         if config.DRY_RUN:
             log.info(f"[DRY-RUN] Would start spoofers for {self.target.ip}")
             return
-        packet_backend = DryRunPacketBackend() if config.DRY_RUN else RealPacketBackend()
+        packet_backend = RealPacketBackend()
 
         if arp_on and self.arp_spoof is None:
             self.arp_spoof = ARPSpoofer(
