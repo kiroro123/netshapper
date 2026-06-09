@@ -29,12 +29,18 @@ class TrafficShaper:
             return True
         return journal()
 
+    @staticmethod
+    def _is_implicit_root_qdisc(root_qdisc: str) -> bool:
+        return root_qdisc.strip().startswith("qdisc noqueue ")
+
     def _inspect_root_qdisc(self) -> InspectionResult:
         result = inspect_resource(
             ["tc", "qdisc", "show", "dev", self.interface, "root"])
         if (
                 result.status == InspectionStatus.PRESENT
-                and not result.stdout.strip()):
+                and (
+                    not result.stdout.strip()
+                    or self._is_implicit_root_qdisc(result.stdout))):
             return InspectionResult(
                 InspectionStatus.ABSENT, result.stdout, result.stderr)
         return result

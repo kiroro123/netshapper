@@ -38,6 +38,25 @@ class TrafficShaperTests(unittest.TestCase):
 
     @mock.patch("netshaper.network.shaper.SubprocessRunner.run")
     @mock.patch("netshaper.network.shaper.inspect_resource")
+    def test_apply_target_allows_implicit_noqueue_root_qdisc(
+            self, inspect_mock, runner_mock):
+        inspect_mock.return_value = InspectionResult(
+            InspectionStatus.PRESENT,
+            stdout="qdisc noqueue 0: root refcnt 2",
+        )
+        runner_mock.return_value = True
+        shaper = TrafficShaper("eth0")
+
+        shaper.apply_target("192.0.2.10", 5.0)
+
+        runner_mock.assert_any_call(
+            ["tc", "qdisc", "add", "dev", "eth0",
+             "root", "handle", "1:", "htb"],
+        )
+        self.assertTrue(shaper._base_initialized)
+
+    @mock.patch("netshaper.network.shaper.SubprocessRunner.run")
+    @mock.patch("netshaper.network.shaper.inspect_resource")
     def test_cleanup_ignores_foreign_root_qdisc(
             self, inspect_mock, runner_mock):
         inspect_mock.return_value = InspectionResult(
