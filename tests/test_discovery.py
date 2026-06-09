@@ -66,6 +66,29 @@ class DiscoveryHostnameTests(unittest.TestCase):
             timeout=1.0,
         )
 
+    def test_arp_sweep_uses_rich_neighbor_cache_without_active_probe(self):
+        disc = NetworkDiscovery("eth0")
+
+        def seed_cache(_subnet, _gateway_ip):
+            for idx in range(20, 36):
+                disc._remember_device(
+                    f"192.0.2.{idx}",
+                    f"aa:bb:cc:dd:ee:{idx:02x}",
+                )
+            return disc._device_count()
+
+        with mock.patch("netshaper.network.discovery._ensure_scapy_layers"), \
+             mock.patch.object(disc, "_merge_neighbor_caches",
+                               side_effect=seed_cache), \
+             mock.patch("netshaper.network.discovery.srp") as srp_mock, \
+             mock.patch("netshaper.network.discovery.sniff"), \
+             mock.patch("netshaper.network.discovery.time.sleep"), \
+             mock.patch("netshaper.network.discovery.print_flush"):
+            devices = disc.arp_sweep("192.0.2.0/24", "192.0.2.1")
+
+        self.assertEqual(len(devices), 16)
+        srp_mock.assert_not_called()
+
     def test_default_gateway_uses_selected_interface_and_lowest_metric(self):
         route_table = (
             "Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT\n"
