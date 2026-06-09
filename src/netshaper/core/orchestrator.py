@@ -923,13 +923,42 @@ class NetShaper:
                                 rule_spec["check"],
                             )
                         for table, hook, chain_name in chain_specs:
-                            run_recovery_if_present(
-                                f"{binary} unlink {chain_name}",
-                                [binary, "-t", table, "-D", hook,
-                                 "-j", chain_name],
-                                [binary, "-t", table, "-C", hook,
-                                 "-j", chain_name],
-                            )
+                            # Guard on chain existence rather than the jump-rule
+                            # check (-C HOOK -j CHAIN), which returns ERROR on
+                            # iptables-nft when the target chain is absent
+                            # ("RULE_CHECK failed (Invalid argument)").
+                            _cst = inspect_stale_resource(
+                                [binary, "-t", table, "-L", chain_name])
+                            if _cst is InspectionStatus.ABSENT:
+                                log.info(
+                                    f"Stale cleanup skipped "
+                                    f"({binary} unlink {chain_name} already absent)"
+                                )
+                            elif _cst is InspectionStatus.ERROR:
+                                cleanup_ok = False
+                                log.error(
+                                    f"Stale cleanup failed "
+                                    f"({binary} unlink {chain_name}): "
+                                    "resource inspection failed"
+                                )
+                            else:
+                                _jst = inspect_stale_resource(
+                                    [binary, "-t", table, "-C", hook,
+                                     "-j", chain_name])
+                                if _jst is InspectionStatus.PRESENT:
+                                    run_recovery(
+                                        f"{binary} unlink {chain_name}",
+                                        [binary, "-t", table, "-D", hook,
+                                         "-j", chain_name],
+                                    )
+                                elif _jst is InspectionStatus.ERROR:
+                                    # nft backend can't verify; attempt removal,
+                                    # tolerate failure (rule may already be gone)
+                                    SubprocessRunner.run(
+                                        [binary, "-t", table, "-D", hook,
+                                         "-j", chain_name],
+                                        check=False, silent=True,
+                                    )
                             run_recovery_if_present(
                                 f"{binary} flush {chain_name}",
                                 [binary, "-t", table, "-F", chain_name],
