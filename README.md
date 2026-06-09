@@ -29,22 +29,22 @@ python -m pip install -e ".[dev]"
 
 ## Quick start
 
-Run the CLI:
+Run from this source checkout:
 
 ```bash
-python -m netshaper -i <your-interface>
+sudo env PYTHONPATH="$PWD/src" python -m netshaper -i <your-interface>
 ```
 
 Safe preview mode:
 
 ```bash
-python -m netshaper -i <your-interface> --targets <target-ip> --dry-run
+sudo env PYTHONPATH="$PWD/src" python -m netshaper -i <your-interface> --targets <target-ip> --dry-run
 ```
 
 Optional captive-portal / DNS helper:
 
 ```bash
-sudo netshaper-fake-server
+sudo env PYTHONPATH="$PWD/src" python -m netshaper.fake_server3 --smart-spoof-all --host-ip <your-ip>
 ```
 
 From a source checkout, this remains available too:
@@ -52,6 +52,12 @@ From a source checkout, this remains available too:
 ```bash
 sudo python3 fake_server3.py
 ```
+
+## User guide
+
+See [USER_GUIDE.md](USER_GUIDE.md) for the practical workflow, shell aliases,
+fake-server modes such as `--smart-spoof-all`, discovery behavior, dry-run
+usage, and troubleshooting.
 
 ## Testing
 
