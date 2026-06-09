@@ -66,6 +66,7 @@ class NetShaper:
         self.stop_event  = threading.Event()
         self._global_rules_applied = False
         self._global_firewall_binaries_applied: List[str] = []
+        self._global_rules_created: List[dict] = []
         self._mitm_proc  = None
         self._cleanup_running = False
         self._cleanup_complete = False
@@ -248,11 +249,55 @@ class NetShaper:
             "check": [binary, "-C", "INPUT", *base],
         }
 
+    def _journal_state_if_ready(self) -> bool:
+        required = ("session_id", "interface", "state_snapshot", "sessions")
+        if not all(hasattr(self, name) for name in required):
+            return True
+        return self.save_state()
+
+    def _record_global_rule(self, binary: str, spec: dict) -> bool:
+        if not hasattr(self, "_global_rules_created"):
+            self._global_rules_created = []
+        if not hasattr(self, "_global_firewall_binaries_applied"):
+            self._global_firewall_binaries_applied = []
+        record = {
+            "binary": binary,
+            "description": spec["description"],
+            "delete": spec["delete"],
+            "check": spec["check"],
+        }
+        self._global_rules_created.append(record)
+        if binary not in self._global_firewall_binaries_applied:
+            self._global_firewall_binaries_applied.append(binary)
+        self._global_rules_applied = True
+        return self._journal_state_if_ready()
+
+    def _global_rule_records_for_cleanup(self) -> List[dict]:
+        records = list(getattr(self, "_global_rules_created", []))
+        if records:
+            return records
+        if not getattr(self, "_global_rules_applied", False):
+            return []
+        records = []
+        comment = (
+            self._global_rule_comment()
+            if hasattr(self, "session_id") else None
+        )
+        for binary in getattr(self, "_global_firewall_binaries_applied", []):
+            for spec in self._global_firewall_rule_specs(
+                    binary, self.interface, comment):
+                records.append({
+                    "binary": binary,
+                    "description": spec["description"],
+                    "delete": spec["delete"],
+                    "check": spec["check"],
+                })
+        return records
+
     def _apply_global_rules(self) -> None:
         if self._global_rules_applied:
             return
         ok = True
-        applied_binaries = []
         comment = self._global_rule_comment()
         ok = SubprocessRunner.run(
             ["sysctl", "-w", "net.ipv4.ip_forward=1"], silent=True) and ok
@@ -265,15 +310,14 @@ class NetShaper:
             silent=True) and ok
         for binary in ["iptables", "ip6tables"]:
             if shutil.which(binary):
-                applied_binaries.append(binary)
                 for spec in self._global_firewall_rule_specs(
                         binary, self.interface, comment):
-                    ok = SubprocessRunner.run(
-                        spec["apply"], silent=True) and ok
+                    if SubprocessRunner.run(spec["apply"], silent=True):
+                        ok = self._record_global_rule(binary, spec) and ok
+                    else:
+                        ok = False
         if not ok:
             raise RuntimeError("Failed to apply global forwarding rules")
-        self._global_firewall_binaries_applied = applied_binaries
-        self._global_rules_applied = True
         log.info("Global dual-stack forwarding + MASQUERADE enabled")
 
     def _restore_original_forwarding(self) -> bool:
@@ -300,10 +344,11 @@ class NetShaper:
 
     def _remove_global_rules(self) -> bool:
         ok = self._restore_original_forwarding()
-        binaries = list(self._global_firewall_binaries_applied)
-        if not self._global_rules_applied and not binaries:
+        records = self._global_rule_records_for_cleanup()
+        if not records:
             return ok
-        for binary in binaries:
+        for record in list(records):
+            binary = record["binary"]
             if not shutil.which(binary):
                 if binary in self._global_firewall_binaries_applied:
                     log.error(
@@ -312,23 +357,28 @@ class NetShaper:
                     )
                     ok = False
                 continue
-            for spec in self._global_firewall_rule_specs(
-                    binary, self.interface, self._global_rule_comment()):
-                status = self._inspect_rule(spec["check"])
-                if status is InspectionStatus.ABSENT:
-                    continue
-                if status is InspectionStatus.ERROR:
-                    log.error(
-                        f"Cannot inspect global firewall rule: "
-                        f"{spec['description']}"
-                    )
-                    ok = False
-                    continue
-                ok = SubprocessRunner.run(
-                    spec["delete"], check=False, silent=True) and ok
+            status = self._inspect_rule(record["check"])
+            if status is InspectionStatus.ABSENT:
+                if record in getattr(self, "_global_rules_created", []):
+                    self._global_rules_created.remove(record)
+                continue
+            if status is InspectionStatus.ERROR:
+                log.error(
+                    f"Cannot inspect global firewall rule: "
+                    f"{record['description']}"
+                )
+                ok = False
+                continue
+            if SubprocessRunner.run(
+                    record["delete"], check=False, silent=True):
+                if record in getattr(self, "_global_rules_created", []):
+                    self._global_rules_created.remove(record)
+            else:
+                ok = False
         if ok:
             self._global_rules_applied = False
             self._global_firewall_binaries_applied = []
+            self._global_rules_created = []
             log.info("Global forwarding + MASQUERADE removed")
         return ok
 
@@ -691,6 +741,8 @@ class NetShaper:
             ),
             "global_firewall_binaries": list(
                 getattr(self, "_global_firewall_binaries_applied", [])),
+            "global_rules_created": list(
+                getattr(self, "_global_rules_created", [])),
             "shaper_base_initialized": getattr(
                 getattr(self, "shaper", None), "_base_initialized", False),
             "owner": getattr(self, "_owner_metadata", {}),
@@ -800,16 +852,30 @@ class NetShaper:
                             if shutil.which(binary)
                         ]
                     comment = data.get("global_rule_comment")
-                    for binary in binaries:
+                    rule_records = data.get("global_rules_created")
+                    if rule_records is None:
+                        rule_records = []
+                        for binary in binaries:
+                            for spec in self._global_firewall_rule_specs(
+                                    binary, iface, comment):
+                                rule_records.append({
+                                    "binary": binary,
+                                    "description": spec["description"],
+                                    "delete": spec["delete"],
+                                    "check": spec["check"],
+                                })
+                    for record in rule_records:
+                        binary = record.get("binary")
+                        if not binary:
+                            continue
                         if not require_binary(binary, "global firewall rules"):
                             continue
-                        for spec in self._global_firewall_rule_specs(
-                                binary, iface, comment):
-                            run_recovery_if_present(
-                                spec["description"],
-                                spec["delete"],
-                                spec["check"],
-                            )
+                        run_recovery_if_present(
+                            record.get("description")
+                            or f"{binary} global firewall rule",
+                            record["delete"],
+                            record["check"],
+                        )
 
                 for target in data.get("targets", []):
                     ip = target.get("ip")

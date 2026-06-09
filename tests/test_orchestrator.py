@@ -214,6 +214,8 @@ class NetShaperCleanupTests(unittest.TestCase):
         ns.interface = "eth0"
         ns.session_id = "NS-TEST"
         ns._global_rules_applied = False
+        ns._global_firewall_binaries_applied = []
+        ns._global_rules_created = []
 
         with mock.patch("netshaper.core.orchestrator.shutil.which",
                         return_value="/sbin/tool"), \
@@ -238,6 +240,56 @@ class NetShaperCleanupTests(unittest.TestCase):
             ns._global_firewall_binaries_applied,
             ["iptables", "ip6tables"],
         )
+        self.assertEqual(len(ns._global_rules_created), 6)
+
+    def test_partial_global_setup_records_successful_rule_for_cleanup(self):
+        ns = NetShaper.__new__(NetShaper)
+        ns.interface = "eth0"
+        ns.session_id = "NS-TEST"
+        ns.sessions = {}
+        ns.state_snapshot = mock.Mock()
+        ns._global_rules_applied = False
+        ns._global_firewall_binaries_applied = []
+        ns._global_rules_created = []
+        ns.save_state = mock.Mock(return_value=True)
+        runner_results = [
+            True, True, True,
+            True, False, False,
+            False, False, False,
+        ]
+
+        with mock.patch("netshaper.core.orchestrator.shutil.which",
+                        return_value="/sbin/tool"), \
+             mock.patch("netshaper.core.orchestrator.SubprocessRunner.run",
+                        side_effect=runner_results) as runner_mock:
+            with self.assertRaisesRegex(RuntimeError, "global forwarding"):
+                ns._apply_global_rules()
+
+        self.assertTrue(ns._global_rules_applied)
+        self.assertEqual(ns._global_firewall_binaries_applied, ["iptables"])
+        self.assertEqual(len(ns._global_rules_created), 1)
+        ns.save_state.assert_called_once()
+
+        runner_mock.reset_mock()
+        runner_mock.return_value = True
+        runner_mock.side_effect = None
+        ns.state_snapshot = mock.Mock(
+            ipv4_forwarding=None,
+            ipv6_forwarding=None,
+            route_localnet=None,
+        )
+        with mock.patch("netshaper.core.orchestrator.shutil.which",
+                        return_value="/sbin/tool"), \
+             mock.patch("netshaper.system.subprocess.run",
+                        return_value=mock.Mock(returncode=0)), \
+             mock.patch("netshaper.core.orchestrator.SubprocessRunner.run",
+                        return_value=True) as cleanup_runner_mock:
+            result = ns._remove_global_rules()
+
+        self.assertTrue(result)
+        self.assertFalse(ns._global_rules_applied)
+        self.assertEqual(ns._global_rules_created, [])
+        cleanup_runner_mock.assert_called_once()
 
     def test_remove_global_rules_deletes_only_session_comment(self):
         ns = NetShaper.__new__(NetShaper)
@@ -250,6 +302,7 @@ class NetShaperCleanupTests(unittest.TestCase):
         )
         ns._global_rules_applied = True
         ns._global_firewall_binaries_applied = ["iptables"]
+        ns._global_rules_created = []
 
         with mock.patch("netshaper.core.orchestrator.shutil.which",
                         return_value="/sbin/iptables"), \
@@ -285,6 +338,7 @@ class NetShaperCleanupTests(unittest.TestCase):
         )
         ns._global_rules_applied = False
         ns._global_firewall_binaries_applied = []
+        ns._global_rules_created = []
 
         with mock.patch("netshaper.core.orchestrator.shutil.which",
                         return_value="/sbin/iptables"), \
@@ -308,6 +362,7 @@ class NetShaperCleanupTests(unittest.TestCase):
         )
         ns._global_rules_applied = True
         ns._global_firewall_binaries_applied = ["iptables"]
+        ns._global_rules_created = []
 
         with mock.patch("netshaper.core.orchestrator.shutil.which",
                         return_value="/sbin/iptables"), \
@@ -333,6 +388,7 @@ class NetShaperCleanupTests(unittest.TestCase):
         )
         ns._global_rules_applied = True
         ns._global_firewall_binaries_applied = ["iptables"]
+        ns._global_rules_created = []
         inspect_error = mock.Mock(
             returncode=4,
             stdout="",

@@ -18,6 +18,7 @@ class StateSnapshotTests(unittest.TestCase):
             ns.own_ip = "192.0.2.10"
             ns.session_id = "NS-TEST"
             ns._global_rules_applied = False
+            ns._global_rules_created = []
             ns.state_snapshot = NetworkStateSnapshot(
                 session_id="NS-TEST",
                 interface="eth0",
@@ -56,6 +57,7 @@ class StateSnapshotTests(unittest.TestCase):
             self.assertEqual(data["interface"], "eth0")
             self.assertFalse(data["global_rules_applied"])
             self.assertIsNone(data["global_rule_comment"])
+            self.assertEqual(data["global_rules_created"], [])
             self.assertFalse(data["shaper_base_initialized"])
             self.assertEqual(data["snapshot"]["route_localnet"], 0)
             self.assertEqual(
@@ -75,6 +77,12 @@ class StateSnapshotTests(unittest.TestCase):
             ns.session_id = "NS-TEST"
             ns._global_rules_applied = True
             ns._global_firewall_binaries_applied = ["iptables"]
+            ns._global_rules_created = [{
+                "binary": "iptables",
+                "description": "iptables test rule",
+                "delete": ["iptables", "-D", "FORWARD", "-j", "ACCEPT"],
+                "check": ["iptables", "-C", "FORWARD", "-j", "ACCEPT"],
+            }]
             ns.state_snapshot = NetworkStateSnapshot(
                 session_id="NS-TEST",
                 interface="eth0",
@@ -100,6 +108,10 @@ class StateSnapshotTests(unittest.TestCase):
                 "netshaper:NS-TEST:global",
             )
             self.assertEqual(data["global_firewall_binaries"], ["iptables"])
+            self.assertEqual(
+                data["global_rules_created"],
+                ns._global_rules_created,
+            )
 
     def test_dry_run_save_state_stays_in_memory(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -109,6 +121,7 @@ class StateSnapshotTests(unittest.TestCase):
             ns.own_ip = "192.0.2.10"
             ns.session_id = "NS-TEST"
             ns._global_rules_applied = False
+            ns._global_rules_created = []
             ns.state_snapshot = NetworkStateSnapshot(
                 session_id="NS-TEST",
                 interface="eth0",
