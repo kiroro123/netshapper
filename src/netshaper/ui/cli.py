@@ -9,7 +9,7 @@ import signal
 import socket
 import sys
 import threading
-from typing import List, Optional
+from typing import List, Optional, Union
 
 # When this file is executed directly from inside the package directory,
 # absolute imports such as netshaper.config need the package parent on sys.path.
@@ -186,9 +186,13 @@ def pick_limit_ui() -> float:
                 print_flush("  [!] Invalid number.")
 
 
+def target_ip(target: Union[Device, str]) -> str:
+    return target if isinstance(target, str) else target.ip
+
+
 def run_active_session(
     ns,
-    targets: List[str],
+    targets: List[Union[Device, str]],
     *,
     arp_on: bool,
     dns_spoof_on: bool,
@@ -201,6 +205,7 @@ def run_active_session(
     rolling: bool,
 ) -> None:
     try:
+        target_ips = [target_ip(target) for target in targets]
         if not ns.save_state():
             raise RuntimeError("Could not write recovery state before setup.")
         ns._apply_global_rules()
@@ -220,7 +225,7 @@ def run_active_session(
 
         if sniff_on:
             ns.launch_sniffer(
-                target_ips=targets,
+                target_ips=target_ips,
                 save_pcap=save_pcap,
                 rolling=rolling,
             )
@@ -280,10 +285,11 @@ def main() -> None:
             for token in args.targets:
                 raw_targets.extend(part.strip() for part in token.split(",") if part.strip())
             targets = raw_targets
-            print_flush(f"  Targets from --targets: {', '.join(targets)}")
+            print_flush(f"  Targets from --targets: {', '.join(raw_targets)}")
         else:
             devices = ns.discover()
-            targets = [dev.ip for dev in pick_targets_ui(devices)]
+            targets = pick_targets_ui(devices)
+        target_ips = [target_ip(target) for target in targets]
 
         print_flush("\n  -- Features (enter numbers e.g. 1 3 5) ------------------")
         print_flush("  [1] ARP spoofing (core MITM)")
@@ -361,7 +367,7 @@ def main() -> None:
                     sys.exit(0)
 
         print_flush(f"\n{'=' * 58}")
-        print_flush(f"  Targets       : {', '.join(targets)}")
+        print_flush(f"  Targets       : {', '.join(target_ips)}")
         print_flush(f"  ARP spoof     : {'Yes' if arp_on else 'No'}")
         print_flush(f"  DNS spoof     : {'Yes' if dns_spoof_on else 'No'}")
         print_flush(f"  Captive portal: {'Yes' if captive_portal else 'No'}")

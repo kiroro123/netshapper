@@ -2,6 +2,7 @@ import threading
 import unittest
 from unittest import mock
 
+from netshaper.models import Device
 from netshaper.ui import cli
 
 
@@ -70,6 +71,44 @@ class CliTests(unittest.TestCase):
             rolling=False,
         )
         self.assertEqual(ns.save_state.call_count, 3)
+        ns.cleanup.assert_called_once()
+
+    def test_run_active_session_passes_discovered_device_to_add_target(self):
+        ns = mock.Mock()
+        ns.stop_event = threading.Event()
+        ns.save_state.return_value = True
+        ns.launch_sniffer.side_effect = RuntimeError("sniffer failed")
+        target = Device(ip="192.0.2.10", mac="00:11:22:33:44:55")
+
+        with mock.patch("netshaper.ui.cli.print_flush"), \
+             self.assertRaises(RuntimeError):
+            cli.run_active_session(
+                ns,
+                [target],
+                arp_on=True,
+                dns_spoof_on=False,
+                captive_portal=False,
+                http_redirect_port=None,
+                throttle_on=False,
+                limit=None,
+                sniff_on=True,
+                save_pcap=False,
+                rolling=False,
+            )
+
+        ns.add_target.assert_called_once_with(
+            target,
+            arp_on=True,
+            dns_spoof=False,
+            captive_portal=False,
+            http_redirect_port=None,
+            limit=None,
+        )
+        ns.launch_sniffer.assert_called_once_with(
+            target_ips=["192.0.2.10"],
+            save_pcap=False,
+            rolling=False,
+        )
         ns.cleanup.assert_called_once()
 
     def test_run_active_session_aborts_before_mutation_when_state_save_fails(self):
