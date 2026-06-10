@@ -1,0 +1,18 @@
+prune .git
+prune .github
+prune .pytest_cache
+prune .mypy_cache
+prune .ruff_cache
+prune .venv
+prune venv
+prune build
+prune dist
+prune captures
+prune logs
+prune state
+prune tmp
+prune reference
+
+global-exclude *.py[cod] __pycache__/*
+global-exclude *.log *.pcap *.pcapng *.cap *.har *.zip
+global-exclude .coverage *.sqlite *.db *.state *.pid

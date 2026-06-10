@@ -1,1 +1,5 @@
-"""NetShaper — Modular MITM Framework v3.8.0"""
+"""NetShaper — modular network testing toolkit."""
+
+from netshaper.version import __version__
+
+VERSION = __version__

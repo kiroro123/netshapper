@@ -5,6 +5,7 @@ PacketSniffer       — bounded-queue sniffer with optional one-shot pcap save.
 RollingPacketSniffer — streaming writer with 50 MB file rotation.
 """
 import logging
+import os
 import queue
 import threading
 import time
@@ -52,6 +53,21 @@ def wrpcap(*args, **kwargs):
     return _wrpcap(*args, **kwargs)
 
 
+def _async_sniffer_running(sniffer) -> bool:
+    if sniffer is None:
+        return False
+    running = getattr(sniffer, "running", None)
+    if running is False:
+        return False
+    thread = getattr(sniffer, "thread", None)
+    if thread is not None:
+        try:
+            return thread.is_alive()
+        except Exception:
+            return False
+    return True
+
+
 class PacketSniffer:
     """
     Captures packets into a bounded queue (maxsize=10 000).
@@ -67,6 +83,9 @@ class PacketSniffer:
         self._sniffer   = None
         self._stop      = threading.Event()
         self._dropped   = 0
+        self.started_at: Optional[float] = None
+        self.last_error: Optional[str] = None
+        self.output_files: List[str] = []
         self._queue: Optional[queue.Queue] = (
             queue.Queue(maxsize=10_000) if save_pcap else None
         )
@@ -97,7 +116,18 @@ class PacketSniffer:
             prn=self._packet_callback,
             store=False,
             stop_filter=lambda _: self._stop.is_set())
-        self._sniffer.start()
+        try:
+            self._sniffer.start()
+            self.started_at = time.time()
+        except Exception as exc:
+            self.last_error = f"sniffer start failed: {exc}"
+            log.error(f"[Sniffer] {self.last_error}")
+            raise
+
+    def is_running(self) -> bool:
+        if self._stop.is_set() or self.last_error:
+            return False
+        return _async_sniffer_running(self._sniffer)
 
     def stop(self) -> None:
         self._stop.set()
@@ -116,8 +146,16 @@ class PacketSniffer:
                 except queue.Empty:
                     break
             if packets:
-                fname = f"capture_{time.strftime('%Y%m%d_%H%M%S')}.pcap"
-                wrpcap(fname, packets)
+                fname = os.path.abspath(
+                    f"capture_{time.strftime('%Y%m%d_%H%M%S')}.pcap"
+                )
+                try:
+                    wrpcap(fname, packets)
+                except Exception as exc:
+                    self.last_error = f"pcap write failed: {exc}"
+                    log.error(f"[Sniffer] {self.last_error}")
+                    raise
+                self.output_files.append(fname)
                 log.info(f"Saved {len(packets)} packets → {fname}")
 
 
@@ -142,6 +180,10 @@ class RollingPacketSniffer:
         self.current_bytes       = 0
         self._sniffer            = None
         self._consumer           = None
+        self._writer_ready       = threading.Event()
+        self.started_at: Optional[float] = None
+        self.last_error: Optional[str] = None
+        self.output_files: List[str] = []
 
     def _get_filename(self) -> str:
         ts = time.strftime('%Y%m%d_%H%M%S')
@@ -165,13 +207,18 @@ class RollingPacketSniffer:
 
     def _consumer_flush_loop(self) -> None:
         active_pcap = self._get_filename()
+        writer = None
         try:
             _ensure_capture_tools()
             writer = RawPcapWriter(active_pcap, append=True, sync=True)
         except Exception as e:
-            log.error(f"[RollingSniffer] Initial file open failed: {e}")
+            self.last_error = f"Initial file open failed: {e}"
+            self._writer_ready.set()
+            log.error(f"[RollingSniffer] {self.last_error}")
             return
 
+        self.output_files.append(os.path.abspath(active_pcap))
+        self._writer_ready.set()
         log.info(f"[RollingSniffer] Writing → {active_pcap}")
         try:
             while not self._stop_event.is_set() or not self._queue.empty():
@@ -194,19 +241,28 @@ class RollingPacketSniffer:
                     log.info(f"[RollingSniffer] Rotating → {active_pcap}")
                     try:
                         writer = RawPcapWriter(active_pcap, append=True, sync=True)
+                        self.output_files.append(os.path.abspath(active_pcap))
                     except Exception as e:
-                        log.error(f"[RollingSniffer] Rotation failed: {e}")
+                        self.last_error = f"Rotation failed: {e}"
+                        log.error(f"[RollingSniffer] {self.last_error}")
                         return   # Stop capture — disk problem
 
-                writer.write(pkt)
-                self.current_bytes += pkt_len
-                self._queue.task_done()
+                try:
+                    writer.write(pkt)
+                    self.current_bytes += pkt_len
+                    self._queue.task_done()
+                except Exception as e:
+                    self.last_error = f"Writer failed: {e}"
+                    log.error(f"[RollingSniffer] {self.last_error}")
+                    return
         finally:
             # BUG FIX: log final close errors instead of silencing them
-            try:
-                writer.close()
-            except Exception as e:
-                log.error(f"[RollingSniffer] Final close failed: {e}")
+            if writer is not None:
+                try:
+                    writer.close()
+                except Exception as e:
+                    self.last_error = f"Final close failed: {e}"
+                    log.error(f"[RollingSniffer] {self.last_error}")
 
     def start(self) -> None:
         _ensure_capture_tools()
@@ -218,8 +274,31 @@ class RollingPacketSniffer:
         self._consumer = threading.Thread(
             target=self._consumer_flush_loop, daemon=True)
         self._consumer.start()
-        self._sniffer.start()
+        if not self._writer_ready.wait(timeout=2.0):
+            self.last_error = "Initial file open timed out"
+            self._stop_event.set()
+            raise RuntimeError(self.last_error)
+        if self.last_error:
+            self._stop_event.set()
+            raise RuntimeError(self.last_error)
+        try:
+            self._sniffer.start()
+            self.started_at = time.time()
+        except Exception as exc:
+            self.last_error = f"sniffer start failed: {exc}"
+            self._stop_event.set()
+            if self._consumer:
+                self._consumer.join(timeout=5.0)
+            log.error(f"[RollingSniffer] {self.last_error}")
+            raise
         log.info("Rolling sniffer started (50 MB rotation)")
+
+    def is_running(self) -> bool:
+        if self._stop_event.is_set() or self.last_error:
+            return False
+        if self._consumer is None or not self._consumer.is_alive():
+            return False
+        return _async_sniffer_running(self._sniffer)
 
     def stop(self) -> None:
         self._stop_event.set()

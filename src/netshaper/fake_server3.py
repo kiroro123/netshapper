@@ -1,51 +1,89 @@
 #!/usr/bin/env python3
 """
 Combined Captive Portal (HTTP) + Fake DNS Server
-Production Build v3 — All patches applied
+NetShaper packaged fake server
 ─────────────────────────────────────────────────
-• Fail-fast IP detection (no silent loopback fallback)
+• Fail-fast IP detection with psutil fallback (no silent loopback fallback)
 • UDP 53 : Dual-stack DNS (AF_INET6 + IPV6_V6ONLY=0)
            Policy-based spoof / forward / block decisions
            Optional --spoof-all and --smart-spoof-all lab modes
-           Pointer-compression guard, dynamic QDCOUNT echo,
+           Pointer-compression guard, single-question validation,
            bounds-checked QTYPE extraction
 • TCP 80 : Dual-stack threaded HTTP server
            DualStackHTTPServer via address_family + super().server_bind()
 • Privilege drop after socket binding (Phase 1 / Phase 2 architecture)
-• CA cert served over plain HTTP intentionally (install flow pre-TLS)
+• Optional CA cert serving over plain HTTP when --serve-ca-cert is set
 """
 
-import argparse, os, sys, socket, threading, pwd
+import argparse, errno, os, pwd, socket, sys, threading
+from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from ipaddress import ip_address
 from socketserver import ThreadingMixIn
+
+import psutil
+
+try:
+    from netshaper.utils import bold, cyan, green, print_flush, red, yellow
+except ModuleNotFoundError:  # Allows direct execution from src/netshaper/.
+    from utils import bold, cyan, green, print_flush, red, yellow
 
 
 # ── Auto-detect own IP (fail-fast) ─────────────────────────────────────────
+def _usable_ipv4(address: str) -> bool:
+    try:
+        parsed = ip_address(address)
+    except ValueError:
+        return False
+    return parsed.version == 4 and not parsed.is_loopback and not parsed.is_unspecified
+
+
 def get_own_ip() -> str:
     """Return IPv4 address of the primary interface or exit with a clear error."""
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    errors = []
+
     try:
-        s.connect(("8.8.8.8", 80))
-        ip = s.getsockname()[0]
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("8.8.8.8", 80))
+            ip = s.getsockname()[0]
+            if _usable_ipv4(ip):
+                return ip
+            errors.append(f"route probe returned unusable address {ip}")
+    except OSError as e:
+        errors.append(f"route probe failed: {e}")
+
+    try:
+        stats = psutil.net_if_stats()
+        for iface, addrs in psutil.net_if_addrs().items():
+            iface_stats = stats.get(iface)
+            if iface_stats is not None and not iface_stats.isup:
+                continue
+            for addr in addrs:
+                if addr.family == socket.AF_INET and _usable_ipv4(addr.address):
+                    return addr.address
+        errors.append("psutil found no active non-loopback IPv4 address")
     except Exception as e:
-        sys.exit(
-            f"[Portal] Fatal: Automatic network IP detection failed: {e}\n"
-            f"Ensure an active network interface is available."
-        )
-    finally:
-        s.close()
-    return ip
+        errors.append(f"psutil fallback failed: {e}")
+
+    detail = "; ".join(errors)
+    sys.exit(
+        f"{red('[Engine]')} Fatal: Automatic network IP detection failed: {detail}\n"
+        f"Use --host-ip with the IPv4 address that targets should resolve to."
+    )
 
 
 YOUR_IP         = ""
 INDEX_FILE_PATH = "/var/www/html/index.html"
 CA_CERT_PATH    = os.path.expanduser("~/.mitmproxy/mitmproxy-ca-cert.cer")
+CA_CERT_CONTENT: bytes | None = None
 DNS_UPSTREAM    = os.environ.get("DNS_UPSTREAM", "8.8.8.8")
 DNS_SPOOF_ALL   = os.environ.get("DNS_SPOOF_ALL", "").lower() in ("1", "true", "yes")
 DNS_SMART_SPOOF_ALL = os.environ.get("DNS_SMART_SPOOF_ALL", "").lower() in (
     "1", "true", "yes"
 )
 DNS_VERBOSE     = os.environ.get("DNS_VERBOSE", "").lower() in ("1", "true", "yes")
+DNS_MAX_WORKERS = int(os.environ.get("DNS_MAX_WORKERS", "16"))
+SERVE_CA_CERT   = os.environ.get("SERVE_CA_CERT", "").lower() in ("1", "true", "yes")
 
 
 def parse_domain_csv(value: str) -> set[str]:
@@ -111,6 +149,33 @@ CAPTIVE_CHECK_PATHS = [
 ]
 
 
+# ── Certificate cache ──────────────────────────────────────────────────────
+def load_ca_cert() -> bytes | None:
+    """
+    Cache the mitmproxy CA certificate while the process still has privileges.
+
+    The HTTP handler may run after drop_privileges("nobody"), when the original
+    mitmproxy profile directory is no longer readable.
+    """
+    global CA_CERT_CONTENT
+    try:
+        with open(CA_CERT_PATH, "rb") as f:
+            CA_CERT_CONTENT = f.read()
+    except FileNotFoundError:
+        CA_CERT_CONTENT = None
+    except OSError as e:
+        CA_CERT_CONTENT = None
+        print_flush(f"{yellow('[Portal]')} Could not preload CA cert: {e}")
+    return CA_CERT_CONTENT
+
+
+def ca_cert_content() -> bytes | None:
+    """Return cached CA bytes, loading from disk if still accessible."""
+    if CA_CERT_CONTENT is not None:
+        return CA_CERT_CONTENT
+    return load_ca_cert()
+
+
 # ── Privilege drop (Phase 2 — call after sockets are bound) ────────────────
 def drop_privileges(user: str = "nobody"):
     """
@@ -125,12 +190,12 @@ def drop_privileges(user: str = "nobody"):
         os.setgroups([])            # Drop supplementary group memberships
         os.setgid(pw.pw_gid)        # Set GID first (can't after setuid)
         os.setuid(pw.pw_uid)        # Drop to unprivileged UID
-        print(f"[Engine] Privileges dropped to '{user}' "
-              f"(uid={pw.pw_uid}, gid={pw.pw_gid})")
+        print_flush(f"{green('[Engine]')} Privileges dropped to '{user}' "
+                    f"(uid={pw.pw_uid}, gid={pw.pw_gid})")
     except KeyError:
-        sys.exit(f"[Engine] Fatal: Drop target user '{user}' does not exist.")
+        sys.exit(f"{red('[Engine]')} Fatal: Drop target user '{user}' does not exist.")
     except PermissionError as e:
-        sys.exit(f"[Engine] Fatal: Failed to drop privileges: {e}")
+        sys.exit(f"{red('[Engine]')} Fatal: Failed to drop privileges: {e}")
 
 
 # ── DNS helpers ────────────────────────────────────────────────────────────
@@ -178,6 +243,12 @@ def parse_dns_question(data: bytes):
         return None, None, None
     qtype = (data[wire_end] << 8) | data[wire_end + 1]
     return ".".join(labels).rstrip("."), qtype, question_end
+
+
+def dns_qdcount(data: bytes) -> int | None:
+    if len(data) < 12:
+        return None
+    return (data[4] << 8) | data[5]
 
 
 def domain_matches(domain: str, patterns: set[str]) -> bool:
@@ -232,7 +303,7 @@ def decide_dns_policy(domain: str, qtype: int) -> tuple[str, str]:
 
 def build_dns_response(data: bytes, question_end: int, qtype: int) -> bytes:
     txid = data[0:2]
-    qdcount = data[4:6]
+    qdcount = b'\x00\x01'
     question_section = data[12:question_end]
 
     if qtype == 1:  # A record
@@ -264,7 +335,7 @@ def build_dns_response(data: bytes, question_end: int, qtype: int) -> bytes:
 
 def build_nxdomain_response(data: bytes, question_end: int) -> bytes:
     txid = data[0:2]
-    qdcount = data[4:6]
+    qdcount = b'\x00\x01'
     question_section = data[12:question_end]
     return (
         txid
@@ -276,15 +347,35 @@ def build_nxdomain_response(data: bytes, question_end: int) -> bytes:
 
 
 def forward_dns_query(data: bytes) -> bytes | None:
+    errors = []
     try:
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as upstream:
-            upstream.settimeout(2.0)
-            upstream.sendto(data, (DNS_UPSTREAM, 53))
-            response, _ = upstream.recvfrom(4096)
-            return response
-    except Exception as e:
-        print(f"[DNS] Upstream forward failed ({DNS_UPSTREAM}): {e}")
+        upstream_addresses = socket.getaddrinfo(
+            DNS_UPSTREAM, 53, type=socket.SOCK_DGRAM
+        )
+    except socket.gaierror as e:
+        print_flush(f"{yellow('[DNS]')} Upstream lookup failed ({DNS_UPSTREAM}): {e}")
         return None
+
+    if not upstream_addresses:
+        print_flush(f"{yellow('[DNS]')} Upstream lookup returned no addresses ({DNS_UPSTREAM})")
+        return None
+
+    for family, socktype, proto, _, sockaddr in upstream_addresses:
+        try:
+            with socket.socket(family, socktype, proto) as upstream:
+                upstream.settimeout(2.0)
+                upstream.sendto(data, sockaddr)
+                response, _ = upstream.recvfrom(4096)
+                return response
+        except OSError as e:
+            errors.append(f"{sockaddr}: {e}")
+
+    if errors:
+        print_flush(
+            f"{yellow('[DNS]')} Upstream forward failed ({DNS_UPSTREAM}): "
+            + "; ".join(errors)
+        )
+    return None
 
 
 def parse_args():
@@ -352,17 +443,31 @@ def parse_args():
         action="store_true",
         help="Print every DNS question, including forwarded domains.",
     )
+    parser.add_argument(
+        "--serve-ca-cert",
+        action="store_true",
+        help="Serve the mitmproxy CA certificate at /cert.",
+    )
+    parser.add_argument(
+        "--dns-workers",
+        type=int,
+        default=DNS_MAX_WORKERS,
+        help="Maximum concurrent DNS forwarding workers.",
+    )
     return parser.parse_args()
 
 
 def configure_dns(args) -> None:
+    """Merge CLI DNS policy into module-level state used by the server loop."""
     global DNS_SPOOF_ALL, DNS_SMART_SPOOF_ALL, DNS_SPOOF_DOMAINS
     global DNS_FORWARD_DOMAINS, DNS_BLOCK_DOMAINS, DNS_FORWARD_CATEGORIES
-    global DNS_UPSTREAM, DNS_VERBOSE
+    global DNS_UPSTREAM, DNS_VERBOSE, DNS_MAX_WORKERS, SERVE_CA_CERT
     DNS_SPOOF_ALL = DNS_SPOOF_ALL or args.spoof_all
     DNS_SMART_SPOOF_ALL = DNS_SMART_SPOOF_ALL or args.smart_spoof_all
     DNS_VERBOSE = DNS_VERBOSE or args.verbose_dns
     DNS_UPSTREAM = args.upstream
+    DNS_MAX_WORKERS = max(1, args.dns_workers)
+    SERVE_CA_CERT = SERVE_CA_CERT or args.serve_ca_cert
     cli_domains = {
         domain.strip().rstrip(".").lower()
         for item in args.spoof
@@ -395,16 +500,18 @@ def bind_dns_socket(port: int = 53) -> socket.socket:
         try:
             sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
         except Exception as e:
-            print(f"[DNS] Warning: Could not configure IPV6_V6ONLY: {e}")
+            print_flush(
+                f"{yellow('[DNS]')} Warning: Could not configure IPV6_V6ONLY: {e}"
+            )
 
     try:
         sock.bind(("::", port))
     except PermissionError:
         sock.close()
-        sys.exit(f"[DNS] Error: Root privileges required to bind to port {port}.")
+        sys.exit(f"{red('[DNS]')} Error: Root privileges required to bind to port {port}.")
     except OSError as e:
         sock.close()
-        sys.exit(f"[DNS] Error: Could not bind to port {port}: {e}")
+        sys.exit(f"{red('[DNS]')} Error: Could not bind to port {port}: {e}")
 
     return sock
 
@@ -419,48 +526,104 @@ def print_dns_startup(port: int) -> None:
     forwarded = ", ".join(sorted(DNS_FORWARD_DOMAINS)) or "none"
     blocked = ", ".join(sorted(DNS_BLOCK_DOMAINS)) or "none"
     categories = ", ".join(sorted(active_smart_categories())) or "none"
-    print(f"[DNS] Dual-stack DNS listening on port {port}  (YOUR_IP={YOUR_IP})")
-    print(f"[DNS] Upstream={DNS_UPSTREAM}  Spoof={mode}")
-    print(f"[DNS] Forward={forwarded}  Block={blocked}  SmartCategories={categories}")
+    print_flush(bold(cyan("NetShaper captive portal + DNS")))
+    print_flush(f"{cyan('[DNS]')} Dual-stack DNS listening on port {port}  (YOUR_IP={YOUR_IP})")
+    print_flush(f"{cyan('[DNS]')} Upstream={DNS_UPSTREAM}  Spoof={mode}")
+    print_flush(f"{cyan('[DNS]')} Forward={forwarded}  Block={blocked}  SmartCategories={categories}")
+
+
+def handle_dns_query(sock: socket.socket, data: bytes, addr) -> None:
+    try:
+        if len(data) < 12:
+            return
+
+        qdcount = dns_qdcount(data)
+        if qdcount != 1:
+            print_flush(
+                f"{yellow('[DNS]')} Rejecting query from {addr}: "
+                f"QDCOUNT={qdcount}, expected 1"
+            )
+            return
+
+        domain, qtype, question_end = parse_dns_question(data)
+        if domain is None:
+            return
+
+        action, reason = decide_dns_policy(domain, qtype)
+
+        if action == "spoof":
+            response = build_dns_response(data, question_end, qtype)
+            print_flush(
+                f"{green('[DNS]')} SPOOF {domain} qtype={qtype} -> {YOUR_IP} "
+                f"reason={reason}"
+            )
+        elif action == "block":
+            response = build_nxdomain_response(data, question_end)
+            print_flush(f"{yellow('[DNS]')} BLOCK {domain} qtype={qtype} reason={reason}")
+        else:
+            if DNS_VERBOSE:
+                print_flush(
+                    f"{cyan('[DNS]')} FORWARD {domain} qtype={qtype} -> {DNS_UPSTREAM} "
+                    f"reason={reason}"
+                )
+            response = forward_dns_query(data)
+            if response is None:
+                return
+
+        sock.sendto(response, addr)
+
+    except OSError as e:
+        print_flush(f"{red('[DNS]')} Socket send failed for {addr}: {e}")
+        if e.errno in (errno.EBADF, errno.ENOTSOCK, errno.ENOMEM):
+            raise
+    except Exception as e:
+        print_flush(f"{yellow('[DNS]')} Failed to process query from {addr}: {e}")
 
 
 def serve_dns(sock: socket.socket) -> None:
+    in_flight = threading.BoundedSemaphore(DNS_MAX_WORKERS)
+    executor = ThreadPoolExecutor(
+        max_workers=DNS_MAX_WORKERS,
+        thread_name_prefix="netshaper-dns",
+    )
+
+    def submit_query(data: bytes, addr) -> None:
+        if not in_flight.acquire(blocking=False):
+            print_flush(f"{yellow('[DNS]')} Dropping query from {addr}: workers busy")
+            return
+
+        def run_query() -> None:
+            try:
+                handle_dns_query(sock, data, addr)
+            finally:
+                in_flight.release()
+
+        executor.submit(run_query)
+
+    try:
+        while True:
+            try:
+                data, addr = sock.recvfrom(1024)
+            except OSError as e:
+                print_flush(f"{red('[DNS]')} Socket receive failed; stopping DNS server: {e}")
+                break
+            submit_query(data, addr)
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+
+
+def serve_dns_sync(sock: socket.socket) -> None:
+    """Single-threaded DNS loop kept for deterministic tests."""
     while True:
         try:
             data, addr = sock.recvfrom(1024)
-
-            if len(data) < 12:
-                continue
-
-            domain, qtype, question_end = parse_dns_question(data)
-            if domain is None:
-                continue
-
-            action, reason = decide_dns_policy(domain, qtype)
-
-            if action == "spoof":
-                response = build_dns_response(data, question_end, qtype)
-                print(
-                    f"[DNS] SPOOF {domain} qtype={qtype} -> {YOUR_IP} "
-                    f"reason={reason}"
-                )
-            elif action == "block":
-                response = build_nxdomain_response(data, question_end)
-                print(f"[DNS] BLOCK {domain} qtype={qtype} reason={reason}")
-            else:
-                if DNS_VERBOSE:
-                    print(
-                        f"[DNS] FORWARD {domain} qtype={qtype} -> {DNS_UPSTREAM} "
-                        f"reason={reason}"
-                    )
-                response = forward_dns_query(data)
-                if response is None:
-                    continue
-
-            sock.sendto(response, addr)
-
-        except Exception:
-            continue              # Never crash on a bad packet
+        except OSError as e:
+            print_flush(f"{red('[DNS]')} Socket receive failed; stopping DNS server: {e}")
+            break
+        try:
+            handle_dns_query(sock, data, addr)
+        except OSError:
+            break
 
 
 def dns_server(port: int = 53):
@@ -470,7 +633,7 @@ def dns_server(port: int = 53):
       - selected non-A      → NOERROR/NODATA
       - all other queries   → upstream DNS
     RFC 1035 §4.1.4 pointer-compression handled.
-    QDCOUNT echoed verbatim for strict-resolver compatibility.
+    Only single-question requests are accepted.
 
     port param allows unprivileged override (e.g. 5353) in CI/test runs.
     """
@@ -488,7 +651,7 @@ class CaptivePortalHandler(BaseHTTPRequestHandler):
 
         # 1. OS captive-portal probes → 204 No Content
         if any(probe in path for probe in CAPTIVE_CHECK_PATHS):
-            print(f"[Portal] Captive check  {client}  {path}")
+            print_flush(f"{cyan('[Portal]')} Captive check  {client}  {path}")
             self.send_response(204)
             self.send_header("Connection", "close")
             self.end_headers()
@@ -498,10 +661,18 @@ class CaptivePortalHandler(BaseHTTPRequestHandler):
         #    Served over plain HTTP intentionally — client must be able to
         #    fetch the cert BEFORE trusting TLS; that's the whole install flow.
         if path == "/cert":
-            if os.path.exists(CA_CERT_PATH):
-                print(f"[Portal] Serving MITM CA cert to {client}")
-                with open(CA_CERT_PATH, "rb") as f:
-                    content = f.read()
+            if not SERVE_CA_CERT:
+                msg = b"CA certificate serving is disabled."
+                self.send_response(404)
+                self.send_header("Content-Type", "text/plain")
+                self.send_header("Content-Length", str(len(msg)))
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(msg)
+                return
+            content = ca_cert_content()
+            if content is not None:
+                print_flush(f"{green('[Portal]')} Serving MITM CA cert to {client}")
                 self.send_response(200)
                 self.send_header("Content-Type", "application/x-x509-ca-cert")
                 self.send_header("Content-Length", str(len(content)))
@@ -525,7 +696,7 @@ class CaptivePortalHandler(BaseHTTPRequestHandler):
         # 3. Root / index
         if path in ("/", "/index.html"):
             if os.path.exists(INDEX_FILE_PATH):
-                print(f"[Portal] Serving index.html to {client}")
+                print_flush(f"{green('[Portal]')} Serving index.html to {client}")
                 with open(INDEX_FILE_PATH, "rb") as f:
                     content = f.read()
                 self.send_response(200)
@@ -545,7 +716,7 @@ class CaptivePortalHandler(BaseHTTPRequestHandler):
             return
 
         # 4. Everything else → redirect to captive portal
-        print(f"[Portal] Redirecting {client}  {path}  → /index.html")
+        print_flush(f"{cyan('[Portal]')} Redirecting {client}  {path}  → /index.html")
         self.send_response(302)
         self.send_header("Location", f"http://{YOUR_IP}/index.html")
         self.send_header("Connection", "close")
@@ -597,25 +768,27 @@ def main() -> None:
     except PermissionError:
         dns_sock.close()
         sys.exit(
-            f"[Portal] Error: Root privileges required to bind to port {args.http_port}."
+            f"{red('[Portal]')} Error: Root privileges required to bind to port {args.http_port}."
         )
     except OSError as e:
         dns_sock.close()
-        sys.exit(f"[Portal] Error: Could not bind to port {args.http_port}: {e}")
+        sys.exit(f"{red('[Portal]')} Error: Could not bind to port {args.http_port}: {e}")
 
     # Phase 2: drop root now that sockets are bound
+    if SERVE_CA_CERT:
+        load_ca_cert()
     drop_privileges("nobody")
     print_dns_startup(args.dns_port)
     threading.Thread(target=serve_dns, args=(dns_sock,), daemon=True).start()
 
-    print(
-        f"[Portal] Combined server running — DNS :{args.dns_port}  "
+    print_flush(
+        f"{bold(green('[Engine]'))} Combined server running — DNS :{args.dns_port}  "
         f"HTTP :{args.http_port}  (IP: {YOUR_IP})"
     )
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
-        print("\n[Portal] Shutting down gracefully.")
+        print_flush(f"\n{yellow('[Engine]')} Shutting down gracefully.")
 
 
 # ── Entry point ────────────────────────────────────────────────────────────

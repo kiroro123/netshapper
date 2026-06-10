@@ -31,7 +31,8 @@ class MarkIDPool:
     """
     def __init__(self, start: int = 10, step: int = 20,
                  max_targets: int = 50):
-        assert step >= 20, "step must be >= 20 to avoid mark-pair collisions"
+        if step < 20:
+            raise ValueError("step must be >= 20 to avoid mark-pair collisions")
         self._available: List[int]      = list(range(start,
                                                       start + step * max_targets,
                                                       step))

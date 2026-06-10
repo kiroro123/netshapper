@@ -268,7 +268,7 @@ class NetworkDiscovery:
         """
         ARP passive-sniff callback — thread-safe write to devices_dict.
 
-        BUG FIX (v3.8.1): original code also added pdst/Ether.dst as a device,
+        Historical bug fix: original code also added pdst/Ether.dst as a device,
         which injected ghost entries (ff:ff:ff:ff:ff:ff) for every probed IP.
         Now only the *source* IP/MAC is registered.
         """
@@ -584,7 +584,7 @@ class NetworkDiscovery:
         """
         Async hostname resolution — single flat ThreadPoolExecutor.
 
-        BUG FIX (v3.8.1): the as_completed() TimeoutError was not caught at
+        Historical bug fix: the as_completed() TimeoutError was not caught at
         the for-loop level, causing it to propagate to the caller when the
         5-second wall-clock budget expired before all futures completed.
         The try/except is now correctly wrapped around the for statement.

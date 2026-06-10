@@ -169,10 +169,15 @@ class NetShaperCleanupTests(unittest.TestCase):
     def test_launch_mitmproxy_reaps_process_when_readiness_fails(self):
         ns = NetShaper.__new__(NetShaper)
         ns.own_ip = "192.0.2.1"
+        ns.session_id = "NS-TEST"
+        ns._mitm_log_path = None
+        ns._mitm_log_handle = None
         proc = mock.Mock()
-        proc.poll.side_effect = [None, 0]
+        proc.poll.side_effect = [None, None, 0]
 
-        with mock.patch("netshaper.core.orchestrator.config.DRY_RUN", False), \
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch("netshaper.core.orchestrator.config.STATE_DIR", tmp), \
+             mock.patch("netshaper.core.orchestrator.config.DRY_RUN", False), \
              mock.patch("netshaper.core.orchestrator.check_local_port",
                         return_value=False), \
              mock.patch("netshaper.core.orchestrator.subprocess.Popen",
@@ -185,6 +190,8 @@ class NetShaperCleanupTests(unittest.TestCase):
         proc.terminate.assert_called_once()
         proc.wait.assert_called_once_with(timeout=5)
         self.assertIsNone(ns._mitm_proc)
+        self.assertIsNone(ns._mitm_log_handle)
+        self.assertTrue(ns._mitm_log_path.endswith("mitmproxy.log"))
 
     def test_failed_mitmproxy_termination_keeps_process_for_retry(self):
         ns = NetShaper.__new__(NetShaper)
@@ -204,6 +211,46 @@ class NetShaperCleanupTests(unittest.TestCase):
         self.assertTrue(second)
         self.assertIsNone(ns._mitm_proc)
         self.assertEqual(proc.terminate.call_count, 2)
+
+    def test_start_monitor_thread_records_crashes(self):
+        ns = NetShaper.__new__(NetShaper)
+        ns.session_id = "NS-TEST"
+        ns.stop_event = threading.Event()
+        ns._monitor_thread = None
+        ns._runtime_errors = []
+        ns.monitor = mock.Mock(side_effect=RuntimeError("counter failed"))
+
+        with mock.patch("netshaper.core.orchestrator.log"):
+            thread = ns.start_monitor_thread()
+            thread.join(timeout=1.0)
+
+        self.assertFalse(thread.is_alive())
+        self.assertTrue(ns.stop_event.is_set())
+        self.assertTrue(
+            any("counter failed" in error for error in ns._runtime_errors)
+        )
+
+    def test_runtime_health_reports_failed_components(self):
+        ns = NetShaper.__new__(NetShaper)
+        ns.stop_event = threading.Event()
+        ns._runtime_errors = []
+        monitor = mock.Mock()
+        monitor.is_alive.return_value = False
+        ns._monitor_thread = monitor
+        ns.sniffer = mock.Mock()
+        ns.sniffer.is_running.return_value = False
+        ns.sniffer.last_error = "disk full"
+        ns._mitm_proc = None
+        ns.own_ip = "192.0.2.1"
+
+        with mock.patch("netshaper.core.orchestrator.config.DRY_RUN", False):
+            issues = ns.runtime_health_issues(
+                expect_sniffer=True,
+                expect_monitor=True,
+            )
+
+        self.assertIn("bandwidth monitor thread is not running", issues)
+        self.assertTrue(any("disk full" in issue for issue in issues))
 
     def test_instance_lock_rejects_second_holder(self):
         first = NetShaper.__new__(NetShaper)

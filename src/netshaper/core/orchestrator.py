@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import shutil
+import socket
 import subprocess
 import tempfile
 import threading
@@ -68,6 +69,11 @@ class NetShaper:
         self._global_firewall_binaries_applied: List[str] = []
         self._global_rules_created: List[dict] = []
         self._mitm_proc  = None
+        self._mitm_log_path: Optional[str] = None
+        self._mitm_log_handle = None
+        self._monitor_thread: Optional[threading.Thread] = None
+        self._runtime_errors: List[str] = []
+        self._started_at: Optional[float] = None
         self._cleanup_running = False
         self._cleanup_complete = False
         self._dry_run_state = None
@@ -134,6 +140,183 @@ class NetShaper:
             lock_file.close()
         finally:
             self._lock_file = None
+
+    @staticmethod
+    def _timestamp() -> str:
+        return time.strftime("%Y-%m-%d %H:%M:%S %z")
+
+    def _session_state_dir(self) -> str:
+        return os.path.join(
+            config.STATE_DIR,
+            getattr(self, "session_id", "NS-UNKNOWN"),
+        )
+
+    def _state_path(self) -> str:
+        return os.path.join(self._session_state_dir(), "state.json")
+
+    def record_runtime_error(self, component: str, error) -> None:
+        message = f"{self._timestamp()} {component}: {error}"
+        self._runtime_errors.append(message)
+        log.error(f"Runtime failure ({component}): {error}")
+
+    def start_monitor_thread(self) -> threading.Thread:
+        current = getattr(self, "_monitor_thread", None)
+        if current and current.is_alive():
+            return current
+
+        def guarded_monitor() -> None:
+            try:
+                self.monitor()
+            except Exception as exc:
+                self.record_runtime_error("bandwidth monitor", exc)
+                self.stop_event.set()
+
+        self._monitor_thread = threading.Thread(
+            target=guarded_monitor,
+            name=f"netshaper-monitor-{getattr(self, 'session_id', 'NS-UNKNOWN')}",
+            daemon=True,
+        )
+        self._started_at = time.time()
+        self._monitor_thread.start()
+        return self._monitor_thread
+
+    def _sniffer_output_files(self) -> List[str]:
+        sniffer = getattr(self, "sniffer", None)
+        return list(getattr(sniffer, "output_files", []) or [])
+
+    def runtime_evidence_lines(
+            self,
+            target_ips: Optional[List[str]] = None,
+            *,
+            expect_sniffer: bool = False,
+            save_pcap: bool = False,
+            rolling: bool = False) -> List[str]:
+        started_at = self._started_at or time.time()
+        lines = [
+            f"Session ID: {self.session_id}",
+            f"Started at: {time.strftime('%Y-%m-%d %H:%M:%S %z', time.localtime(started_at))}",
+            f"Interface: {self.interface}",
+            f"Targets: {', '.join(target_ips or []) or '-'}",
+            "State file: "
+            + ("dry-run memory only" if config.DRY_RUN else self._state_path()),
+            "Log file: "
+            + ("console only" if config.DRY_RUN else config.LOG_FILE),
+        ]
+
+        monitor_thread = getattr(self, "_monitor_thread", None)
+        lines.append(
+            "Monitor thread: "
+            + ("running" if monitor_thread and monitor_thread.is_alive()
+               else "not running")
+        )
+
+        sniffer = getattr(self, "sniffer", None)
+        if sniffer:
+            if hasattr(sniffer, "is_running"):
+                sniffer_status = (
+                    "running" if sniffer.is_running() else "not running"
+                )
+            else:
+                sniffer_status = "unknown"
+            lines.append(f"Packet sniffer: {sniffer_status}")
+            output_files = self._sniffer_output_files()
+            if output_files:
+                lines.append("PCAP files: " + ", ".join(output_files))
+            elif rolling:
+                lines.append("PCAP files: rolling writer started, no file recorded yet")
+            elif save_pcap:
+                lines.append("PCAP files: will be written during shutdown")
+            else:
+                lines.append("PCAP files: not requested")
+        elif expect_sniffer:
+            lines.append("Packet sniffer: not started")
+
+        proc = getattr(self, "_mitm_proc", None)
+        if proc:
+            lines.append(f"mitmproxy PID: {proc.pid}")
+        if getattr(self, "_mitm_log_path", None):
+            lines.append(f"mitmproxy log: {self._mitm_log_path}")
+
+        errors = getattr(self, "_runtime_errors", [])
+        lines.append("Runtime errors: " + ("; ".join(errors) if errors else "none"))
+        return lines
+
+    def runtime_health_issues(
+            self,
+            *,
+            expect_sniffer: bool = False,
+            expect_monitor: bool = False,
+            expected_tcp_ports: Optional[List[int]] = None,
+            expected_udp_ports: Optional[List[int]] = None) -> List[str]:
+        issues = list(getattr(self, "_runtime_errors", []))
+        if self.stop_event.is_set():
+            return issues
+
+        if expect_monitor:
+            monitor_thread = getattr(self, "_monitor_thread", None)
+            if monitor_thread is None or not monitor_thread.is_alive():
+                issues.append("bandwidth monitor thread is not running")
+
+        if expect_sniffer and not config.DRY_RUN:
+            sniffer = getattr(self, "sniffer", None)
+            if sniffer is None:
+                issues.append("packet sniffer was requested but is not started")
+            elif hasattr(sniffer, "is_running") and not sniffer.is_running():
+                detail = getattr(sniffer, "last_error", None)
+                message = "packet sniffer stopped unexpectedly"
+                if detail:
+                    message += f": {detail}"
+                issues.append(message)
+
+        proc = getattr(self, "_mitm_proc", None)
+        if proc:
+            return_code = proc.poll()
+            if return_code is not None:
+                issues.append(
+                    f"mitmproxy exited unexpectedly with code {return_code}"
+                )
+
+        if not config.DRY_RUN:
+            host = getattr(self, "own_ip", None)
+            if host:
+                for port in expected_tcp_ports or []:
+                    if not check_local_port(host, port):
+                        issues.append(f"TCP port {port} is no longer reachable")
+                for port in expected_udp_ports or []:
+                    if not check_local_port(host, port, socket.SOCK_DGRAM):
+                        issues.append(f"UDP port {port} is no longer reachable")
+            elif expected_tcp_ports or expected_udp_ports:
+                issues.append("local host IP is unknown; cannot verify ports")
+
+        return issues
+
+    def _open_mitmproxy_log(self):
+        if config.DRY_RUN:
+            return None
+        os.makedirs(self._session_state_dir(), mode=0o700, exist_ok=True)
+        self._mitm_log_path = os.path.join(
+            self._session_state_dir(), "mitmproxy.log"
+        )
+        self._mitm_log_handle = open(
+            self._mitm_log_path,
+            "a",
+            encoding="utf-8",
+            buffering=1,
+        )
+        self._mitm_log_handle.write(
+            f"{self._timestamp()} starting mitmproxy\n"
+        )
+        return self._mitm_log_handle
+
+    def _close_mitmproxy_log(self) -> None:
+        handle = getattr(self, "_mitm_log_handle", None)
+        if not handle:
+            return
+        try:
+            handle.write(f"{self._timestamp()} mitmproxy stopped\n")
+            handle.close()
+        finally:
+            self._mitm_log_handle = None
 
     @staticmethod
     def scale_bytes(val: float) -> str:
@@ -562,7 +745,7 @@ class NetShaper:
             )
             cleanup_step("traffic shaper", self.shaper.cleanup)
 
-            state_path = os.path.join(config.STATE_DIR, self.session_id, "state.json")
+            state_path = self._state_path()
             if errors:
                 log.warning(f"Network cleanup completed with {len(errors)} error(s).")
             else:
@@ -624,12 +807,15 @@ class NetShaper:
         if check_local_port(self.own_ip, port):
             log.info(f"mitmproxy already running on :{port}")
             return True
+        log_handle = None
         try:
+            log_handle = self._open_mitmproxy_log()
             self._mitm_proc = subprocess.Popen(
                 ["mitmweb", "--mode", "transparent",
                  "--listen-port", str(port),
                  "--set", f"web_port={web_port}"],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                stdout=log_handle or subprocess.DEVNULL,
+                stderr=subprocess.STDOUT if log_handle else subprocess.DEVNULL)
             for attempt in range(10):
                 if check_local_port(self.own_ip, port):
                     print_flush(
@@ -637,12 +823,25 @@ class NetShaper:
                     return True
                 log.debug(f"Waiting for mitmproxy… (attempt {attempt+1}/10)")
                 time.sleep(0.5)
-            log.error(f"mitmproxy did not bind to :{port} within 5 s")
+            return_code = self._mitm_proc.poll()
+            if return_code is None:
+                log.error(f"mitmproxy did not bind to :{port} within 5 s")
+            else:
+                log.error(
+                    f"mitmproxy exited during startup with code {return_code}; "
+                    f"see {self._mitm_log_path or 'logs'}"
+                )
             self._terminate_mitmproxy()
             return False
         except FileNotFoundError:
             print_flush("  [!] mitmweb not found.  pip install mitmproxy")
+            if log_handle:
+                self._close_mitmproxy_log()
             return False
+        except Exception:
+            if log_handle:
+                self._close_mitmproxy_log()
+            raise
 
     def _terminate_mitmproxy(self) -> bool:
         proc = getattr(self, "_mitm_proc", None)
@@ -666,11 +865,13 @@ class NetShaper:
             log.error(f"mitmproxy cleanup failed: {exc}")
         if ok:
             self._mitm_proc = None
+            self._close_mitmproxy_log()
         return ok
 
     def close(self) -> None:
         """Release non-network resources when a session never started."""
         self._terminate_mitmproxy()
+        self._close_mitmproxy_log()
         self._release_instance_lock()
 
     # ── State persistence ─────────────────────────────────────────────────────
@@ -760,7 +961,7 @@ class NetShaper:
             self._dry_run_state = data
             return True
         try:
-            state_dir = os.path.join(config.STATE_DIR, self.session_id)
+            state_dir = self._session_state_dir()
             os.makedirs(state_dir, mode=0o700, exist_ok=True)
             with tempfile.NamedTemporaryFile(
                     'w', dir=state_dir, delete=False) as tf:
@@ -1023,8 +1224,9 @@ class NetShaper:
                     print_flush(
                         f"\r  TX:{self.scale_bytes(tx)}"
                         f"  RX:{self.scale_bytes(rx)}   ",
-                        end='')
+                        end='', flush=True)
                 old = new
             except Exception as e:
                 log.debug(f"[Monitor] Counter read error: {e}")
-        print_flush()
+        # Erase the \r line so shutdown messages start on a clean line
+        print_flush("\r" + " " * 40 + "\r", end='')

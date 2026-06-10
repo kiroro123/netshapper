@@ -1,19 +1,25 @@
 # NetShaper
 
-NetShaper is a modular, authorized network-testing toolkit for controlled lab and client-network analysis. It combines discovery, packet capture, DNS handling, traffic shaping, and MITM-style interception logic in a single Python CLI.
+NetShaper is a modular, authorized network-testing toolkit for controlled lab and client-network analysis. It combines discovery, packet capture, DNS handling, traffic shaping, and MITM-style interception in a single Python CLI.
 
-This repository is intentionally framed as a safety-first, lab-oriented tool for authorized testing and reversible diagnostics.
+**Use only on networks and devices you own or have explicit written permission to test.**
 
-## What this project is
+## Features
 
-This project is intended for authorized security validation and controlled network diagnostics on environments where you have explicit permission to test. It is designed to help identify, reproduce, and validate network behavior and possible weaknesses in a safe, reversible workflow.
+- Dual-stack ARP + NDP spoofing (IPv4 and IPv6 MITM)
+- Per-target DNS redirect and captive portal (HTTP)
+- Bandwidth throttling via Linux `tc` HTB
+- Packet capture with optional rolling `.pcap` files
+- Transparent HTTPS inspection via mitmproxy
+- Atomic state persistence and automatic stale-session recovery
+- Full `--dry-run` mode — prints commands without touching the system
 
-## Current goals
+## Requirements
 
-- Provide a real CLI workflow for authorized network testing
-- Improve safe dry-run behavior and rollback handling
-- Add stronger session tracking and cleanup reliability
-- Prepare the project for GitHub-based development and CI
+- Linux, Python ≥ 3.10
+- Root (`sudo`)
+- `iptables` / `ip6tables`, `tc`, `sysctl` on PATH
+- `scapy`, `psutil` (installed automatically)
 
 ## Installation
 
@@ -21,56 +27,70 @@ This project is intended for authorized security validation and controlled netwo
 python -m pip install -e .
 ```
 
-For developer tooling:
+Dev extras (pytest etc.):
 
 ```bash
 python -m pip install -e ".[dev]"
 ```
 
-## Quick start
-
-Run from this source checkout:
+## Quick Start
 
 ```bash
-sudo env PYTHONPATH="$PWD/src" python -m netshaper -i <your-interface>
+sudo env PYTHONPATH="$PWD/src" python -m netshaper -i <interface> \
+  --allow-cidr <authorized-cidr>
 ```
 
-Safe preview mode:
+Dry-run preview (no system changes):
 
 ```bash
-sudo env PYTHONPATH="$PWD/src" python -m netshaper -i <your-interface> --targets <target-ip> --dry-run
+sudo env PYTHONPATH="$PWD/src" python -m netshaper -i <interface> \
+  --allow-cidr <authorized-cidr> --targets <ip> --dry-run
 ```
 
-Optional captive-portal / DNS helper:
+Optional DNS/HTTP captive-portal helper (separate terminal):
 
 ```bash
 sudo env PYTHONPATH="$PWD/src" python -m netshaper.fake_server3 --smart-spoof-all --host-ip <your-ip>
 ```
 
-From a source checkout, this remains available too:
+## User Guide
 
-```bash
-sudo python3 fake_server3.py
-```
-
-## User guide
-
-See [USER_GUIDE.md](USER_GUIDE.md) for the practical workflow, shell aliases,
-fake-server modes such as `--smart-spoof-all`, discovery behavior, dry-run
-usage, and troubleshooting.
+See [USER_GUIDE.md](USER_GUIDE.md) for the full workflow, shell aliases, fake-server modes, discovery behaviour, dry-run usage, and troubleshooting.
 
 ## Testing
-
-Run the regression suite:
 
 ```bash
 python -m unittest discover -s tests -v
 ```
 
-## Repository notes
+Root-only end-to-end namespace checks:
 
-- The main CLI workflow lives in the packaged `src/netshaper` tree and is the recommended path for normal use.
-- `netshaper-fake-server` / `fake_server3.py` is an optional experimental helper for captive-portal / DNS lab scenarios. Keep it as a supporting utility, not as the main user path.
-- Use this tool only on networks and devices you are authorized to test.
+```bash
+sudo env PYTHONPATH="$PWD/src:$PWD" python -m unittest tests.test_netns_integration -v
+```
 
-The project is still evolving, and the current focus is safety, rollback, and reliable validation behavior.
+## Release Hygiene
+
+Do not distribute a working tree ZIP. Build releases from a clean checkout with
+`python -m build` or `git archive` so `.git`, virtual environments, packet
+captures, logs, caches, reference artifacts, and state files are excluded.
+Treat Git history and packet captures as sensitive material.
+
+## Logs
+
+When running normally (not `--dry-run`), NetShaper writes to `/var/log/netshaper.log`.
+After startup, the CLI prints a verified evidence block with the session ID,
+timestamp, interface, targets, state file, log file, monitor status, sniffer
+status, and any packet-capture files known at that point. Auto-launched
+mitmproxy output is written to `/run/netshaper/<session-id>/mitmproxy.log`.
+
+During the active session NetShaper keeps checking the monitor thread, requested
+packet sniffer, mitmproxy process, and configured local redirect ports. A failed
+health check is reported as an error and triggers normal cleanup instead of
+continuing to display a successful status.
+
+## Notes
+
+- Session state is stored under `/run/netshaper/` and cleaned up on exit.
+- Only one NetShaper instance may run at a time (enforced via lock file).
+- `fake_server3` is an optional helper for captive-portal and DNS lab scenarios; it is not required for ARP spoofing or traffic shaping.

@@ -55,6 +55,16 @@ _ERROR_MARKERS = (
 )
 
 
+def _stable_subprocess_env() -> dict[str, str]:
+    env = os.environ.copy()
+    env.update({
+        "LANG": "C",
+        "LC_ALL": "C",
+        "LANGUAGE": "C",
+    })
+    return env
+
+
 def inspect_resource(args) -> InspectionResult:
     if config.DRY_RUN:
         return InspectionResult(InspectionStatus.ABSENT)
@@ -64,6 +74,7 @@ def inspect_resource(args) -> InspectionResult:
             capture_output=True,
             text=True,
             check=False,
+            env=_stable_subprocess_env(),
         )
     except FileNotFoundError as exc:
         return InspectionResult(InspectionStatus.ERROR, stderr=str(exc))
@@ -109,7 +120,12 @@ class SubprocessRunner:
             return True
         try:
             res = subprocess.run(
-                args, capture_output=True, text=True, check=check)
+                args,
+                capture_output=True,
+                text=True,
+                check=check,
+                env=_stable_subprocess_env(),
+            )
             if res.returncode != 0:
                 if not silent:
                     # Always log on failure when silent=False.

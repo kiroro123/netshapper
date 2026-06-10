@@ -5,95 +5,70 @@ you own or have explicit permission to test.
 
 ## Run From Source
 
-This repo uses a `src/` Python layout. When running directly from the checkout,
-use `PYTHONPATH` so Python can find the package:
+This repo uses a `src/` Python layout. Set `PYTHONPATH` so Python finds the
+package without a system install:
 
 ```bash
-cd /home/kyrol/Downloads/netshaper
-sudo env PYTHONPATH="$PWD/src" python -m netshaper -i wlp0s20f3
+sudo env PYTHONPATH="$PWD/src" python -m netshaper -i <interface> \
+  --allow-cidr <authorized-cidr>
 ```
 
-If you already created the `snetshaper` alias:
+Suggested alias (add to `~/.bashrc` or `~/.zshrc`):
 
 ```bash
-snetshaper -i wlp0s20f3
+alias snetshaper='sudo env PYTHONPATH="$(git -C ~/Downloads/netshaper rev-parse --show-toplevel)/src" python -m netshaper'
 ```
 
-Suggested alias:
+Or with a fixed path:
 
 ```bash
-echo "alias snetshaper='sudo env PYTHONPATH=/home/kyrol/Downloads/netshaper/src python -m netshaper'" >> ~/.bashrc
-source ~/.bashrc
+alias snetshaper='sudo env PYTHONPATH=/path/to/netshaper/src python -m netshaper'
 ```
 
-Why plain `sudo python -m netshaper` may fail:
+Why plain `sudo python -m netshaper` fails:
 
 ```text
 No module named netshaper
 ```
 
-Root's Python does not automatically include this repo's `src/` directory.
-Using `PYTHONPATH` fixes that without installing into the system Python.
+Root's `$PYTHONPATH` is stripped by default. The `env PYTHONPATH=...` form
+passes it through explicitly.
 
 ## Fake Server
 
-The fake server is the DNS and HTTP helper used for captive-portal style lab
-flows. Run it in a separate terminal before starting NetShaper.
-
-From source:
+The fake server handles DNS queries and serves the captive-portal HTTP page.
+Run it in a **separate terminal** before starting NetShaper when using features
+2 or 3.
 
 ```bash
-cd /home/kyrol/Downloads/netshaper
 sudo env PYTHONPATH="$PWD/src" python -m netshaper.fake_server3
 ```
 
-Or with an alias:
+Suggested alias:
 
 ```bash
-echo "alias sfakeserver='sudo env PYTHONPATH=/home/kyrol/Downloads/netshaper/src python -m netshaper.fake_server3'" >> ~/.bashrc
-source ~/.bashrc
-sfakeserver
+alias sfakeserver='sudo env PYTHONPATH=/path/to/netshaper/src python -m netshaper.fake_server3'
 ```
 
-The root source-file entrypoint also works:
-
-```bash
-cd /home/kyrol/Downloads/netshaper
-sudo python3 fake_server3.py
-```
-
-The fake server binds low ports such as DNS `53` and HTTP `80`, so it normally
-needs `sudo`.
+The fake server binds ports `53` (DNS) and `80` (HTTP), so it requires `sudo`.
 
 ## Recommended Two-Terminal Workflow
 
-Terminal 1:
+**Terminal 1** — fake server:
 
 ```bash
-sfakeserver --smart-spoof-all --host-ip 192.168.24.140 --verbose-dns
+sfakeserver --smart-spoof-all --host-ip <your-ip> --verbose-dns
 ```
 
-Terminal 2:
+**Terminal 2** — NetShaper:
 
 ```bash
-snetshaper -i wlp0s20f3
+snetshaper -i <interface> --allow-cidr <authorized-cidr>
 ```
 
-In NetShaper, choose features:
+Then select features `1 2 3` (or `1,2,3`) for ARP + DNS + captive portal.
 
-```text
-1 2 3
-```
-
-For ARP spoofing, DNS handling, and captive portal.
-
-With bandwidth throttling too:
-
-```text
-1 2 3 4
-```
-
-## NetShaper Feature Menu
+## Feature Menu
 
 ```text
 [1] ARP spoofing (core MITM)
@@ -104,115 +79,136 @@ With bandwidth throttling too:
 [6] mitmproxy HTTPS inspection
 ```
 
-Common choices:
+Enter numbers separated by spaces or commas:
 
 ```text
-1 2 3      ARP + DNS + captive portal
-1 2 3 4    ARP + DNS + captive portal + throttle
-1 5        ARP + packet sniffer
-1 6        ARP + mitmproxy HTTPS inspection
+1 2 3        ARP + DNS + captive portal
+1,2,3,4      same + bandwidth throttle
+1 5          ARP + packet capture
+1 6          ARP + mitmproxy HTTPS inspection
+```
+
+## Bandwidth Throttle Presets
+
+When feature `4` is selected you'll be shown:
+
+```text
+[1] 1 Mbps   [2] 2 Mbps   [3] 3 Mbps
+[4] 5 Mbps   [5] 10 Mbps  [6] Custom
+```
+
+Custom accepts any value from 0.1 to 1000 Mbps.
+
+You can also set throttle non-interactively:
+
+```bash
+snetshaper -i <interface> --allow-cidr 192.168.1.0/24 --targets 192.168.1.5 --limit 2.5
 ```
 
 ## Fake Server Modes
 
-Show all fake-server options:
+| Flag | Behaviour |
+|------|-----------|
+| *(none)* | Serve captive portal; forward all DNS upstream |
+| `--spoof example.com,test.local` | Spoof only listed domains |
+| `--spoof-all` | Spoof every queried domain |
+| `--smart-spoof-all` | Spoof broadly; auto-forward connectivity checks, CDNs, payment domains |
+| `--forward google.com` | Always forward these domains even in spoof-all mode |
+| `--block ads.example.com` | Return NXDOMAIN for these domains |
+| `--upstream 1.1.1.1` | Use a different upstream DNS resolver |
+| `--forward-category connectivity` | Forward a built-in safe category in smart mode |
+| `--verbose-dns` | Log every DNS query and response |
+| `--host-ip <ip>` | Override the IP returned in spoofed A records |
+| `--dns-workers 16` | Set maximum concurrent DNS forwarding workers |
+| `--serve-ca-cert` | Explicitly enable serving the mitmproxy CA at `/cert` |
+
+## Non-Interactive Mode
+
+Skip discovery and set all options from the command line:
 
 ```bash
-sfakeserver --help
+snetshaper -i eth0 --allow-cidr 192.168.1.0/24 --targets 192.168.1.5,192.168.1.6 --limit 1.5
 ```
 
-Default mode:
+`--targets` accepts space-separated or comma-separated IPs. `--limit` sets
+bandwidth in Mbps; feature 4 (throttle) is automatically enabled when it is
+provided. `--allow-cidr` is required and should match the written
+authorization scope for the test.
 
-```bash
-sfakeserver
-```
+## Discovery Behaviour
 
-Runs the HTTP portal and DNS helper. DNS queries not selected for spoofing are
-forwarded upstream.
+Discovery uses three sources in parallel:
 
-Spoof specific domains:
+1. Linux neighbor cache (`ip neigh` + `/proc/net/arp`) — instant
+2. Live ARP sweep — two passes across the subnet in 64-host batches
+3. Passive ARP sniff — 15 seconds, catches quiet devices
 
-```bash
-sfakeserver --spoof example.com,test.local --host-ip 192.168.24.140
-```
-
-Spoof every queried domain:
-
-```bash
-sfakeserver --spoof-all --host-ip 192.168.24.140
-```
-
-Smart broad spoofing:
-
-```bash
-sfakeserver --smart-spoof-all --host-ip 192.168.24.140 --verbose-dns
-```
-
-`--smart-spoof-all` spoofs broadly but forwards safe categories such as
-connectivity checks, DNS providers, Android/Google core services, and sensitive
-finance/payment domains.
-
-Always forward specific domains:
-
-```bash
-sfakeserver --smart-spoof-all --forward google.com,apple.com
-```
-
-Block specific domains with NXDOMAIN:
-
-```bash
-sfakeserver --block ads.example.com
-```
-
-Use a different upstream DNS server:
-
-```bash
-sfakeserver --upstream 1.1.1.1
-```
-
-Forward only selected safe categories in smart mode:
-
-```bash
-sfakeserver --smart-spoof-all --forward-category connectivity --forward-category android
-```
-
-## Discovery Behavior
-
-Discovery now uses three sources:
-
-- Linux neighbor cache (`ip neigh`)
-- `/proc/net/arp`
-- Live ARP refresh plus passive ARP sniffing
-
-Expected discovery output may include:
+Expected output:
 
 ```text
-Cached neighbors: 35 devices
-ARP sweep: pass 1/2 batch 1/4 | 35 devices
-Passive sniff: 15s | 35 devices
+Cached neighbors: 12 devices
+ARP sweep: pass 1/2 batch 1/2 | 12 devices
+Passive sniff: 15s | 14 devices
 ```
 
-The passive sniff phase listens for ARP traffic for about 15 seconds. This is
-normal and helps catch quiet devices.
-
-To inspect what Linux already knows:
+To see what Linux already knows before running NetShaper:
 
 ```bash
-sudo ip neigh show dev wlp0s20f3
+ip neigh show dev <interface>
 cat /proc/net/arp
 ```
 
 ## Dry Run
 
-Dry-run avoids system changes and active discovery. Provide targets manually:
+Prints every command that would be run without applying any system change.
+Discovery is skipped; supply targets manually:
 
 ```bash
-snetshaper -i wlp0s20f3 --targets 192.168.24.134,192.168.24.176 --dry-run
+snetshaper -i eth0 --allow-cidr 192.168.1.0/24 --targets 192.168.1.5 --dry-run
 ```
+
+No `sudo` requirement in dry-run mode, but target scope is still validated.
+
+## Logs
+
+Normal runs write to `/var/log/netshaper.log`. `--dry-run` logs to the console
+only.
+
+## Runtime Evidence
+
+NetShaper does not treat startup as successful just because setup commands
+returned. Before it prints the active monitoring prompt, it verifies the
+runtime checks and shows an evidence block like:
+
+```text
+[+] Startup verified. Evidence:
+    Session ID: NS-ABC123
+    Started at: 2026-06-10 12:34:56 +0800
+    Interface: eth0
+    Targets: 192.168.1.5
+    State file: /run/netshaper/NS-ABC123/state.json
+    Log file: /var/log/netshaper.log
+    Monitor thread: running
+    Packet sniffer: running
+    PCAP files: will be written during shutdown
+    Runtime errors: none
+```
+
+During the active session it keeps checking:
+
+- The bandwidth monitor thread
+- Requested packet sniffer liveness
+- Auto-launched mitmproxy process state
+- Local TCP/UDP redirect ports used by selected DNS, HTTP, or mitmproxy modes
+
+If a check fails, NetShaper reports `Runtime health check failed: ...`, runs
+normal cleanup, and exits with an error instead of continuing to show a healthy
+status. Auto-launched mitmproxy stdout/stderr is saved under
+`/run/netshaper/<session-id>/mitmproxy.log`.
 
 ## Port Conflicts
 
-If the fake server cannot bind DNS or HTTP ports:
+If the fake server cannot bind its ports:
 
 ```bash
 sudo ss -ltnup | grep -E ':53|:80|:8088'
@@ -220,30 +216,48 @@ sudo ss -ltnup | grep -E ':53|:80|:8088'
 
 Common conflicts:
 
-- `systemd-resolved` or another DNS service on port `53`
-- Apache/Nginx or another web server on port `80`
-- mitmproxy on port `8088`
+| Port | Usual culprit | Quick fix |
+|------|---------------|-----------|
+| 53   | `systemd-resolved` | `sudo systemctl stop systemd-resolved` |
+| 80   | Apache / Nginx | `sudo systemctl stop apache2` |
+| 8088 | Previous mitmproxy | `pkill mitmweb` |
+
+## Cleanup
+
+Stop NetShaper with `Ctrl+C`. It will:
+
+- Send corrective ARP/NDP packets to restore real MAC tables
+- Remove all per-target iptables/ip6tables chains
+- Delete global FORWARD and MASQUERADE rules
+- Restore original `ip_forward` / `route_localnet` sysctl values
+- Remove the session state file from `/run/netshaper/`
+
+If a previous run left stale state (e.g. after a crash), NetShaper detects and
+cleans it automatically at the next startup.
 
 ## Testing
-
-Run the full regression suite:
 
 ```bash
 python -m unittest discover -s tests -v
 ```
 
-Run focused tests:
+Run a specific module:
 
 ```bash
-python -m unittest tests.test_discovery -v
-python -m unittest tests.test_fake_server -v
 python -m unittest tests.test_cli -v
+python -m unittest tests.test_firewall -v
 ```
 
-## Cleanup
+Run the root-only end-to-end namespace checks when validating a real operating
+environment:
 
-Stop NetShaper with `Ctrl+C`. It should restore forwarding, firewall rules,
-traffic shaping state, and remove its session state file.
+```bash
+sudo env PYTHONPATH="$PWD/src:$PWD" python -m unittest tests.test_netns_integration -v
+```
 
-If startup reports stale recovery state, let NetShaper recover it before
-starting a new active session.
+## Release Hygiene
+
+Do not share a working tree ZIP. Build from a clean checkout with
+`python -m build` or `git archive`, and exclude `.git`, virtual environments,
+packet captures, logs, caches, reference artifacts, and state files. Treat
+packet captures, runtime logs, and Git history as sensitive material.

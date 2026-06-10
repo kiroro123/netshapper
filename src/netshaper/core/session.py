@@ -11,17 +11,14 @@ from within the orchestrator's _lifecycle_lock (RLock).
 from __future__ import annotations
 
 import logging
-from typing import Callable, Optional, TYPE_CHECKING
+from typing import Callable, Optional
 
 from netshaper import config
 from netshaper.models import Device
-from netshaper.network.backends import DryRunPacketBackend, RealPacketBackend
+from netshaper.network.backends import RealPacketBackend
 from netshaper.network.firewall import FirewallManager
 from netshaper.network.spoofers import ARPSpoofer, NDPSpoofer
 from netshaper.network.shaper import TrafficShaper
-
-if TYPE_CHECKING:
-    pass   # No additional TYPE_CHECKING imports needed here
 
 log = logging.getLogger("netshaper")
 

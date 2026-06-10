@@ -1,12 +1,23 @@
 """
-NetShaper — terminal I/O helpers.
-
-Kept in a standalone module so that network/discovery.py can call
-print_flush() without importing anything from ui/ (which would
-create a dependency inversion).
+NetShaper — terminal I/O helpers and ANSI colour utilities.
 """
 import os
 import sys
+
+# ANSI colour codes — gracefully disabled on non-TTY outputs
+def _tty() -> bool:
+    return sys.stdout.isatty() and sys.stderr.isatty()
+
+def _c(code: str, text: str) -> str:
+    return f"\033[{code}m{text}\033[0m" if _tty() else text
+
+def bold(t: str)    -> str: return _c("1", t)
+def dim(t: str)     -> str: return _c("2", t)
+def green(t: str)   -> str: return _c("32", t)
+def yellow(t: str)  -> str: return _c("33", t)
+def red(t: str)     -> str: return _c("31", t)
+def cyan(t: str)    -> str: return _c("36", t)
+def magenta(t: str) -> str: return _c("35", t)
 
 
 def print_flush(*args, **kwargs) -> None:
@@ -24,5 +35,5 @@ def safe_input(prompt: str = "") -> str:
     try:
         return input().strip()
     except KeyboardInterrupt:
-        print("\n  [NetShaper] Interrupted.")
+        print()
         sys.exit(0)

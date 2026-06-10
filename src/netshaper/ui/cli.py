@@ -4,11 +4,11 @@ NetShaper — Command Line Interface.
 from __future__ import annotations
 
 import argparse
+from ipaddress import ip_address, ip_network
 import os
 import signal
 import socket
 import sys
-import threading
 from typing import List, Optional, Union
 
 # When this file is executed directly from inside the package directory,
@@ -22,14 +22,14 @@ import psutil
 
 from netshaper import config
 
-VERSION = "3.8.0"
+from netshaper.config import VERSION
 from netshaper.models import Device
-from netshaper.system import check_local_port
-from netshaper.utils import print_flush, safe_input
+from netshaper.system import SystemChecker, check_local_port
+from netshaper.utils import bold, cyan, green, print_flush, red, safe_input, yellow
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="NetShaper v3.8.0")
+    parser = argparse.ArgumentParser(description=f"NetShaper v{VERSION}")
     parser.add_argument(
         "--version", action="store_true",
         help="Show NetShaper version and exit.",
@@ -50,6 +50,15 @@ def parse_args() -> argparse.Namespace:
         help="Skip discovery and use these IPs directly (comma-separated values allowed).",
     )
     parser.add_argument(
+        "--allow-cidr",
+        action="append",
+        default=[],
+        help=(
+            "Authorized target CIDR. Required before starting a session; "
+            "may be repeated or comma-separated."
+        ),
+    )
+    parser.add_argument(
         "--limit",
         type=float,
         help="Set bandwidth throttling in Mbps without using the interactive prompt.",
@@ -67,15 +76,58 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
+def _net_if_addrs_or_exit() -> dict:
+    try:
+        return psutil.net_if_addrs()
+    except Exception as exc:
+        sys.exit(f"[NetShaper] Could not inspect network interfaces: {exc}")
+
+
+def _net_if_stats_or_empty() -> dict:
+    try:
+        return psutil.net_if_stats()
+    except Exception:
+        return {}
+
+
+def _usable_interface_ipv4s(name: str, addrs_by_name: Optional[dict] = None) -> list[str]:
+    addrs = (addrs_by_name or _net_if_addrs_or_exit()).get(name, [])
+    result = []
+    for addr in addrs:
+        if addr.family != socket.AF_INET:
+            continue
+        parsed = ip_address(addr.address)
+        if parsed.is_loopback or parsed.is_unspecified:
+            continue
+        result.append(addr.address)
+    return result
+
+
 def choose_interface(requested: Optional[str] = None) -> str:
     if requested:
+        addrs = _net_if_addrs_or_exit()
+        if requested not in addrs:
+            sys.exit(f"[NetShaper] Interface not found: {requested}")
+        stats = _net_if_stats_or_empty().get(requested)
+        if stats is not None and not stats.isup:
+            sys.exit(f"[NetShaper] Interface is down: {requested}")
+        if not _usable_interface_ipv4s(requested, addrs):
+            sys.exit(
+                f"[NetShaper] Interface has no usable non-loopback IPv4: {requested}"
+            )
         return requested
 
+    stats = _net_if_stats_or_empty()
+    addrs_by_name = _net_if_addrs_or_exit()
     ifaces = [
         (name, addr.address)
-        for name, addrs in psutil.net_if_addrs().items()
+        for name, addrs in addrs_by_name.items()
         for addr in addrs
-        if addr.family == socket.AF_INET and not addr.address.startswith("127.")
+        if (
+            addr.family == socket.AF_INET
+            and not addr.address.startswith("127.")
+            and (stats.get(name) is None or stats[name].isup)
+        )
     ]
     if not ifaces:
         sys.exit("[NetShaper] No active interface.")
@@ -149,11 +201,12 @@ def pick_targets_ui(devices: List[Device]) -> List[Device]:
 
 
 def normalize_feature_choices(raw: str) -> tuple[set[int], list[str]]:
-    """Parse feature numbers and return valid features plus invalid tokens."""
+    """Parse feature numbers (space- or comma-separated) and return valid features plus invalid tokens."""
     features: set[int] = set()
     invalid: list[str] = []
 
-    for token in raw.split():
+    # Accept both "1 3 5" and "1,3,5" and "1, 3, 5"
+    for token in raw.replace(",", " ").split():
         try:
             value = int(token)
         except ValueError:
@@ -169,14 +222,14 @@ def normalize_feature_choices(raw: str) -> tuple[set[int], list[str]]:
 
 
 def pick_limit_ui() -> float:
-    presets = {"1": 1.0, "2": 2.0, "3": 3.0, "4": 5.0}
+    presets = {"1": 1.0, "2": 2.0, "3": 3.0, "4": 5.0, "5": 10.0}
     print_flush("\n  Bandwidth presets:")
-    print_flush("  [1] 1 Mbps  [2] 2 Mbps  [3] 3 Mbps  [4] 5 Mbps  [5] Custom")
+    print_flush("  [1] 1 Mbps  [2] 2 Mbps  [3] 3 Mbps  [4] 5 Mbps  [5] 10 Mbps  [6] Custom")
     while True:
-        choice = safe_input("  Select (1-5): ")
+        choice = safe_input("  Select (1-6): ")
         if choice in presets:
             return presets[choice]
-        if choice == "5":
+        if choice == "6":
             try:
                 value = float(safe_input("  Enter Mbps: "))
                 if 0.1 <= value <= 1000:
@@ -188,6 +241,94 @@ def pick_limit_ui() -> float:
 
 def target_ip(target: Union[Device, str]) -> str:
     return target if isinstance(target, str) else target.ip
+
+
+def parse_authorized_cidrs(raw_values: list[str]) -> list:
+    networks = []
+    for token in raw_values:
+        for item in token.split(","):
+            item = item.strip()
+            if not item:
+                continue
+            try:
+                networks.append(ip_network(item, strict=False))
+            except ValueError as exc:
+                raise ValueError(f"invalid --allow-cidr value {item!r}: {exc}") from exc
+    if not networks:
+        raise ValueError("--allow-cidr is required before starting a session")
+    return networks
+
+
+def _interface_broadcasts(interface: str) -> set:
+    broadcasts = set()
+    for addr in _net_if_addrs_or_exit().get(interface, []):
+        broadcast = getattr(addr, "broadcast", None)
+        if not broadcast:
+            continue
+        try:
+            broadcasts.add(ip_address(broadcast.split("%", 1)[0]))
+        except ValueError:
+            continue
+    return broadcasts
+
+
+def _reserved_in_authorized_network(ip_obj, networks: list) -> bool:
+    for network in networks:
+        if ip_obj.version != network.version or ip_obj not in network:
+            continue
+        if ip_obj == network.network_address and network.prefixlen < (
+                31 if ip_obj.version == 4 else 127):
+            return True
+        if (
+                ip_obj.version == 4
+                and ip_obj == network.broadcast_address
+                and network.prefixlen < 31):
+            return True
+    return False
+
+
+def validate_targets(
+        targets: List[Union[Device, str]],
+        authorized_cidrs: list,
+        *,
+        interface: str,
+        own_ip: Optional[str],
+        own_ipv6: Optional[str],
+        gateway_ip: Optional[str],
+        gateway_ipv6: Optional[str]) -> List[Union[Device, str]]:
+    local_addresses = {
+        ip_address(value)
+        for value in (own_ip, own_ipv6, gateway_ip, gateway_ipv6)
+        if value
+    }
+    broadcasts = _interface_broadcasts(interface)
+    validated: List[Union[Device, str]] = []
+
+    for target in targets:
+        raw_ip = target_ip(target)
+        try:
+            parsed = ip_address(raw_ip)
+        except ValueError as exc:
+            raise ValueError(f"invalid target IP {raw_ip!r}") from exc
+
+        if parsed.is_unspecified or parsed.is_loopback or parsed.is_multicast:
+            raise ValueError(f"refusing reserved target address: {parsed}")
+        if parsed in local_addresses:
+            raise ValueError(f"refusing own/gateway target address: {parsed}")
+        if parsed in broadcasts:
+            raise ValueError(f"refusing broadcast target address: {parsed}")
+        if not any(
+                parsed.version == network.version and parsed in network
+                for network in authorized_cidrs):
+            raise ValueError(
+                f"target {parsed} is outside authorized CIDR allowlist"
+            )
+        if _reserved_in_authorized_network(parsed, authorized_cidrs):
+            raise ValueError(f"refusing network/broadcast target address: {parsed}")
+
+        validated.append(str(parsed) if isinstance(target, str) else target)
+
+    return validated
 
 
 def run_active_session(
@@ -232,10 +373,40 @@ def run_active_session(
 
         if not ns.save_state():
             raise RuntimeError("Could not update recovery state after startup.")
-        threading.Thread(target=ns.monitor, daemon=True).start()
-        print_flush("[*] Active. Press Ctrl+C to stop.")
+
+        expected_tcp_ports = [http_redirect_port] if http_redirect_port else []
+        expected_udp_ports = [53] if dns_spoof_on else []
+        ns.start_monitor_thread()
+        issues = ns.runtime_health_issues(
+            expect_sniffer=sniff_on,
+            expect_monitor=True,
+            expected_tcp_ports=expected_tcp_ports,
+            expected_udp_ports=expected_udp_ports,
+        )
+        if issues:
+            raise RuntimeError(
+                "Startup verification failed: " + "; ".join(issues)
+            )
+
+        print_flush(green("[+] Startup verified. Evidence:"))
+        for line in ns.runtime_evidence_lines(
+                target_ips,
+                expect_sniffer=sniff_on,
+                save_pcap=save_pcap,
+                rolling=rolling):
+            print_flush(f"    {line}")
+        print_flush(green("[*] Monitoring.") + " Press " + bold("Ctrl+C") + " to stop.")
         while not ns.stop_event.wait(1):
-            pass
+            issues = ns.runtime_health_issues(
+                expect_sniffer=sniff_on,
+                expect_monitor=True,
+                expected_tcp_ports=expected_tcp_ports,
+                expected_udp_ports=expected_udp_ports,
+            )
+            if issues:
+                raise RuntimeError(
+                    "Runtime health check failed: " + "; ".join(issues)
+                )
     finally:
         ns.cleanup()
         if getattr(ns, "_cleanup_complete", True):
@@ -251,6 +422,11 @@ def main() -> None:
         return
 
     config.DRY_RUN = args.dry_run
+    SystemChecker.check()
+    try:
+        authorized_cidrs = parse_authorized_cidrs(args.allow_cidr)
+    except ValueError as exc:
+        sys.exit(f"[NetShaper] {exc}")
     config.configure_logging(console_only=config.DRY_RUN)
     if config.DRY_RUN:
         print_flush("[*] DRY RUN MODE - no system changes.\n")
@@ -281,14 +457,35 @@ def main() -> None:
             print_flush(f"  IPv6 GW : {ns.gw_ipv6}")
 
         if args.targets:
-            raw_targets = []
-            for token in args.targets:
-                raw_targets.extend(part.strip() for part in token.split(",") if part.strip())
-            targets = raw_targets
-            print_flush(f"  Targets from --targets: {', '.join(raw_targets)}")
+            raw_targets = list(args.targets)
+            try:
+                targets = validate_targets(
+                    raw_targets,
+                    authorized_cidrs,
+                    interface=interface,
+                    own_ip=ns.own_ip,
+                    own_ipv6=ns.own_ipv6,
+                    gateway_ip=ns.gw,
+                    gateway_ipv6=ns.gw_ipv6,
+                )
+            except ValueError as exc:
+                sys.exit(f"[NetShaper] {exc}")
+            print_flush(f"  Targets from --targets: {', '.join(targets)}")
         else:
             devices = ns.discover()
-            targets = pick_targets_ui(devices)
+            selected_targets = pick_targets_ui(devices)
+            try:
+                targets = validate_targets(
+                    selected_targets,
+                    authorized_cidrs,
+                    interface=interface,
+                    own_ip=ns.own_ip,
+                    own_ipv6=ns.own_ipv6,
+                    gateway_ip=ns.gw,
+                    gateway_ipv6=ns.gw_ipv6,
+                )
+            except ValueError as exc:
+                sys.exit(f"[NetShaper] {exc}")
         target_ips = [target_ip(target) for target in targets]
 
         print_flush("\n  -- Features (enter numbers e.g. 1 3 5) ------------------")
@@ -366,21 +563,27 @@ def main() -> None:
                 if safe_input("  Continue anyway? (y/n): ").lower() != "y":
                     sys.exit(0)
 
-        print_flush(f"\n{'=' * 58}")
-        print_flush(f"  Targets       : {', '.join(target_ips)}")
-        print_flush(f"  ARP spoof     : {'Yes' if arp_on else 'No'}")
-        print_flush(f"  DNS spoof     : {'Yes' if dns_spoof_on else 'No'}")
-        print_flush(f"  Captive portal: {'Yes' if captive_portal else 'No'}")
+        W = 58
+        def _yn(flag: bool) -> str:
+            return green("Yes") if flag else "No"
+
+        print_flush(f"\n{cyan('=' * W)}")
+        print_flush(bold(f"  {'Session Summary'}"))
+        print_flush(cyan('-' * W))
+        print_flush(f"  Targets       : {cyan(', '.join(target_ips))}")
+        print_flush(f"  ARP spoof     : {_yn(arp_on)}")
+        print_flush(f"  DNS spoof     : {_yn(dns_spoof_on)}")
+        print_flush(f"  Captive portal: {_yn(captive_portal)}")
         if captive_portal:
             print_flush(f"    HTTP -> port: {http_redirect_port}")
-        print_flush(f"  Throttle      : {f'{limit} Mbps' if throttle_on else 'No'}")
-        print_flush(f"  mitmproxy     : {'Yes' if mitm_on else 'No'}")
-        print_flush(f"  Sniffer       : {'Yes' if sniff_on else 'No'}")
+        print_flush(f"  Throttle      : {green(f'{limit} Mbps') if throttle_on else 'No'}")
+        print_flush(f"  mitmproxy     : {_yn(mitm_on)}")
+        print_flush(f"  Sniffer       : {_yn(sniff_on)}")
         if sniff_on and save_pcap:
-            print_flush(f"    Rolling pcap: {'Yes' if rolling else 'No'}")
-        print_flush(f"{'=' * 58}")
+            print_flush(f"    Rolling pcap: {_yn(rolling)}")
+        print_flush(f"{cyan('=' * W)}")
 
-        if safe_input("\n  Proceed? (y/n): ").lower() != "y":
+        if safe_input(f"\n  {bold('Proceed?')} (y/n): ").lower() != "y":
             sys.exit(0)
 
         def sig_handler(_sig, _frame):

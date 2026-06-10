@@ -1,3 +1,4 @@
+import io
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -5,9 +6,63 @@ from unittest import mock
 from netshaper import fake_server3
 
 
+class NonClosingBytesIO(io.BytesIO):
+    def close(self):
+        self.flush()
+
+
+class FakeSocket:
+    def __init__(self, request: bytes):
+        self.reader = io.BytesIO(request)
+        self.writer = NonClosingBytesIO()
+
+    def makefile(self, mode, *args, **kwargs):
+        if "r" in mode:
+            return self.reader
+        return self.writer
+
+    def sendall(self, data: bytes):
+        self.writer.write(data)
+
+
+def handle_http_request(path: str) -> bytes:
+    request = f"GET {path} HTTP/1.1\r\nHost: portal.test\r\n\r\n".encode()
+    sock = FakeSocket(request)
+    fake_server3.CaptivePortalHandler(sock, ("192.0.2.55", 54321), mock.Mock())
+    return sock.writer.getvalue()
+
+
 class FakeServerStartupTests(unittest.TestCase):
     def test_packaged_fake_server_exposes_main(self):
         self.assertTrue(callable(fake_server3.main))
+
+    @mock.patch("netshaper.fake_server3.psutil.net_if_addrs")
+    @mock.patch("netshaper.fake_server3.psutil.net_if_stats")
+    @mock.patch("netshaper.fake_server3.socket.socket")
+    def test_get_own_ip_falls_back_to_psutil(self, socket_mock, stats_mock, addrs_mock):
+        route_sock = mock.Mock()
+        route_sock.connect.side_effect = OSError("network unreachable")
+        socket_mock.return_value.__enter__.return_value = route_sock
+        stats_mock.return_value = {
+            "lo": SimpleNamespace(isup=True),
+            "eth0": SimpleNamespace(isup=True),
+        }
+        addrs_mock.return_value = {
+            "lo": [
+                SimpleNamespace(
+                    family=fake_server3.socket.AF_INET,
+                    address="127.0.0.1",
+                )
+            ],
+            "eth0": [
+                SimpleNamespace(
+                    family=fake_server3.socket.AF_INET,
+                    address="192.0.2.44",
+                )
+            ],
+        }
+
+        self.assertEqual(fake_server3.get_own_ip(), "192.0.2.44")
 
     @mock.patch("netshaper.fake_server3.socket.socket")
     def test_bind_dns_socket_binds_before_returning(self, socket_mock):
@@ -57,6 +112,10 @@ class FakeServerStartupTests(unittest.TestCase):
         def drop(user):
             events.append(("drop", user))
 
+        def load_cert():
+            events.append(("load_cert",))
+            return b"cached-cert"
+
         def make_thread(target, args, daemon):
             events.append(("thread", target, args, daemon))
             return thread_obj
@@ -65,14 +124,17 @@ class FakeServerStartupTests(unittest.TestCase):
              mock.patch("netshaper.fake_server3.configure_dns"), \
              mock.patch("netshaper.fake_server3.bind_dns_socket", side_effect=bind_dns), \
              mock.patch("netshaper.fake_server3.DualStackHTTPServer", side_effect=http_server), \
+             mock.patch("netshaper.fake_server3.load_ca_cert", side_effect=load_cert), \
              mock.patch("netshaper.fake_server3.drop_privileges", side_effect=drop), \
+             mock.patch("netshaper.fake_server3.SERVE_CA_CERT", False), \
              mock.patch("netshaper.fake_server3.print_dns_startup"), \
              mock.patch("netshaper.fake_server3.threading.Thread", side_effect=make_thread), \
-             mock.patch("builtins.print"):
+             mock.patch("netshaper.fake_server3.print_flush"):
             fake_server3.main()
 
         self.assertEqual(events[0], ("bind_dns", 5353))
         self.assertEqual(events[1][0], "http_bind")
+        self.assertNotIn(("load_cert",), events)
         self.assertEqual(events[2], ("drop", "nobody"))
         self.assertEqual(
             events[3],
@@ -80,6 +142,112 @@ class FakeServerStartupTests(unittest.TestCase):
         )
         thread_obj.start.assert_called_once()
         httpd.serve_forever.assert_called_once()
+
+
+class CertificateHandlerTests(unittest.TestCase):
+    def setUp(self):
+        self.original_cert_content = fake_server3.CA_CERT_CONTENT
+        self.original_serve_ca_cert = fake_server3.SERVE_CA_CERT
+
+    def tearDown(self):
+        fake_server3.CA_CERT_CONTENT = self.original_cert_content
+        fake_server3.SERVE_CA_CERT = self.original_serve_ca_cert
+
+    def test_cert_endpoint_serves_cached_cert_after_privilege_drop(self):
+        fake_server3.CA_CERT_CONTENT = b"test-ca-cert"
+        fake_server3.SERVE_CA_CERT = True
+
+        with mock.patch("netshaper.fake_server3.load_ca_cert") as load_cert_mock, \
+             mock.patch("netshaper.fake_server3.print_flush"):
+            response = handle_http_request("/cert")
+
+        load_cert_mock.assert_not_called()
+        self.assertIn(b"HTTP/1.0 200 OK", response)
+        self.assertIn(b"Content-Type: application/x-x509-ca-cert", response)
+        self.assertIn(b"Content-Length: 12", response)
+        self.assertTrue(response.endswith(b"\r\n\r\ntest-ca-cert"))
+
+    def test_cert_endpoint_returns_404_when_cert_not_preloaded_or_readable(self):
+        fake_server3.CA_CERT_CONTENT = None
+        fake_server3.SERVE_CA_CERT = True
+
+        with mock.patch("netshaper.fake_server3.load_ca_cert", return_value=None):
+            response = handle_http_request("/cert")
+
+        self.assertIn(b"HTTP/1.0 404 Not Found", response)
+        self.assertIn(b"mitmproxy CA cert not found", response)
+
+    def test_cert_endpoint_is_disabled_by_default(self):
+        fake_server3.CA_CERT_CONTENT = b"test-ca-cert"
+        fake_server3.SERVE_CA_CERT = False
+
+        with mock.patch("netshaper.fake_server3.load_ca_cert") as load_cert_mock:
+            response = handle_http_request("/cert")
+
+        load_cert_mock.assert_not_called()
+        self.assertIn(b"HTTP/1.0 404 Not Found", response)
+        self.assertIn(b"CA certificate serving is disabled", response)
+
+
+class DnsForwardingTests(unittest.TestCase):
+    def setUp(self):
+        self.original_upstream = fake_server3.DNS_UPSTREAM
+
+    def tearDown(self):
+        fake_server3.DNS_UPSTREAM = self.original_upstream
+
+    @mock.patch("netshaper.fake_server3.socket.socket")
+    @mock.patch("netshaper.fake_server3.socket.getaddrinfo")
+    def test_forward_dns_query_uses_ipv6_upstream_family(self, getaddrinfo_mock, socket_mock):
+        fake_server3.DNS_UPSTREAM = "2001:4860:4860::8888"
+        sockaddr = ("2001:4860:4860::8888", 53, 0, 0)
+        getaddrinfo_mock.return_value = [
+            (
+                fake_server3.socket.AF_INET6,
+                fake_server3.socket.SOCK_DGRAM,
+                0,
+                "",
+                sockaddr,
+            )
+        ]
+        upstream_sock = mock.Mock()
+        upstream_sock.recvfrom.return_value = (b"response", sockaddr)
+        socket_mock.return_value.__enter__.return_value = upstream_sock
+
+        response = fake_server3.forward_dns_query(b"query")
+
+        self.assertEqual(response, b"response")
+        socket_mock.assert_called_once_with(
+            fake_server3.socket.AF_INET6,
+            fake_server3.socket.SOCK_DGRAM,
+            0,
+        )
+        upstream_sock.sendto.assert_called_once_with(b"query", sockaddr)
+
+
+class ServeDnsTests(unittest.TestCase):
+    def test_serve_dns_logs_and_stops_on_socket_receive_error(self):
+        sock = mock.Mock()
+        sock.recvfrom.side_effect = OSError("closed")
+
+        with mock.patch("netshaper.fake_server3.print_flush") as print_flush_mock:
+            fake_server3.serve_dns(sock)
+
+        print_flush_mock.assert_called_once()
+
+    def test_handle_dns_query_rejects_multi_question_requests(self):
+        data = (
+            b"\x12\x34\x01\x00"
+            b"\x00\x02\x00\x00\x00\x00\x00\x00"
+            b"\x04test\x00\x00\x01\x00\x01"
+        )
+        sock = mock.Mock()
+
+        with mock.patch("netshaper.fake_server3.print_flush") as print_flush_mock:
+            fake_server3.handle_dns_query(sock, data, ("192.0.2.5", 5353))
+
+        sock.sendto.assert_not_called()
+        self.assertIn("QDCOUNT=2", print_flush_mock.call_args.args[0])
 
 
 class ParseDnsQuestionTests(unittest.TestCase):
