@@ -22,6 +22,20 @@ class CliTests(unittest.TestCase):
             args = cli.parse_args()
         self.assertEqual(args.limit, 7.5)
 
+    def test_parse_args_accepts_emergency_restore_flags(self):
+        with mock.patch("sys.argv", [
+            "netshaper",
+            "--emergency-restore-state",
+            "/run/netshaper/NS-OLD/state.json",
+            "--yes-really-restore-firewall-snapshot",
+        ]):
+            args = cli.parse_args()
+        self.assertEqual(
+            args.emergency_restore_state,
+            "/run/netshaper/NS-OLD/state.json",
+        )
+        self.assertTrue(args.yes_really_restore_firewall_snapshot)
+
     def test_parse_args_accepts_authorized_cidr_flag(self):
         with mock.patch("sys.argv", ["netshaper", "--allow-cidr", "192.0.2.0/24"]):
             args = cli.parse_args()
@@ -314,7 +328,42 @@ class CliTests(unittest.TestCase):
 
         logging_mock.assert_not_called()
 
-    def test_main_passes_authorized_cidrs_to_interactive_discovery(self):
+    def test_main_emergency_restore_requires_acknowledgement(self):
+        with mock.patch("sys.argv", [
+                "netshaper", "--emergency-restore-state", "/tmp/state.json"
+             ]), \
+             mock.patch("netshaper.ui.cli.SystemChecker.check") as check_mock, \
+             self.assertRaisesRegex(SystemExit, "requires"):
+            cli.main()
+
+        check_mock.assert_not_called()
+
+    def test_main_emergency_restore_uses_state_manager(self):
+        with mock.patch("sys.argv", [
+                "netshaper",
+                "--emergency-restore-state", "/tmp/state.json",
+                "--yes-really-restore-firewall-snapshot",
+             ]), \
+             mock.patch("netshaper.ui.cli.SystemChecker.check") as check_mock, \
+             mock.patch("netshaper.ui.cli.config.configure_logging"
+                        ) as logging_mock, \
+             mock.patch("netshaper.ui.cli.print_flush") as print_mock, \
+             mock.patch(
+                 "netshaper.core.state_manager.StateSnapshotManager"
+                 ".restore_from_state_file",
+                 return_value=True,
+             ) as restore_mock:
+            cli.main()
+
+        check_mock.assert_called_once()
+        logging_mock.assert_called_once()
+        restore_mock.assert_called_once_with(
+            "/tmp/state.json",
+            restore_firewall=True,
+        )
+        print_mock.assert_called_with("[+] Emergency snapshot restore complete.")
+
+    def test_main_passes_authorized_cidrs_to_core_constructor(self):
         ns = mock.Mock()
         ns.load_state_and_cleanup.return_value = True
         ns.own_ip = "192.0.2.10"
@@ -332,7 +381,7 @@ class CliTests(unittest.TestCase):
              mock.patch("netshaper.ui.cli.config.configure_logging"), \
              mock.patch("netshaper.ui.cli.print_flush"), \
              mock.patch("netshaper.core.orchestrator.NetShaper",
-                        return_value=ns), \
+                        return_value=ns) as ns_cls, \
              mock.patch("netshaper.ui.cli.pick_targets_ui",
                         return_value=[target]), \
              mock.patch("netshaper.ui.cli.safe_input",
@@ -342,9 +391,10 @@ class CliTests(unittest.TestCase):
              self.assertRaises(SystemExit):
             cli.main()
 
-        authorized = ns.discover.call_args.args[0]
+        authorized = ns_cls.call_args.kwargs["authorized_cidrs"]
         self.assertEqual([str(network) for network in authorized],
                          ["192.0.2.16/28"])
+        ns.discover.assert_called_once_with()
         ns.close.assert_called_once()
 
     def test_main_exits_when_required_dns_service_is_unreachable(self):

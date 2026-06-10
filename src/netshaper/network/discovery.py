@@ -130,8 +130,8 @@ class NetworkDiscovery:
                             best = (metric, gateway)
             if best is not None:
                 return best[1]
-        except Exception:
-            pass
+        except Exception as exc:
+            log.debug("IPv4 default gateway lookup failed: %s", exc)
         return None
 
     def get_default_gateway_ipv6(self) -> Optional[str]:
@@ -154,8 +154,8 @@ class NetworkDiscovery:
                             best = (metric, gateway)
             if best is not None:
                 return best[1]
-        except Exception:
-            pass
+        except Exception as exc:
+            log.debug("IPv6 default gateway lookup failed: %s", exc)
         return None
 
     def resolve_mac(self, ip: str) -> Optional[str]:
@@ -166,8 +166,8 @@ class NetworkDiscovery:
                 iface=self.interface, timeout=3, verbose=0)
             if ans:
                 return ans[0][1].src.lower()
-        except Exception:
-            pass
+        except Exception as exc:
+            log.debug("MAC resolution failed for %s: %s", ip, exc)
         return None
 
     # ── ARP sweep ────────────────────────────────────────────────────────────
@@ -679,7 +679,13 @@ class NetworkDiscovery:
         for resolver in resolvers:
             try:
                 name = self._clean_hostname(resolver(ip), ip)
-            except Exception:
+            except Exception as exc:
+                log.debug(
+                    "Hostname resolver %s failed for %s: %s",
+                    getattr(resolver, "__name__", resolver),
+                    ip,
+                    exc,
+                )
                 continue
             if name:
                 return name

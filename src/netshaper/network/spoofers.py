@@ -12,7 +12,7 @@ import threading
 import time
 from typing import TYPE_CHECKING, List
 
-from netshaper.network.backends import DryRunPacketBackend, RealPacketBackend
+from netshaper.network.backends import RealPacketBackend
 
 if TYPE_CHECKING:
     from netshaper.core.session import TargetSession

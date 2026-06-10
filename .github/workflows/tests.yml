@@ -1,9 +1,15 @@
-name: Python Tests
+name: Python Quality
 
 on:
   push:
     branches: [ main, master ]
   pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 3 * * 1'
+
+permissions:
+  contents: read
 
 jobs:
   test:
@@ -13,15 +19,61 @@ jobs:
         python-version: ['3.10', '3.11', '3.12']
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python-version }}
+      - name: Install project and quality tools
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+      - name: Ruff
+        run: python -m ruff check .
+      - name: Mypy
+        run: python -m mypy
+      - name: Bandit
+        run: python -m bandit -c pyproject.toml -r src/netshaper
+      - name: Unit tests with coverage
+        run: |
+          python -m coverage run -m unittest discover -s tests -v
+          python -m coverage report
+
+  audit-and-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install project and quality tools
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+      - name: Dependency audit
+        run: python -m pip_audit
+      - name: Build package
+        run: python -m build
+      - name: Install built wheel
+        run: python -m pip install --force-reinstall --no-deps dist/*.whl
+
+  privileged-netns:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
       - name: Install project
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -e .
-      - name: Run tests
+          python -m pip install -e ".[dev]"
+      - name: Install namespace tools
+        run: sudo apt-get update && sudo apt-get install -y iproute2 iptables iputils-ping
+      - name: Run privileged namespace tests
         run: |
-          python -m unittest discover -s tests -v
+          sudo env PYTHONPATH="$PWD/src:$PWD" \
+            python -m unittest tests.test_netns_integration -v

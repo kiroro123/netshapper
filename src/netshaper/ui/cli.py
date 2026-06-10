@@ -25,7 +25,7 @@ from netshaper import config
 from netshaper.config import VERSION
 from netshaper.models import Device
 from netshaper.system import SystemChecker, check_local_port
-from netshaper.utils import bold, cyan, green, print_flush, red, safe_input, yellow
+from netshaper.utils import bold, cyan, green, print_flush, safe_input
 
 
 def parse_args() -> argparse.Namespace:
@@ -62,6 +62,22 @@ def parse_args() -> argparse.Namespace:
         "--limit",
         type=float,
         help="Set bandwidth throttling in Mbps without using the interactive prompt.",
+    )
+    parser.add_argument(
+        "--emergency-restore-state",
+        metavar="PATH",
+        help=(
+            "Emergency only: restore forwarding sysctls and full firewall "
+            "snapshots from a NetShaper state.json file."
+        ),
+    )
+    parser.add_argument(
+        "--yes-really-restore-firewall-snapshot",
+        action="store_true",
+        help=(
+            "Required with --emergency-restore-state; acknowledges that full "
+            "firewall snapshot replay can overwrite unrelated live changes."
+        ),
     )
     args = parser.parse_args()
     if args.targets:
@@ -422,6 +438,24 @@ def main() -> None:
         return
 
     config.DRY_RUN = args.dry_run
+    if args.emergency_restore_state:
+        if not args.yes_really_restore_firewall_snapshot:
+            sys.exit(
+                "[NetShaper] Emergency restore requires "
+                "--yes-really-restore-firewall-snapshot because it can "
+                "overwrite unrelated firewall changes."
+            )
+        SystemChecker.check()
+        config.configure_logging(console_only=config.DRY_RUN)
+        from netshaper.core.state_manager import StateSnapshotManager
+
+        if not StateSnapshotManager.restore_from_state_file(
+                args.emergency_restore_state,
+                restore_firewall=True):
+            sys.exit("[NetShaper] Emergency snapshot restore failed.")
+        print_flush("[+] Emergency snapshot restore complete.")
+        return
+
     SystemChecker.check()
     try:
         authorized_cidrs = parse_authorized_cidrs(args.allow_cidr)
@@ -437,8 +471,8 @@ def main() -> None:
     from netshaper.core.orchestrator import NetShaper
 
     try:
-        ns = NetShaper(interface)
-    except RuntimeError as exc:
+        ns = NetShaper(interface, authorized_cidrs=authorized_cidrs)
+    except (RuntimeError, ValueError) as exc:
         sys.exit(f"[NetShaper] {exc}")
 
     try:
@@ -472,7 +506,7 @@ def main() -> None:
                 sys.exit(f"[NetShaper] {exc}")
             print_flush(f"  Targets from --targets: {', '.join(targets)}")
         else:
-            devices = ns.discover(authorized_cidrs)
+            devices = ns.discover()
             selected_targets = pick_targets_ui(devices)
             try:
                 targets = validate_targets(

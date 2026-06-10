@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import glob
 import fcntl
+from ipaddress import ip_address, ip_network
 import json
 import logging
 import os
@@ -19,7 +20,7 @@ import tempfile
 import threading
 import time
 import uuid
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Sequence, Union
 
 import psutil
 
@@ -43,7 +44,9 @@ log = logging.getLogger("netshaper")
 
 
 class NetShaper:
-    def __init__(self, interface: str):
+    def __init__(self, interface: str, authorized_cidrs: Sequence):
+        self.authorized_cidrs = self._normalize_authorized_cidrs(
+            authorized_cidrs)
         SystemChecker.check()
         self.interface   = interface
         self.session_id  = f"NS-{uuid.uuid4().hex[:6].upper()}"
@@ -83,6 +86,84 @@ class NetShaper:
         self.state_snapshot = StateSnapshotManager.capture(interface, self.session_id)
 
     # ── Helpers ───────────────────────────────────────────────────────────────
+    @staticmethod
+    def _normalize_authorized_cidrs(raw_values: Sequence) -> list:
+        networks = []
+        for token in raw_values or []:
+            if isinstance(token, str):
+                raw_items = token.split(",")
+            else:
+                raw_items = [token]
+            for item in raw_items:
+                if isinstance(item, str):
+                    item = item.strip()
+                    if not item:
+                        continue
+                    networks.append(ip_network(item, strict=False))
+                else:
+                    # Accept ipaddress network objects from the CLI parser.
+                    if not (
+                            hasattr(item, "version")
+                            and hasattr(item, "network_address")
+                            and hasattr(item, "prefixlen")):
+                        raise ValueError(
+                            f"invalid authorized CIDR object: {item!r}"
+                        )
+                    networks.append(item)
+        if not networks:
+            raise ValueError(
+                "authorized_cidrs is required before creating NetShaper"
+            )
+        return networks
+
+    def _assert_authorized_target(self, raw_ip: str) -> None:
+        try:
+            parsed = ip_address(raw_ip)
+        except ValueError as exc:
+            raise ValueError(f"invalid target IP {raw_ip!r}") from exc
+
+        if parsed.is_unspecified or parsed.is_loopback or parsed.is_multicast:
+            raise ValueError(f"refusing reserved target address: {parsed}")
+
+        local_addresses = {
+            ip_address(value)
+            for value in (
+                getattr(self, "own_ip", None),
+                getattr(self, "own_ipv6", None),
+                getattr(self, "gw", None),
+                getattr(self, "gw_ipv6", None),
+            )
+            if value
+        }
+        if parsed in local_addresses:
+            raise ValueError(f"refusing own/gateway target address: {parsed}")
+
+        authorized_cidrs = getattr(self, "authorized_cidrs", [])
+        if not authorized_cidrs:
+            raise ValueError("authorized_cidrs is empty; refusing target")
+        if not any(
+                parsed.version == network.version and parsed in network
+                for network in authorized_cidrs):
+            raise ValueError(
+                f"target {parsed} is outside authorized CIDR allowlist"
+            )
+
+        for network in authorized_cidrs:
+            if parsed.version != network.version or parsed not in network:
+                continue
+            if parsed == network.network_address and network.prefixlen < (
+                    31 if parsed.version == 4 else 127):
+                raise ValueError(
+                    f"refusing network/broadcast target address: {parsed}"
+                )
+            if (
+                    parsed.version == 4
+                    and parsed == network.broadcast_address
+                    and network.prefixlen < 31):
+                raise ValueError(
+                    f"refusing network/broadcast target address: {parsed}"
+                )
+
     @staticmethod
     def _process_start_time(pid: int) -> Optional[str]:
         try:
@@ -567,8 +648,11 @@ class NetShaper:
         return ok
 
     # ── Discovery ─────────────────────────────────────────────────────────────
-    def discover(self, authorized_cidrs: Optional[List] = None) -> List[Device]:
+    def discover(self) -> List[Device]:
         import sys
+        authorized_cidrs = getattr(self, "authorized_cidrs", [])
+        if not authorized_cidrs:
+            raise ValueError("authorized_cidrs is empty; refusing discovery")
         if config.DRY_RUN:
             print_flush("[DRY-RUN] Device discovery skipped")
             return []
@@ -603,6 +687,7 @@ class NetShaper:
         with self._lifecycle_lock:
             if target_ip in self.sessions:
                 raise ValueError(f"Target {target_ip} is already active.")
+        self._assert_authorized_target(target_ip)
 
         # Resolve IP -> Device if needed
         if isinstance(target, str):
@@ -890,17 +975,7 @@ class NetShaper:
 
     @staticmethod
     def _snapshot_from_state(data: dict) -> NetworkStateSnapshot:
-        snapshot = data.get("snapshot") or {}
-        return NetworkStateSnapshot(
-            session_id=snapshot.get("session_id") or data.get("session_id", ""),
-            interface=snapshot.get("interface") or data.get("interface", ""),
-            ipv4_forwarding=snapshot.get("ipv4_forwarding"),
-            ipv6_forwarding=snapshot.get("ipv6_forwarding"),
-            route_localnet=snapshot.get("route_localnet"),
-            iptables_rules=snapshot.get("iptables_rules", ""),
-            ip6tables_rules=snapshot.get("ip6tables_rules", ""),
-            tc_configuration=snapshot.get("tc_configuration", ""),
-        )
+        return StateSnapshotManager.snapshot_from_state(data)
 
     @staticmethod
     def _session_dns_recorded(session: TargetSession) -> bool:

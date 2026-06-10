@@ -181,7 +181,7 @@ def check_local_port(host: str, port: int,
         finally:
             try:
                 s.close()
-            except Exception:
-                pass
+            except Exception as exc:
+                log.debug("Socket close failed during port check: %s", exc)
     except Exception:
         return False

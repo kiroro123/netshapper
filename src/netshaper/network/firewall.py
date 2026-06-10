@@ -7,7 +7,6 @@ so that teardown of one target never touches another's rules.
 import hashlib
 import logging
 import shutil
-import subprocess
 from typing import Callable, List, Optional, Set, Tuple
 
 from netshaper import config

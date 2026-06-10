@@ -272,6 +272,41 @@ class StateSnapshotTests(unittest.TestCase):
 
         self.assertFalse(result)
 
+    @mock.patch("netshaper.core.state_manager.subprocess.run")
+    def test_restore_from_state_file_uses_explicit_firewall_restore(self, run_mock):
+        run_mock.return_value = SimpleNamespace(returncode=0)
+        state = {
+            "session_id": "NS-TEST",
+            "interface": "eth0",
+            "snapshot": {
+                "session_id": "NS-TEST",
+                "interface": "eth0",
+                "ipv4_forwarding": None,
+                "ipv6_forwarding": None,
+                "route_localnet": None,
+                "iptables_rules": "*filter\nCOMMIT\n",
+                "ip6tables_rules": "",
+                "tc_configuration": "qdisc htb 1: root",
+            },
+        }
+
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8") as fh:
+            json.dump(state, fh)
+            fh.flush()
+
+            result = StateSnapshotManager.restore_from_state_file(
+                fh.name,
+                restore_firewall=True,
+            )
+
+        self.assertTrue(result)
+        run_mock.assert_called_once_with(
+            ["iptables-restore"],
+            input="*filter\nCOMMIT\n",
+            text=True,
+            check=False,
+        )
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

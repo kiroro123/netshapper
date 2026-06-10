@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import subprocess
 from dataclasses import dataclass
 from typing import Optional
@@ -22,7 +23,14 @@ class NetworkStateSnapshot:
 
 
 class StateSnapshotManager:
-    """Capture and restore the pre-session network state for safer cleanup."""
+    """Capture and restore pre-session network state.
+
+    Routine cleanup restores forwarding sysctls only. Full firewall snapshots
+    are retained solely for explicit emergency recovery because replaying them
+    can overwrite legitimate firewall changes made by other software while a
+    NetShaper session was active. ``tc_configuration`` is captured as evidence
+    for operators and recovery logs; it is not replayed.
+    """
 
     @staticmethod
     def _run(args: list[str]) -> str:
@@ -41,10 +49,37 @@ class StateSnapshotManager:
         except ValueError:
             return None
 
+    @staticmethod
+    def snapshot_from_state(data: dict) -> NetworkStateSnapshot:
+        snapshot = data.get("snapshot") or data
+        return NetworkStateSnapshot(
+            session_id=snapshot.get("session_id") or data.get("session_id", ""),
+            interface=snapshot.get("interface") or data.get("interface", ""),
+            ipv4_forwarding=snapshot.get("ipv4_forwarding"),
+            ipv6_forwarding=snapshot.get("ipv6_forwarding"),
+            route_localnet=snapshot.get("route_localnet"),
+            iptables_rules=snapshot.get("iptables_rules", ""),
+            ip6tables_rules=snapshot.get("ip6tables_rules", ""),
+            tc_configuration=snapshot.get("tc_configuration", ""),
+        )
+
+    @classmethod
+    def restore_from_state_file(
+            cls,
+            path: str,
+            *,
+            restore_firewall: bool = False) -> bool:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+        return cls.restore(
+            cls.snapshot_from_state(data),
+            restore_firewall=restore_firewall,
+        )
+
     @classmethod
     def restore(cls, snapshot: NetworkStateSnapshot,
                 restore_firewall: bool = False) -> bool:
-        """Restore the captured forwarding and iptables state."""
+        """Restore forwarding sysctls, and optionally full firewall snapshots."""
         ok = True
 
         def run_command(args: list[str]) -> bool:

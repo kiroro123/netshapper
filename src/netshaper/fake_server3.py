@@ -15,7 +15,13 @@ NetShaper packaged fake server
 • Optional CA cert serving over plain HTTP when --serve-ca-cert is set
 """
 
-import argparse, errno, os, pwd, socket, sys, threading
+import argparse
+import errno
+import os
+import pwd
+import socket
+import sys
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from ipaddress import ip_address

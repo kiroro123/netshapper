@@ -6,7 +6,7 @@ from netshaper.system import InspectionStatus
 
 
 class FirewallManagerTests(unittest.TestCase):
-    @mock.patch("netshaper.network.firewall.subprocess.run")
+    @mock.patch("netshaper.system.subprocess.run")
     def test_chain_ok_dry_run_skips_subprocess(self, run_mock):
         fw = FirewallManager.__new__(FirewallManager)
 
@@ -16,7 +16,7 @@ class FirewallManagerTests(unittest.TestCase):
         self.assertFalse(result)
         run_mock.assert_not_called()
 
-    @mock.patch("netshaper.network.firewall.subprocess.run")
+    @mock.patch("netshaper.system.subprocess.run")
     def test_chain_ok_handles_missing_binary(self, run_mock):
         run_mock.side_effect = FileNotFoundError
         fw = FirewallManager.__new__(FirewallManager)

@@ -3,6 +3,7 @@ import os
 import tempfile
 import threading
 import unittest
+from ipaddress import ip_network
 from unittest import mock
 
 from netshaper.core.orchestrator import NetShaper
@@ -10,6 +11,28 @@ from netshaper.models import Device
 
 
 class NetShaperCleanupTests(unittest.TestCase):
+    @staticmethod
+    def _set_authorized(
+            ns: NetShaper,
+            cidrs: tuple[str, ...] = ("192.0.2.0/24",)) -> None:
+        ns.authorized_cidrs = [ip_network(cidr) for cidr in cidrs]
+
+    def test_constructor_requires_authorized_cidrs_before_system_checks(self):
+        with mock.patch("netshaper.core.orchestrator.SystemChecker.check"
+                        ) as check_mock:
+            with self.assertRaisesRegex(ValueError, "authorized_cidrs"):
+                NetShaper("eth0", authorized_cidrs=[])
+
+        check_mock.assert_not_called()
+
+    def test_constructor_accepts_string_authorized_cidrs(self):
+        with mock.patch("netshaper.core.orchestrator.SystemChecker.check",
+                        side_effect=RuntimeError("stop after auth")):
+            with self.assertRaisesRegex(RuntimeError, "stop after auth") as cm:
+                NetShaper("eth0", authorized_cidrs=["192.0.2.0/24"])
+
+        self.assertIn("stop after auth", str(cm.exception))
+
     def test_add_target_rejects_duplicate_target(self):
         ns = NetShaper.__new__(NetShaper)
         ns._lifecycle_lock = threading.RLock()
@@ -58,6 +81,7 @@ class NetShaperCleanupTests(unittest.TestCase):
 
     def test_add_target_rolls_back_partially_created_session(self):
         ns = NetShaper.__new__(NetShaper)
+        self._set_authorized(ns)
         ns._lifecycle_lock = threading.RLock()
         ns.sessions = {}
         ns.mark_pool = mock.Mock()
@@ -85,6 +109,7 @@ class NetShaperCleanupTests(unittest.TestCase):
 
     def test_failed_rollback_keeps_session_for_retry(self):
         ns = NetShaper.__new__(NetShaper)
+        self._set_authorized(ns)
         ns._lifecycle_lock = threading.RLock()
         ns.sessions = {}
         ns.mark_pool = mock.Mock()
@@ -113,6 +138,22 @@ class NetShaperCleanupTests(unittest.TestCase):
         session.cleanup.assert_called_once()
         ns.mark_pool.release.assert_not_called()
         ns.save_state.assert_called_once()
+
+    def test_add_target_rejects_out_of_scope_before_resolution(self):
+        ns = NetShaper.__new__(NetShaper)
+        self._set_authorized(ns)
+        ns._lifecycle_lock = threading.RLock()
+        ns.sessions = {}
+        ns.own_ip = "192.0.2.1"
+        ns.own_ipv6 = None
+        ns.gw = "192.0.2.254"
+        ns.gw_ipv6 = None
+        ns.disc = mock.Mock()
+
+        with self.assertRaisesRegex(ValueError, "outside authorized"):
+            ns.add_target("198.51.100.10")
+
+        ns.disc.resolve_mac.assert_not_called()
 
     def test_remove_target_keeps_failed_cleanup_registered(self):
         ns = NetShaper.__new__(NetShaper)
@@ -156,6 +197,7 @@ class NetShaperCleanupTests(unittest.TestCase):
 
     def test_dry_run_discover_does_not_touch_network(self):
         ns = NetShaper.__new__(NetShaper)
+        self._set_authorized(ns)
         ns.disc = mock.Mock()
 
         with mock.patch("netshaper.core.orchestrator.config.DRY_RUN", True), \
@@ -165,6 +207,34 @@ class NetShaperCleanupTests(unittest.TestCase):
         self.assertEqual(result, [])
         ns.disc.get_subnet_v4.assert_not_called()
         ns.disc.arp_sweep.assert_not_called()
+
+    def test_discover_fails_closed_without_authorized_cidrs(self):
+        ns = NetShaper.__new__(NetShaper)
+        ns.authorized_cidrs = []
+        ns.disc = mock.Mock()
+
+        with self.assertRaisesRegex(ValueError, "authorized_cidrs"):
+            ns.discover()
+
+        ns.disc.get_subnet_v4.assert_not_called()
+
+    def test_discover_uses_core_authorized_cidrs(self):
+        ns = NetShaper.__new__(NetShaper)
+        self._set_authorized(ns, ("192.0.2.64/28",))
+        ns.gw = "192.0.2.1"
+        ns.disc = mock.Mock()
+        ns.disc.get_subnet_v4.return_value = "192.0.2.0/24"
+        ns.disc.arp_sweep.return_value = []
+
+        with mock.patch("netshaper.core.orchestrator.config.DRY_RUN", False):
+            result = ns.discover()
+
+        self.assertEqual(result, [])
+        ns.disc.arp_sweep.assert_called_once_with(
+            "192.0.2.0/24",
+            "192.0.2.1",
+            ns.authorized_cidrs,
+        )
 
     def test_launch_mitmproxy_reaps_process_when_readiness_fails(self):
         ns = NetShaper.__new__(NetShaper)
