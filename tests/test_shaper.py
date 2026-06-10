@@ -40,10 +40,16 @@ class TrafficShaperTests(unittest.TestCase):
     @mock.patch("netshaper.network.shaper.inspect_resource")
     def test_apply_target_allows_implicit_noqueue_root_qdisc(
             self, inspect_mock, runner_mock):
-        inspect_mock.return_value = InspectionResult(
-            InspectionStatus.PRESENT,
-            stdout="qdisc noqueue 0: root refcnt 2",
-        )
+        inspect_mock.side_effect = [
+            InspectionResult(
+                InspectionStatus.PRESENT,
+                stdout="qdisc noqueue 0: root refcnt 2",
+            ),
+            InspectionResult(
+                InspectionStatus.PRESENT,
+                stdout="qdisc htb 1: root refcnt 2",
+            ),
+        ]
         runner_mock.return_value = True
         shaper = TrafficShaper("eth0")
 
@@ -158,6 +164,10 @@ class TrafficShaperTests(unittest.TestCase):
                 InspectionStatus.PRESENT,
                 stdout="qdisc htb 1: root refcnt 2",
             ),
+            InspectionResult(
+                InspectionStatus.PRESENT,
+                stdout="qdisc htb 1: root refcnt 2",
+            ),
         ]
         runner_mock.side_effect = [True, True, True, False, True, True, True]
         shaper = TrafficShaper("eth0")
@@ -210,6 +220,10 @@ class TrafficShaperTests(unittest.TestCase):
                 InspectionStatus.PRESENT,
                 stdout="qdisc htb 1: root refcnt 2",
             ),
+            InspectionResult(
+                InspectionStatus.PRESENT,
+                stdout="qdisc htb 1: root refcnt 2",
+            ),
         ]
         runner_mock.side_effect = [True, True, True, False, True, True, False]
         shaper = TrafficShaper("eth0")
@@ -224,7 +238,13 @@ class TrafficShaperTests(unittest.TestCase):
     @mock.patch("netshaper.network.shaper.inspect_resource")
     def test_apply_target_journals_each_created_resource(
             self, inspect_mock, runner_mock):
-        inspect_mock.return_value = InspectionResult(InspectionStatus.ABSENT)
+        inspect_mock.side_effect = [
+            InspectionResult(InspectionStatus.ABSENT),
+            InspectionResult(
+                InspectionStatus.PRESENT,
+                stdout="qdisc htb 1: root refcnt 2",
+            ),
+        ]
         runner_mock.return_value = True
         journal = mock.Mock(return_value=True)
         shaper = TrafficShaper("eth0")
@@ -235,7 +255,7 @@ class TrafficShaperTests(unittest.TestCase):
             journal=journal,
         )
 
-        self.assertEqual(journal.call_count, 7)
+        self.assertEqual(journal.call_count, 8)
 
     @mock.patch("netshaper.network.shaper.SubprocessRunner.run")
     def test_cleanup_target_removes_protocol_specific_filters(self, runner_mock):

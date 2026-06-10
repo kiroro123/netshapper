@@ -18,6 +18,7 @@ class TrafficShaper:
     def __init__(self, interface: str):
         self.interface         = interface
         self._base_initialized = False
+        self._root_qdisc_pending = False
         self._active_marks: Set[int] = set()
         self._target_filters: Set[Tuple[int, str]] = set()
         self._target_classes: Set[int] = set()
@@ -68,10 +69,20 @@ class TrafficShaper:
 
     def _clear_root_ownership(self) -> None:
         self._base_initialized = False
+        self._root_qdisc_pending = False
         self._active_marks.clear()
         self._target_filters.clear()
         self._target_classes.clear()
         self._tracked_mark_bases.clear()
+
+    def _journal_pending_root(
+            self,
+            journal: Optional[Callable[[], bool]]) -> bool:
+        self._root_qdisc_pending = True
+        if self._journal_resource(journal):
+            return True
+        self._root_qdisc_pending = False
+        return False
 
     def _init_root(self, journal: Optional[Callable[[], bool]] = None) -> None:
         if not self._base_initialized:
@@ -81,13 +92,30 @@ class TrafficShaper:
                     "Refusing to replace existing root qdisc on "
                     f"{self.interface}: {root_qdisc}"
                 )
+            if not self._journal_pending_root(journal):
+                raise RuntimeError(
+                    "Failed to journal pending NetShaper root qdisc on "
+                    f"{self.interface}"
+                )
             if not SubprocessRunner.run(
                 ["tc", "qdisc", "add", "dev", self.interface,
                  "root", "handle", "1:", "htb"]):
+                self._root_qdisc_pending = False
                 raise RuntimeError(
                     f"Failed to create NetShaper root qdisc on {self.interface}"
                 )
+            root_status = self._owned_root_qdisc_status()
+            if root_status.status is not InspectionStatus.PRESENT:
+                self._root_qdisc_pending = False
+                detail = root_status.stderr.strip() or root_status.stdout.strip()
+                message = (
+                    f"Could not verify NetShaper root qdisc on {self.interface}"
+                )
+                if detail:
+                    message += f": {detail}"
+                raise RuntimeError(message)
             self._base_initialized = True
+            self._root_qdisc_pending = False
             if not self._journal_resource(journal):
                 self.cleanup()
                 raise RuntimeError(

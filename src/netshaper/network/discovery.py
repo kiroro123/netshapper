@@ -11,8 +11,8 @@ import subprocess
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from ipaddress import IPv4Network, ip_address
-from typing import Dict, List, Optional
+from ipaddress import IPv4Address, IPv4Network, ip_address, summarize_address_range
+from typing import Dict, List, Optional, Sequence
 
 import psutil
 
@@ -186,19 +186,81 @@ class NetworkDiscovery:
             for idx in range(0, len(targets), batch_size)
         ]
 
+    @staticmethod
+    def _ipv4_scope_networks(
+            connected_subnet: IPv4Network,
+            authorized_cidrs: Optional[Sequence]) -> List[IPv4Network]:
+        if not authorized_cidrs:
+            return [connected_subnet]
+
+        scoped_networks: List[IPv4Network] = []
+        for network in authorized_cidrs:
+            if getattr(network, "version", None) != 4:
+                continue
+            if not connected_subnet.overlaps(network):
+                continue
+            start = max(
+                int(connected_subnet.network_address),
+                int(network.network_address),
+            )
+            end = min(
+                int(connected_subnet.broadcast_address),
+                int(network.broadcast_address),
+            )
+            scoped_networks.extend(
+                summarize_address_range(IPv4Address(start), IPv4Address(end))
+            )
+
+        unique = {
+            str(network): network
+            for network in scoped_networks
+        }
+        return sorted(
+            unique.values(),
+            key=lambda network: (
+                int(network.network_address),
+                network.prefixlen,
+            ),
+        )
+
+    @staticmethod
+    def _targets_from_scopes(
+            scope_networks: Sequence[IPv4Network],
+            gateway_ip: Optional[str]) -> List[str]:
+        targets: List[str] = []
+        seen = set()
+        for network in scope_networks:
+            for ip in network.hosts():
+                candidate = str(ip)
+                if candidate == gateway_ip or candidate in seen:
+                    continue
+                seen.add(candidate)
+                targets.append(candidate)
+        return targets
+
+    @staticmethod
+    def _ip_in_scopes(ip: str, scope_networks: Sequence[IPv4Network]) -> bool:
+        try:
+            parsed = ip_address(ip)
+        except ValueError:
+            return False
+        return (
+            parsed.version == 4
+            and any(parsed in network for network in scope_networks)
+        )
+
     def _remember_device(
             self,
             ip: str,
             mac: str,
             gateway_ip: Optional[str] = None,
-            subnet: Optional[IPv4Network] = None) -> None:
+            subnet: Optional[IPv4Network] = None,
+            scope_networks: Optional[Sequence[IPv4Network]] = None) -> None:
         if not ip or ip == gateway_ip:
             return
-        if subnet is not None:
-            try:
-                if ip_address(ip) not in subnet:
-                    return
-            except ValueError:
+        scopes = list(scope_networks or ([] if subnet is None else [subnet]))
+        if scopes:
+            if not self._ip_in_scopes(ip, scopes):
                 return
         mac = (mac or "").lower()
         if not self._valid_mac(mac):
@@ -214,7 +276,9 @@ class NetworkDiscovery:
     def _merge_proc_arp_cache(
             self,
             subnet: IPv4Network,
-            gateway_ip: Optional[str]) -> None:
+            gateway_ip: Optional[str],
+            scope_networks: Optional[Sequence[IPv4Network]] = None) -> None:
+        scopes = scope_networks or [subnet]
         try:
             with open("/proc/net/arp", encoding="utf-8") as fh:
                 for raw_line in fh.readlines()[1:]:
@@ -224,14 +288,21 @@ class NetworkDiscovery:
                     ip, _, _, mac, _, device = parts[:6]
                     if device != self.interface:
                         continue
-                    self._remember_device(ip, mac, gateway_ip, subnet)
+                    self._remember_device(
+                        ip,
+                        mac,
+                        gateway_ip,
+                        scope_networks=scopes,
+                    )
         except OSError:
             pass
 
     def _merge_ip_neighbor_cache(
             self,
             subnet: IPv4Network,
-            gateway_ip: Optional[str]) -> None:
+            gateway_ip: Optional[str],
+            scope_networks: Optional[Sequence[IPv4Network]] = None) -> None:
+        scopes = scope_networks or [subnet]
         try:
             result = subprocess.run(
                 ["ip", "-4", "neigh", "show", "dev", self.interface],
@@ -254,17 +325,28 @@ class NetworkDiscovery:
             mac_index = parts.index("lladdr") + 1
             if mac_index >= len(parts):
                 continue
-            self._remember_device(ip, parts[mac_index], gateway_ip, subnet)
+            self._remember_device(
+                ip,
+                parts[mac_index],
+                gateway_ip,
+                scope_networks=scopes,
+            )
 
     def _merge_neighbor_caches(
             self,
             subnet: IPv4Network,
-            gateway_ip: Optional[str]) -> int:
-        self._merge_proc_arp_cache(subnet, gateway_ip)
-        self._merge_ip_neighbor_cache(subnet, gateway_ip)
+            gateway_ip: Optional[str],
+            scope_networks: Optional[Sequence[IPv4Network]] = None) -> int:
+        scopes = scope_networks or [subnet]
+        self._merge_proc_arp_cache(subnet, gateway_ip, scopes)
+        self._merge_ip_neighbor_cache(subnet, gateway_ip, scopes)
         return self._device_count()
 
-    def _passive_sniff_callback(self, pkt) -> None:
+    def _passive_sniff_callback(
+            self,
+            pkt,
+            gateway_ip: Optional[str] = None,
+            scope_networks: Optional[Sequence[IPv4Network]] = None) -> None:
         """
         ARP passive-sniff callback — thread-safe write to devices_dict.
 
@@ -277,19 +359,34 @@ class NetworkDiscovery:
             return
         src_ip  = pkt[ARP].psrc
         src_mac = pkt[Ether].src.lower()
-        self._remember_device(src_ip, src_mac)
+        self._remember_device(
+            src_ip,
+            src_mac,
+            gateway_ip,
+            scope_networks=scope_networks,
+        )
 
-    def arp_sweep(self, subnet: str, gateway_ip: str) -> List[Device]:
+    def arp_sweep(
+            self,
+            subnet: str,
+            gateway_ip: str,
+            authorized_cidrs: Optional[Sequence] = None) -> List[Device]:
         log.info(f"ARP sweep on {subnet}")
+        scope_networks: List[IPv4Network] = []
         try:
             _ensure_scapy_layers()
-            net     = IPv4Network(subnet, strict=False)
-            targets = [str(ip) for ip in net.hosts()
-                       if str(ip) != gateway_ip]
+            net = IPv4Network(subnet, strict=False)
+            scope_networks = self._ipv4_scope_networks(net, authorized_cidrs)
+            targets = self._targets_from_scopes(scope_networks, gateway_ip)
             if not targets:
+                print_flush("  No authorized IPv4 probe targets in interface subnet.")
                 return []
 
-            cached_count = self._merge_neighbor_caches(net, gateway_ip)
+            cached_count = self._merge_neighbor_caches(
+                net,
+                gateway_ip,
+                scope_networks,
+            )
             if cached_count:
                 print_flush(f"  Cached neighbors: {cached_count} devices")
 
@@ -317,17 +414,21 @@ class NetworkDiscovery:
                             rcv[ARP].psrc,
                             rcv[Ether].src,
                             gateway_ip,
-                            net,
+                            scope_networks=scope_networks,
                         )
             print_flush()
-            self._merge_neighbor_caches(net, gateway_ip)
+            self._merge_neighbor_caches(net, gateway_ip, scope_networks)
 
             # Passive ARP sniff for 15 s to catch quiet devices
             stop_sniff = threading.Event()
             t = threading.Thread(
                 target=lambda: sniff(
                     iface=self.interface, filter="arp",
-                    prn=self._passive_sniff_callback,
+                    prn=lambda pkt: self._passive_sniff_callback(
+                        pkt,
+                        gateway_ip,
+                        scope_networks,
+                    ),
                     stop_filter=lambda _: stop_sniff.is_set(),
                     store=False, timeout=15),
                 daemon=True)
@@ -348,7 +449,11 @@ class NetworkDiscovery:
             log.error(f"ARP sweep failed: {e}")
 
         with self.lock:
-            devices = list(self.devices_dict.values())
+            devices = [
+                device for device in self.devices_dict.values()
+                if not scope_networks
+                or self._ip_in_scopes(device.ip, scope_networks)
+            ]
         return sorted(devices,
                       key=lambda d: [int(i) for i in d.ip.split(".")])
 

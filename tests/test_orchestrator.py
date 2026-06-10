@@ -51,7 +51,7 @@ class NetShaperCleanupTests(unittest.TestCase):
         ns._remove_global_rules.assert_called_once()
         restore_mock.assert_called_once_with(
             ns.state_snapshot,
-            restore_firewall=True,
+            restore_firewall=False,
         )
         ns.shaper.cleanup.assert_called_once()
         self.assertFalse(ns._cleanup_complete)
@@ -519,7 +519,57 @@ class NetShaperCleanupTests(unittest.TestCase):
             )
             restore_mock.assert_called_once_with(
                 mock.ANY,
-                restore_firewall=True,
+                restore_firewall=False,
+            )
+            self.assertFalse(os.path.exists(state_path))
+
+    def test_stale_cleanup_removes_pending_tc_root_qdisc(self):
+        ns = NetShaper.__new__(NetShaper)
+        snapshot = {
+            "session_id": "NS-OLD",
+            "interface": "eth0",
+            "ipv4_forwarding": None,
+            "ipv6_forwarding": None,
+            "route_localnet": None,
+            "iptables_rules": "",
+            "ip6tables_rules": "",
+            "tc_configuration": "",
+        }
+        state = {
+            "session_id": "NS-OLD",
+            "interface": "eth0",
+            "targets": [],
+            "global_rules_applied": False,
+            "shaper_base_initialized": False,
+            "shaper_root_qdisc_pending": True,
+            "snapshot": snapshot,
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = os.path.join(tmp, "NS-OLD")
+            os.makedirs(state_dir)
+            state_path = os.path.join(state_dir, "state.json")
+            with open(state_path, "w", encoding="utf-8") as fh:
+                json.dump(state, fh)
+
+            with mock.patch("netshaper.core.orchestrator.config.STATE_DIR", tmp), \
+                 mock.patch("netshaper.core.orchestrator.print_flush"), \
+                 mock.patch("netshaper.core.orchestrator.subprocess.run",
+                            return_value=mock.Mock(
+                                returncode=0,
+                                stdout="qdisc htb 1: root refcnt 2\n",
+                            )), \
+                 mock.patch("netshaper.core.orchestrator.SubprocessRunner.run",
+                            return_value=True) as runner_mock, \
+                 mock.patch("netshaper.core.orchestrator.StateSnapshotManager.restore",
+                            return_value=True):
+                result = ns.load_state_and_cleanup()
+
+            self.assertTrue(result)
+            runner_mock.assert_any_call(
+                ["tc", "qdisc", "del", "dev", "eth0", "root"],
+                check=False,
+                silent=True,
             )
             self.assertFalse(os.path.exists(state_path))
 

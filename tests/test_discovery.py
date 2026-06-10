@@ -1,6 +1,6 @@
 import tempfile
 import unittest
-from ipaddress import IPv4Network
+from ipaddress import IPv4Network, ip_network
 from unittest import mock
 
 from netshaper.models import Device
@@ -79,7 +79,7 @@ class DiscoveryHostnameTests(unittest.TestCase):
             def __contains__(self, _item):
                 return False
 
-        def seed_cache(_subnet, _gateway_ip):
+        def seed_cache(_subnet, _gateway_ip, _scope_networks=None):
             for idx in range(20, 36):
                 disc._remember_device(
                     f"192.0.2.{idx}",
@@ -101,6 +101,59 @@ class DiscoveryHostnameTests(unittest.TestCase):
 
         self.assertEqual(len(devices), 16)
         self.assertEqual(srp_mock.call_count, 8)
+
+    def test_arp_sweep_limits_active_targets_to_authorized_scope(self):
+        disc = NetworkDiscovery("eth0")
+
+        class FakeLayer:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def __truediv__(self, _other):
+                return self
+
+            def __contains__(self, _item):
+                return False
+
+        with mock.patch("netshaper.network.discovery._ensure_scapy_layers"), \
+             mock.patch.object(disc, "_merge_neighbor_caches",
+                               return_value=0), \
+             mock.patch.object(disc, "_target_batches",
+                               wraps=disc._target_batches) as batches_mock, \
+             mock.patch("netshaper.network.discovery.Ether", FakeLayer), \
+             mock.patch("netshaper.network.discovery.ARP", FakeLayer), \
+             mock.patch("netshaper.network.discovery.srp",
+                        return_value=([], None)), \
+             mock.patch("netshaper.network.discovery.sniff"), \
+             mock.patch("netshaper.network.discovery.time.sleep"), \
+             mock.patch("netshaper.network.discovery.print_flush"):
+            disc.arp_sweep(
+                "192.0.2.0/24",
+                "192.0.2.1",
+                [ip_network("192.0.2.64/28")],
+            )
+
+        targets = batches_mock.call_args.args[0]
+        self.assertEqual(targets[0], "192.0.2.65")
+        self.assertEqual(targets[-1], "192.0.2.78")
+        self.assertEqual(len(targets), 14)
+
+    def test_authorized_scope_filters_neighbor_cache_entries(self):
+        arp_table = (
+            "IP address       HW type     Flags       HW address            Mask     Device\n"
+            "192.0.2.65       0x1         0x2         aa:bb:cc:dd:ee:65   *        eth0\n"
+            "192.0.2.20       0x1         0x2         aa:bb:cc:dd:ee:20   *        eth0\n"
+        )
+        disc = NetworkDiscovery("eth0")
+
+        with mock.patch("builtins.open", mock.mock_open(read_data=arp_table)):
+            disc._merge_proc_arp_cache(
+                IPv4Network("192.0.2.0/24"),
+                "192.0.2.1",
+                [IPv4Network("192.0.2.64/28")],
+            )
+
+        self.assertEqual(list(disc.devices_dict), ["192.0.2.65"])
 
     def test_default_gateway_uses_selected_interface_and_lowest_metric(self):
         route_table = (

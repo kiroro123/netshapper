@@ -567,7 +567,7 @@ class NetShaper:
         return ok
 
     # ── Discovery ─────────────────────────────────────────────────────────────
-    def discover(self) -> List[Device]:
+    def discover(self, authorized_cidrs: Optional[List] = None) -> List[Device]:
         import sys
         if config.DRY_RUN:
             print_flush("[DRY-RUN] Device discovery skipped")
@@ -575,7 +575,7 @@ class NetShaper:
         subnet = self.disc.get_subnet_v4()
         if not subnet:
             sys.exit("[NetShaper] Could not determine subnet.")
-        devices = self.disc.arp_sweep(subnet, self.gw)
+        devices = self.disc.arp_sweep(subnet, self.gw, authorized_cidrs)
         self.disc.resolve_hostnames(devices)
         return devices
 
@@ -738,7 +738,7 @@ class NetShaper:
                 lambda: (
                     StateSnapshotManager.restore(
                         self.state_snapshot,
-                        restore_firewall=True,
+                        restore_firewall=False,
                     )
                     or (_ for _ in ()).throw(RuntimeError("state snapshot restore failed"))
                 ),
@@ -954,6 +954,8 @@ class NetShaper:
                 getattr(self, "_global_rules_created", [])),
             "shaper_base_initialized": getattr(
                 getattr(self, "shaper", None), "_base_initialized", False),
+            "shaper_root_qdisc_pending": getattr(
+                getattr(self, "shaper", None), "_root_qdisc_pending", False),
             "owner": getattr(self, "_owner_metadata", {}),
             "snapshot": self._snapshot_to_dict(self.state_snapshot),
         }
@@ -1171,7 +1173,9 @@ class NetShaper:
                                 [binary, "-t", table, "-L", chain_name],
                             )
 
-                if data.get("shaper_base_initialized"):
+                if (
+                        data.get("shaper_base_initialized")
+                        or data.get("shaper_root_qdisc_pending")):
                     if require_binary("tc", "traffic shaper"):
                         run_recovery_if_present(
                             "tc root qdisc",
@@ -1183,7 +1187,7 @@ class NetShaper:
                 snapshot = self._snapshot_from_state(data)
                 cleanup_ok = StateSnapshotManager.restore(
                     snapshot,
-                    restore_firewall=True,
+                    restore_firewall=False,
                 ) and cleanup_ok
                 if cleanup_ok:
                     log.info("Stale rules cleaned.")

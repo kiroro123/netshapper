@@ -59,6 +59,7 @@ class StateSnapshotTests(unittest.TestCase):
             self.assertIsNone(data["global_rule_comment"])
             self.assertEqual(data["global_rules_created"], [])
             self.assertFalse(data["shaper_base_initialized"])
+            self.assertFalse(data["shaper_root_qdisc_pending"])
             self.assertEqual(data["snapshot"]["route_localnet"], 0)
             self.assertEqual(
                 data["targets"][0]["mangle_chain"], "NS-MNG-TEST")

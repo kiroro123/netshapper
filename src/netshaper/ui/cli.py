@@ -472,7 +472,7 @@ def main() -> None:
                 sys.exit(f"[NetShaper] {exc}")
             print_flush(f"  Targets from --targets: {', '.join(targets)}")
         else:
-            devices = ns.discover()
+            devices = ns.discover(authorized_cidrs)
             selected_targets = pick_targets_ui(devices)
             try:
                 targets = validate_targets(
@@ -540,28 +540,24 @@ def main() -> None:
         if dns_spoof_on and not check_local_port(ns.own_ip, 53, socket.SOCK_DGRAM):
             print_flush("  [!] Fake DNS (port 53) not reachable.")
             print_flush("      sudo netshaper-fake-server")
-            if safe_input("  Continue anyway? (y/n): ").lower() != "y":
-                sys.exit(0)
+            sys.exit("[NetShaper] DNS spoofing requires reachable fake DNS.")
 
         if http_redirect_port == 80 and not check_local_port(ns.own_ip, 80):
             print_flush("  [!] Fake HTTP (port 80) not reachable.")
             print_flush("      sudo netshaper-fake-server")
-            if safe_input("  Continue anyway? (y/n): ").lower() != "y":
-                sys.exit(0)
+            sys.exit("[NetShaper] Captive portal requires reachable fake HTTP.")
 
         if http_redirect_port == 8088 and not check_local_port(ns.own_ip, 8088):
             print_flush("  [!] mitmproxy (port 8088) not reachable.")
             if safe_input("  Auto-launch mitmproxy? (y/n): ").lower() == "y":
                 if not ns.launch_mitmproxy(port=8088, web_port=8083):
-                    if safe_input("  Continue without mitmproxy? (y/n): ").lower() != "y":
-                        sys.exit(0)
+                    sys.exit("[NetShaper] mitmproxy did not become reachable.")
             else:
                 print_flush(
                     "      mitmweb --mode transparent --listen-port 8088 "
                     "--set web_port=8083"
                 )
-                if safe_input("  Continue anyway? (y/n): ").lower() != "y":
-                    sys.exit(0)
+                sys.exit("[NetShaper] mitmproxy is required for HTTPS inspection.")
 
         W = 58
         def _yn(flag: bool) -> str:
