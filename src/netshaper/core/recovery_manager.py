@@ -1,0 +1,519 @@
+"""
+NetShaper — Stale session recovery and cleanup.
+
+Handles detection and cleanup of abandoned sessions from crashed/orphaned processes.
+Independently auditable for safety-critical rollback operations.
+"""
+from __future__ import annotations
+
+import json
+import logging
+import os
+import shutil
+import subprocess
+from typing import Callable, List, Optional
+
+from netshaper import config
+from netshaper.core.state_manager import NetworkStateSnapshot, StateSnapshotManager
+from netshaper.system import InspectionStatus, SubprocessRunner, inspect_resource
+
+log = logging.getLogger("netshaper")
+
+
+class RecoveryError(RuntimeError):
+    """Raised when recovery operations fail."""
+    pass
+
+
+class RecoveryManager:
+    """
+    Detects stale sessions (from crashed processes) and cleans up their rules.
+    Handles iptables, firewall, traffic shaper, and sysctl restoration.
+    """
+
+    def __init__(self, interface: str):
+        """
+        Initialize recovery manager for an interface.
+        
+        Args:
+            interface: Network interface name
+        """
+        self.interface = interface
+
+    @staticmethod
+    def _process_start_time(pid: int) -> Optional[str]:
+        """Get process start time from /proc/pid/stat."""
+        try:
+            with open(f"/proc/{pid}/stat", encoding="utf-8") as fh:
+                return fh.read().split()[21]
+        except Exception:
+            return None
+
+    @staticmethod
+    def _process_is_live(
+        pid: Optional[int],
+        start_time: Optional[str],
+    ) -> bool:
+        """Check if a process is still running with the same start time."""
+        if not pid or not start_time:
+            return False
+        current_start = RecoveryManager._process_start_time(pid)
+        return current_start == str(start_time)
+
+    @staticmethod
+    def _inspect_stale_resource(
+        command: List[str],
+        *,
+        output_contains: Optional[str] = None,
+    ) -> InspectionStatus:
+        """Check if a stale firewall resource exists."""
+        inspection = inspect_resource(command)
+        if inspection.status is not InspectionStatus.PRESENT:
+            return inspection.status
+        if (
+            output_contains is not None
+            and output_contains not in inspection.stdout
+        ):
+            return InspectionStatus.ABSENT
+        return InspectionStatus.PRESENT
+
+    @staticmethod
+    def _target_input_rule_spec(
+        binary: str,
+        iface: str,
+        ip: str,
+        proto: str,
+        port: int,
+        comment: Optional[str],
+    ) -> dict:
+        """Generate rule specification for per-target INPUT rules."""
+        comment_args = (
+            ["-m", "comment", "--comment", comment] if comment else []
+        )
+        base = [
+            "-i",
+            iface,
+            "-s",
+            ip,
+            "-p",
+            proto,
+            "--dport",
+            str(port),
+            *comment_args,
+            "-j",
+            "ACCEPT",
+        ]
+        return {
+            "delete": [binary, "-D", "INPUT", *base],
+            "check": [binary, "-C", "INPUT", *base],
+        }
+
+    @staticmethod
+    def _global_firewall_rule_specs(
+        binary: str,
+        iface: str,
+        comment: Optional[str],
+    ) -> List[dict]:
+        """Generate global firewall rule specs for stale cleanup."""
+        comment_args = (
+            ["-m", "comment", "--comment", comment] if comment else []
+        )
+        return [
+            {
+                "description": f"{binary} forward same-interface accept",
+                "delete": [
+                    binary,
+                    "-D",
+                    "FORWARD",
+                    "-i",
+                    iface,
+                    "-o",
+                    iface,
+                    *comment_args,
+                    "-j",
+                    "ACCEPT",
+                ],
+                "check": [
+                    binary,
+                    "-C",
+                    "FORWARD",
+                    "-i",
+                    iface,
+                    "-o",
+                    iface,
+                    *comment_args,
+                    "-j",
+                    "ACCEPT",
+                ],
+            },
+            {
+                "description": f"{binary} established forward accept",
+                "delete": [
+                    binary,
+                    "-D",
+                    "FORWARD",
+                    "-m",
+                    "state",
+                    "--state",
+                    "ESTABLISHED,RELATED",
+                    *comment_args,
+                    "-j",
+                    "ACCEPT",
+                ],
+                "check": [
+                    binary,
+                    "-C",
+                    "FORWARD",
+                    "-m",
+                    "state",
+                    "--state",
+                    "ESTABLISHED,RELATED",
+                    *comment_args,
+                    "-j",
+                    "ACCEPT",
+                ],
+            },
+            {
+                "description": f"{binary} masquerade",
+                "delete": [
+                    binary,
+                    "-t",
+                    "nat",
+                    "-D",
+                    "POSTROUTING",
+                    "-o",
+                    iface,
+                    *comment_args,
+                    "-j",
+                    "MASQUERADE",
+                ],
+                "check": [
+                    binary,
+                    "-t",
+                    "nat",
+                    "-C",
+                    "POSTROUTING",
+                    "-o",
+                    iface,
+                    *comment_args,
+                    "-j",
+                    "MASQUERADE",
+                ],
+            },
+        ]
+
+    def recover_stale_state(self) -> bool:
+        """
+        Scan for stale sessions and clean them up.
+        
+        Returns:
+            True if all recoveries succeeded, False if any failed
+        """
+        if not os.path.isdir(config.STATE_DIR):
+            return True
+
+        recovery_ok = True
+        recovery_attempted = False
+
+        import glob
+
+        for state_path in sorted(
+            glob.glob(os.path.join(config.STATE_DIR, "*", "state.json"))
+        ):
+            cleanup_ok = self._cleanup_stale_session(state_path)
+            if not cleanup_ok:
+                recovery_ok = False
+            else:
+                recovery_attempted = True
+
+        return recovery_ok
+
+    def _cleanup_stale_session(self, state_path: str) -> bool:
+        """Clean up a single stale session file."""
+        cleanup_ok = True
+        try:
+            with open(state_path, encoding="utf-8") as f:
+                data = json.load(f)
+
+            iface = data.get("interface")
+            if not iface:
+                return True
+
+            owner = data.get("owner") or {}
+            if self._process_is_live(
+                owner.get("pid"), owner.get("process_start_time")
+            ):
+                log.info(f"Skipping live NetShaper session: {state_path}")
+                return False
+
+            log.info(f"[Recovery] Cleaning stale session on {iface}…")
+
+            # Clean global rules
+            cleanup_ok = self._cleanup_global_rules(data, iface) and cleanup_ok
+
+            # Clean per-target rules
+            cleanup_ok = self._cleanup_target_rules(data, iface) and cleanup_ok
+
+            # Clean traffic shaper
+            cleanup_ok = self._cleanup_traffic_shaper(data, iface) and cleanup_ok
+
+            # Restore sysctl settings
+            cleanup_ok = self._restore_sysctl_settings(data) and cleanup_ok
+
+            if cleanup_ok:
+                log.info("[Recovery] Stale rules cleaned")
+                os.remove(state_path)
+                try:
+                    os.rmdir(os.path.dirname(state_path))
+                except OSError:
+                    pass
+            else:
+                log.error(f"[Recovery] Leaving recovery state in place: {state_path}")
+
+        except Exception as exc:
+            cleanup_ok = False
+            log.error(f"[Recovery] Could not recover state file {state_path}: {exc}")
+
+        return cleanup_ok
+
+    def _cleanup_global_rules(self, data: dict, iface: str) -> bool:
+        """Clean global firewall rules from stale session."""
+        cleanup_ok = True
+
+        if not data.get("global_rules_applied"):
+            return True
+
+        binaries = data.get("global_firewall_binaries") or []
+        if not binaries:
+            binaries = [
+                binary
+                for binary in ["iptables", "ip6tables"]
+                if shutil.which(binary)
+            ]
+
+        comment = data.get("global_rule_comment")
+        rule_records = data.get("global_rules_created") or []
+
+        if not rule_records:
+            for binary in binaries:
+                for spec in self._global_firewall_rule_specs(binary, iface, comment):
+                    rule_records.append(
+                        {
+                            "binary": binary,
+                            "description": spec["description"],
+                            "delete": spec["delete"],
+                            "check": spec["check"],
+                        }
+                    )
+
+        for record in rule_records:
+            binary = record.get("binary")
+            if not binary or not shutil.which(binary):
+                if binary and binary not in binaries:
+                    log.error(f"[Recovery] {binary} unavailable for global rules")
+                    cleanup_ok = False
+                continue
+
+            status = self._inspect_stale_resource(record["check"])
+            if status is InspectionStatus.ABSENT:
+                log.info(
+                    f"[Recovery] Skipped {record['description']} (already absent)"
+                )
+            elif status is InspectionStatus.ERROR:
+                cleanup_ok = False
+                log.error(
+                    f"[Recovery] Cannot inspect {record['description']}"
+                )
+            else:
+                if SubprocessRunner.run(record["delete"], check=False, silent=True):
+                    log.info(f"[Recovery] Removed {record['description']}")
+                else:
+                    cleanup_ok = False
+                    log.error(f"[Recovery] Failed to remove {record['description']}")
+
+        return cleanup_ok
+
+    def _cleanup_target_rules(self, data: dict, iface: str) -> bool:
+        """Clean per-target firewall rules from stale session."""
+        cleanup_ok = True
+
+        for target in data.get("targets", []):
+            ip = target.get("ip")
+            if not ip:
+                continue
+
+            binaries = ["ip6tables"] if ":" in ip else ["iptables"]
+            suffix = ip.replace(".", "_").replace(":", "_")
+            chain_specs = [
+                ("mangle", "POSTROUTING", target.get("mangle_chain") or f"NS-MNG-{suffix}"),
+                ("nat", "PREROUTING", target.get("nat_chain") or f"NS-NAT-{suffix}"),
+            ]
+
+            for binary in binaries:
+                if not shutil.which(binary):
+                    log.error(f"[Recovery] {binary} unavailable for target {ip}")
+                    cleanup_ok = False
+                    continue
+
+                # Clean INPUT rules for DNS/HTTP
+                if target.get("dns"):
+                    rule_comment = target.get("firewall_rule_comment")
+                    for proto in ["udp", "tcp"]:
+                        rule_spec = self._target_input_rule_spec(
+                            binary, iface, ip, proto, 53, rule_comment
+                        )
+                        if SubprocessRunner.run(
+                            rule_spec["delete"], check=False, silent=True
+                        ):
+                            log.info(
+                                f"[Recovery] Removed {binary} DNS INPUT {ip}/{proto}"
+                            )
+
+                http_port = target.get("http_redirect_port")
+                if http_port:
+                    rule_comment = target.get("firewall_rule_comment")
+                    rule_spec = self._target_input_rule_spec(
+                        binary, iface, ip, "tcp", int(http_port), rule_comment
+                    )
+                    if SubprocessRunner.run(
+                        rule_spec["delete"], check=False, silent=True
+                    ):
+                        log.info(f"[Recovery] Removed {binary} HTTP INPUT {ip}")
+
+                # Clean mangle/nat chains
+                for table, hook, chain_name in chain_specs:
+                    cleanup_ok = self._cleanup_target_chain(
+                        binary, table, hook, chain_name
+                    ) and cleanup_ok
+
+        return cleanup_ok
+
+    def _cleanup_target_chain(
+        self,
+        binary: str,
+        table: str,
+        hook: str,
+        chain_name: str,
+    ) -> bool:
+        """Clean a single target firewall chain."""
+        cleanup_ok = True
+
+        # Check chain existence
+        _cst = self._inspect_stale_resource(
+            [binary, "-t", table, "-L", chain_name]
+        )
+        if _cst is InspectionStatus.ABSENT:
+            log.debug(f"[Recovery] Chain {chain_name} already absent")
+            return True
+
+        if _cst is InspectionStatus.ERROR:
+            cleanup_ok = False
+            log.error(f"[Recovery] Cannot inspect chain {chain_name}")
+            return cleanup_ok
+
+        # Check jump rule
+        _jst = self._inspect_stale_resource(
+            [binary, "-t", table, "-C", hook, "-j", chain_name]
+        )
+        if _jst is InspectionStatus.PRESENT:
+            if SubprocessRunner.run(
+                [binary, "-t", table, "-D", hook, "-j", chain_name],
+                check=False,
+                silent=True,
+            ):
+                log.info(f"[Recovery] Unlinked {chain_name} from {hook}")
+            else:
+                cleanup_ok = False
+
+        # Flush chain
+        if SubprocessRunner.run(
+            [binary, "-t", table, "-F", chain_name], check=False, silent=True
+        ):
+            log.info(f"[Recovery] Flushed {chain_name}")
+        else:
+            cleanup_ok = False
+
+        # Delete chain
+        if SubprocessRunner.run(
+            [binary, "-t", table, "-X", chain_name], check=False, silent=True
+        ):
+            log.info(f"[Recovery] Deleted {chain_name}")
+        else:
+            cleanup_ok = False
+
+        return cleanup_ok
+
+    def _cleanup_traffic_shaper(self, data: dict, iface: str) -> bool:
+        """Clean traffic shaper (tc) rules from stale session."""
+        cleanup_ok = True
+
+        if not (data.get("shaper_base_initialized") or data.get("shaper_root_qdisc_pending")):
+            return True
+
+        if not shutil.which("tc"):
+            log.error("[Recovery] tc (traffic control) unavailable")
+            return False
+
+        status = self._inspect_stale_resource(
+            ["tc", "qdisc", "show", "dev", iface, "root"],
+            output_contains="qdisc htb 1:",
+        )
+
+        if status is InspectionStatus.ABSENT:
+            log.debug("[Recovery] Traffic shaper already removed")
+            return True
+
+        if status is InspectionStatus.ERROR:
+            cleanup_ok = False
+            log.error("[Recovery] Cannot inspect traffic shaper")
+            return cleanup_ok
+
+        if SubprocessRunner.run(
+            ["tc", "qdisc", "del", "dev", iface, "root"], check=False, silent=True
+        ):
+            log.info("[Recovery] Removed traffic shaper root qdisc")
+        else:
+            cleanup_ok = False
+            log.error("[Recovery] Failed to remove traffic shaper")
+
+        return cleanup_ok
+
+    def _restore_sysctl_settings(self, data: dict) -> bool:
+        """Restore sysctl settings to pre-session state."""
+        cleanup_ok = True
+
+        snapshot_data = data.get("snapshot", {})
+        snapshot = StateSnapshotManager.snapshot_from_state(snapshot_data)
+
+        if snapshot.ipv4_forwarding is not None:
+            if SubprocessRunner.run(
+                ["sysctl", "-w", f"net.ipv4.ip_forward={snapshot.ipv4_forwarding}"],
+                silent=True,
+            ):
+                log.info("[Recovery] Restored IPv4 forwarding")
+            else:
+                cleanup_ok = False
+
+        if snapshot.ipv6_forwarding is not None:
+            if SubprocessRunner.run(
+                ["sysctl", "-w", f"net.ipv6.conf.all.forwarding={snapshot.ipv6_forwarding}"],
+                silent=True,
+            ):
+                log.info("[Recovery] Restored IPv6 forwarding")
+            else:
+                cleanup_ok = False
+
+        if snapshot.route_localnet is not None:
+            if SubprocessRunner.run(
+                [
+                    "sysctl",
+                    "-w",
+                    f"net.ipv4.conf.{self.interface}.route_localnet={snapshot.route_localnet}",
+                ],
+                silent=True,
+            ):
+                log.info("[Recovery] Restored route_localnet")
+            else:
+                cleanup_ok = False
+
+        return cleanup_ok

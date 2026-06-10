@@ -26,6 +26,10 @@ import psutil
 
 from netshaper import config
 from netshaper.capture.sniffer import PacketSniffer, RollingPacketSniffer
+from netshaper.core.authorization import AuthorizationError, AuthorizationPolicy
+from netshaper.core.firewall_manager import FirewallError, FirewallManager
+from netshaper.core.mitm_manager import MitmProxyError, MitmProxyManager
+from netshaper.core.recovery_manager import RecoveryManager
 from netshaper.core.session import TargetSession
 from netshaper.core.state_manager import NetworkStateSnapshot, StateSnapshotManager
 from netshaper.models import Device, MarkIDPool
@@ -649,7 +653,8 @@ class NetShaper:
 
     # ── Discovery ─────────────────────────────────────────────────────────────
     def discover(self) -> List[Device]:
-        import sys
+        from netshaper.exceptions import DiscoveryError
+        
         authorized_cidrs = getattr(self, "authorized_cidrs", [])
         if not authorized_cidrs:
             raise ValueError("authorized_cidrs is empty; refusing discovery")
@@ -658,7 +663,7 @@ class NetShaper:
             return []
         subnet = self.disc.get_subnet_v4()
         if not subnet:
-            sys.exit("[NetShaper] Could not determine subnet.")
+            raise DiscoveryError("Could not determine subnet.")
         devices = self.disc.arp_sweep(subnet, self.gw, authorized_cidrs)
         self.disc.resolve_hostnames(devices)
         return devices

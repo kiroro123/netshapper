@@ -34,6 +34,7 @@ dev = [
 [project.scripts]
 netshaper = "netshaper.ui.cli:main"
 netshaper-fake-server = "netshaper.fake_server3:main"
+netshaper-captive-portal = "netshaper.captive_portal:main"
 
 [tool.setuptools]
 include-package-data = true
@@ -55,26 +56,32 @@ target-version = "py310"
 exclude = ["reference"]
 
 [tool.ruff.lint]
-select = ["E", "F"]
-ignore = ["E402", "E501"]
+select = ["E", "F", "W", "C", "B"]
+ignore = ["E402", "E501", "C901"]
 
 [tool.mypy]
 python_version = "3.10"
 ignore_missing_imports = true
 follow_imports = "silent"
 files = [
-  "src/netshaper/core/state_manager.py",
-  "src/netshaper/models.py",
-  "src/netshaper/network/backends.py",
+  "src/netshaper/",
 ]
+exclude = ["src/netshaper/fake_server3.py"]
 
 [tool.bandit]
 exclude_dirs = ["tests", "reference"]
-skips = ["B404", "B603", "B607"]
+# Note: B603/B607 (subprocess) are handled with localized # nosec annotations
 
 [tool.coverage.run]
 source = ["src/netshaper"]
 
 [tool.coverage.report]
-fail_under = 62
+fail_under = 80
 show_missing = true
+exclude_lines = [
+  "pragma: no cover",
+  "def __repr__",
+  "if __name__ == .__main__.:",
+  "raise NotImplementedError",
+  "if TYPE_CHECKING:",
+]

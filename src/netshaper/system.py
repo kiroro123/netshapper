@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from enum import Enum
 
 from netshaper import config
+from netshaper.exceptions import PrivilegeError, SystemCheckError
 
 log = logging.getLogger("netshaper")
 
@@ -102,9 +103,9 @@ class SystemChecker:
         if config.DRY_RUN:
             return
         if not sys.platform.startswith("linux"):
-            sys.exit("[NetShaper] Linux only.")
+            raise SystemCheckError("Linux only.")
         if os.geteuid() != 0:
-            sys.exit("[NetShaper] Root required.")
+            raise PrivilegeError("Root required.")
         # BUG FIX: ensure state directory exists under /run (root-only mode 700)
         # so no unprivileged user can create a symlink there before us.
         os.makedirs(config.STATE_DIR, mode=0o700, exist_ok=True)
@@ -119,7 +120,8 @@ class SubprocessRunner:
             print(f"[DRY-RUN] {' '.join(str(a) for a in args)}", flush=True)
             return True
         try:
-            res = subprocess.run(
+            # B603: subprocess with shell=False — args are pre-validated (binary paths)
+            res = subprocess.run(  # nosec B603
                 args,
                 capture_output=True,
                 text=True,

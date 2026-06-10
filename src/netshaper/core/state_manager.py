@@ -35,7 +35,8 @@ class StateSnapshotManager:
     @staticmethod
     def _run(args: list[str]) -> str:
         try:
-            completed = subprocess.run(args, capture_output=True, text=True, check=False)
+            # B603: subprocess with shell=False — args are ipv4/ipv6 commands with pre-validated data
+            completed = subprocess.run(args, capture_output=True, text=True, check=False)  # nosec B603
             return completed.stdout.strip() if completed.returncode == 0 else ""
         except FileNotFoundError:
             return ""
@@ -87,7 +88,8 @@ class StateSnapshotManager:
                 print(f"[DRY-RUN] {' '.join(str(a) for a in args)}", flush=True)
                 return True
             try:
-                result = subprocess.run(
+                # B603: subprocess with shell=False — firewall restore cmds internally safe
+                result = subprocess.run(  # nosec B603
                     args,
                     capture_output=True,
                     text=True,
@@ -123,7 +125,8 @@ class StateSnapshotManager:
                         print(f"[DRY-RUN] {binary}-restore < snapshot", flush=True)
                         continue
                     try:
-                        result = subprocess.run(
+                        # B603: subprocess with shell=False — restore is internally constructed
+                        result = subprocess.run(  # nosec B603
                             [f"{binary}-restore"],
                             input=rules,
                             text=True,
