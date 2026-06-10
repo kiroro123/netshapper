@@ -10,17 +10,17 @@ import json
 import logging
 import os
 import shutil
-import subprocess
-from typing import Callable, List, Optional
+from typing import List, Optional
 
 from netshaper import config
-from netshaper.core.state_manager import NetworkStateSnapshot, StateSnapshotManager
+from netshaper.core.state_manager import StateSnapshotManager
 from netshaper.system import InspectionStatus, SubprocessRunner, inspect_resource
+from netshaper.exceptions import NetShaperError
 
 log = logging.getLogger("netshaper")
 
 
-class RecoveryError(RuntimeError):
+class RecoveryError(NetShaperError):
     """Raised when recovery operations fail."""
     pass
 
@@ -34,7 +34,7 @@ class RecoveryManager:
     def __init__(self, interface: str):
         """
         Initialize recovery manager for an interface.
-        
+
         Args:
             interface: Network interface name
         """
@@ -205,7 +205,7 @@ class RecoveryManager:
     def recover_stale_state(self) -> bool:
         """
         Scan for stale sessions and clean them up.
-        
+
         Returns:
             True if all recoveries succeeded, False if any failed
         """
@@ -213,7 +213,6 @@ class RecoveryManager:
             return True
 
         recovery_ok = True
-        recovery_attempted = False
 
         import glob
 
@@ -223,8 +222,6 @@ class RecoveryManager:
             cleanup_ok = self._cleanup_stale_session(state_path)
             if not cleanup_ok:
                 recovery_ok = False
-            else:
-                recovery_attempted = True
 
         return recovery_ok
 

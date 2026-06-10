@@ -8,16 +8,15 @@ from __future__ import annotations
 
 import logging
 import shutil
-import subprocess
 from typing import List, Optional
 
-from netshaper import config
 from netshaper.system import InspectionStatus, SubprocessRunner, inspect_resource
+from netshaper.exceptions import NetShaperError
 
 log = logging.getLogger("netshaper")
 
 
-class FirewallError(RuntimeError):
+class FirewallError(NetShaperError):
     """Raised when firewall operations fail."""
     pass
 
@@ -31,7 +30,7 @@ class FirewallManager:
     def __init__(self, interface: str, session_id: str):
         """
         Initialize firewall manager for an interface.
-        
+
         Args:
             interface: Network interface name
             session_id: Session ID for rule comments

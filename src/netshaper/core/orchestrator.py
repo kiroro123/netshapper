@@ -7,15 +7,12 @@ sniffer management, and the bandwidth monitor thread.
 """
 from __future__ import annotations
 
-import glob
 import fcntl
-from ipaddress import ip_address, ip_network
+from ipaddress import ip_network
 import json
 import logging
 import os
-import shutil
 import socket
-import subprocess
 import tempfile
 import threading
 import time
@@ -27,8 +24,8 @@ import psutil
 from netshaper import config
 from netshaper.capture.sniffer import PacketSniffer, RollingPacketSniffer
 from netshaper.core.authorization import AuthorizationError, AuthorizationPolicy
-from netshaper.core.firewall_manager import FirewallError, FirewallManager
-from netshaper.core.mitm_manager import MitmProxyError, MitmProxyManager
+from netshaper.core.firewall_manager import FirewallManager
+from netshaper.core.mitm_manager import MitmProxyManager, MitmProxyError
 from netshaper.core.recovery_manager import RecoveryManager
 from netshaper.core.session import TargetSession
 from netshaper.core.state_manager import NetworkStateSnapshot, StateSnapshotManager
@@ -49,8 +46,11 @@ log = logging.getLogger("netshaper")
 
 class NetShaper:
     def __init__(self, interface: str, authorized_cidrs: Sequence):
-        self.authorized_cidrs = self._normalize_authorized_cidrs(
-            authorized_cidrs)
+        normalized = self._normalize_authorized_cidrs(authorized_cidrs)
+        # Use the immutable AuthorizationPolicy for runtime checks and
+        # expose the CIDRs as an immutable tuple for backward compatibility.
+        self._auth_policy = AuthorizationPolicy(normalized)
+        self.authorized_cidrs = self._auth_policy.cidrs
         SystemChecker.check()
         self.interface   = interface
         self.session_id  = f"NS-{uuid.uuid4().hex[:6].upper()}"
@@ -66,6 +66,11 @@ class NetShaper:
         self.gw_ipv6     = self.disc.get_default_gateway_ipv6()
         self.shaper      = TrafficShaper(interface)
         self.mark_pool   = MarkIDPool()
+        # Instantiate subsystem managers implemented in the refactor so
+        # runtime uses the auditable managers instead of the in-file copies.
+        self.firewall_manager = FirewallManager(interface, getattr(self, 'session_id', ''))
+        self.mitm_manager = MitmProxyManager(getattr(self, 'own_ip', None))
+        self.recovery_manager = RecoveryManager(interface)
         self.sessions:   Dict[str, TargetSession] = {}
         # RLock so remove_target() can be called re-entrantly from cleanup()
         self._lifecycle_lock   = threading.RLock()
@@ -121,52 +126,19 @@ class NetShaper:
         return networks
 
     def _assert_authorized_target(self, raw_ip: str) -> None:
+        # Delegate validation to the centralized AuthorizationPolicy to
+        # ensure the runtime path uses the immutable CIDR allowlist.
         try:
-            parsed = ip_address(raw_ip)
-        except ValueError as exc:
-            raise ValueError(f"invalid target IP {raw_ip!r}") from exc
-
-        if parsed.is_unspecified or parsed.is_loopback or parsed.is_multicast:
-            raise ValueError(f"refusing reserved target address: {parsed}")
-
-        local_addresses = {
-            ip_address(value)
-            for value in (
-                getattr(self, "own_ip", None),
-                getattr(self, "own_ipv6", None),
-                getattr(self, "gw", None),
-                getattr(self, "gw_ipv6", None),
+            self._auth_policy.assert_target_authorized(
+                raw_ip,
+                own_ip=getattr(self, "own_ip", None),
+                own_ipv6=getattr(self, "own_ipv6", None),
+                gateway=getattr(self, "gw", None),
+                gateway_ipv6=getattr(self, "gw_ipv6", None),
             )
-            if value
-        }
-        if parsed in local_addresses:
-            raise ValueError(f"refusing own/gateway target address: {parsed}")
-
-        authorized_cidrs = getattr(self, "authorized_cidrs", [])
-        if not authorized_cidrs:
-            raise ValueError("authorized_cidrs is empty; refusing target")
-        if not any(
-                parsed.version == network.version and parsed in network
-                for network in authorized_cidrs):
-            raise ValueError(
-                f"target {parsed} is outside authorized CIDR allowlist"
-            )
-
-        for network in authorized_cidrs:
-            if parsed.version != network.version or parsed not in network:
-                continue
-            if parsed == network.network_address and network.prefixlen < (
-                    31 if parsed.version == 4 else 127):
-                raise ValueError(
-                    f"refusing network/broadcast target address: {parsed}"
-                )
-            if (
-                    parsed.version == 4
-                    and parsed == network.broadcast_address
-                    and network.prefixlen < 31):
-                raise ValueError(
-                    f"refusing network/broadcast target address: {parsed}"
-                )
+        except AuthorizationError:
+            # Surface the typed AuthorizationError to callers.
+            raise
 
     @staticmethod
     def _process_start_time(pid: int) -> Optional[str]:
@@ -207,7 +179,7 @@ class NetShaper:
             raise RuntimeError(
                 "Another NetShaper instance is already running: "
                 f"{owner}"
-            )
+            ) from None
         self._lock_file.seek(0)
         self._lock_file.truncate()
         json.dump(self._owner_metadata, self._lock_file)
@@ -316,11 +288,11 @@ class NetShaper:
         elif expect_sniffer:
             lines.append("Packet sniffer: not started")
 
-        proc = getattr(self, "_mitm_proc", None)
-        if proc:
-            lines.append(f"mitmproxy PID: {proc.pid}")
-        if getattr(self, "_mitm_log_path", None):
-            lines.append(f"mitmproxy log: {self._mitm_log_path}")
+        mitm_mgr = getattr(self, "mitm_manager", None)
+        if mitm_mgr:
+            mitm_state = mitm_mgr.get_state_for_persistence() or {}
+            if mitm_state.get("mitm_log_path"):
+                lines.append(f"mitmproxy log: {mitm_state.get('mitm_log_path')}")
 
         errors = getattr(self, "_runtime_errors", [])
         lines.append("Runtime errors: " + ("; ".join(errors) if errors else "none"))
@@ -353,13 +325,8 @@ class NetShaper:
                     message += f": {detail}"
                 issues.append(message)
 
-        proc = getattr(self, "_mitm_proc", None)
-        if proc:
-            return_code = proc.poll()
-            if return_code is not None:
-                issues.append(
-                    f"mitmproxy exited unexpectedly with code {return_code}"
-                )
+        # mitmproxy lifecycle is managed by MitmProxyManager; rely on
+        # monitor/port checks above rather than peeking at a subprocess.
 
         if not config.DRY_RUN:
             host = getattr(self, "own_ip", None)
@@ -563,31 +530,11 @@ class NetShaper:
         return records
 
     def _apply_global_rules(self) -> None:
-        if self._global_rules_applied:
-            return
-        ok = True
-        comment = self._global_rule_comment()
-        for command in [
-                ["sysctl", "-w", "net.ipv4.ip_forward=1"],
-                ["sysctl", "-w", "net.ipv6.conf.all.forwarding=1"],
-                ["sysctl", "-w",
-                 f"net.ipv4.conf.{self.interface}.route_localnet=1"],
-        ]:
-            if SubprocessRunner.run(command, silent=True):
-                ok = self._journal_state_if_ready() and ok
-            else:
-                ok = False
-        for binary in ["iptables", "ip6tables"]:
-            if shutil.which(binary):
-                for spec in self._global_firewall_rule_specs(
-                        binary, self.interface, comment):
-                    if SubprocessRunner.run(spec["apply"], silent=True):
-                        ok = self._record_global_rule(binary, spec) and ok
-                    else:
-                        ok = False
-        if not ok:
-            raise RuntimeError("Failed to apply global forwarding rules")
-        log.info("Global dual-stack forwarding + MASQUERADE enabled")
+        # Delegate global forwarding rule application to the FirewallManager
+        try:
+            self.firewall_manager.apply_global_rules()
+        except Exception as exc:
+            raise RuntimeError("Failed to apply global forwarding rules") from exc
 
     def _restore_original_forwarding(self) -> bool:
         ok = True
@@ -612,52 +559,19 @@ class NetShaper:
         return ok
 
     def _remove_global_rules(self) -> bool:
-        ok = self._restore_original_forwarding()
-        records = self._global_rule_records_for_cleanup()
-        if not records:
-            return ok
-        for record in list(records):
-            binary = record["binary"]
-            if not shutil.which(binary):
-                if binary in self._global_firewall_binaries_applied:
-                    log.error(
-                        f"Cannot remove global firewall rules: "
-                        f"{binary} unavailable"
-                    )
-                    ok = False
-                continue
-            status = self._inspect_rule(record["check"])
-            if status is InspectionStatus.ABSENT:
-                if record in getattr(self, "_global_rules_created", []):
-                    self._global_rules_created.remove(record)
-                continue
-            if status is InspectionStatus.ERROR:
-                log.error(
-                    f"Cannot inspect global firewall rule: "
-                    f"{record['description']}"
-                )
-                ok = False
-                continue
-            if SubprocessRunner.run(
-                    record["delete"], check=False, silent=True):
-                if record in getattr(self, "_global_rules_created", []):
-                    self._global_rules_created.remove(record)
-            else:
-                ok = False
-        if ok:
-            self._global_rules_applied = False
-            self._global_firewall_binaries_applied = []
-            self._global_rules_created = []
-            log.info("Global forwarding + MASQUERADE removed")
-        return ok
+        # Delegate removal to FirewallManager (it will also restore sysctls)
+        try:
+            return self.firewall_manager.remove_global_rules()
+        except Exception:
+            return False
 
     # ── Discovery ─────────────────────────────────────────────────────────────
     def discover(self) -> List[Device]:
         from netshaper.exceptions import DiscoveryError
-        
-        authorized_cidrs = getattr(self, "authorized_cidrs", [])
-        if not authorized_cidrs:
+        # Ensure the immutable policy is present and use its CIDRs.
+        if not getattr(self, "_auth_policy", None):
             raise ValueError("authorized_cidrs is empty; refusing discovery")
+        authorized_cidrs = self._auth_policy.cidrs
         if config.DRY_RUN:
             print_flush("[DRY-RUN] Device discovery skipped")
             return []
@@ -820,7 +734,7 @@ class NetShaper:
             )
             cleanup_step(
                 "mitmproxy",
-                self._terminate_mitmproxy,
+                lambda: getattr(self, "mitm_manager", None) and self.mitm_manager.terminate(),
             )
             cleanup_step("global rules", self._remove_global_rules)
             cleanup_step(
@@ -897,66 +811,22 @@ class NetShaper:
         if check_local_port(self.own_ip, port):
             log.info(f"mitmproxy already running on :{port}")
             return True
-        log_handle = None
         try:
-            log_handle = self._open_mitmproxy_log()
-            self._mitm_proc = subprocess.Popen(
-                ["mitmweb", "--mode", "transparent",
-                 "--listen-port", str(port),
-                 "--set", f"web_port={web_port}"],
-                stdout=log_handle or subprocess.DEVNULL,
-                stderr=subprocess.STDOUT if log_handle else subprocess.DEVNULL)
-            for attempt in range(10):
-                if check_local_port(self.own_ip, port):
-                    print_flush(
-                        f"  [+] mitmproxy ready → http://127.0.0.1:{web_port}")
-                    return True
-                log.debug(f"Waiting for mitmproxy… (attempt {attempt+1}/10)")
-                time.sleep(0.5)
-            return_code = self._mitm_proc.poll()
-            if return_code is None:
-                log.error(f"mitmproxy did not bind to :{port} within 5 s")
-            else:
-                log.error(
-                    f"mitmproxy exited during startup with code {return_code}; "
-                    f"see {self._mitm_log_path or 'logs'}"
-                )
-            self._terminate_mitmproxy()
-            return False
-        except FileNotFoundError:
+            ok = self.mitm_manager.launch(port=port, web_port=web_port)
+            if ok:
+                st = self.mitm_manager.get_state_for_persistence() or {}
+                self._mitm_log_path = st.get("mitm_log_path")
+            return ok
+        except MitmProxyError:
             print_flush("  [!] mitmweb not found.  pip install mitmproxy")
-            if log_handle:
-                self._close_mitmproxy_log()
             return False
-        except Exception:
-            if log_handle:
-                self._close_mitmproxy_log()
-            raise
 
     def _terminate_mitmproxy(self) -> bool:
-        proc = getattr(self, "_mitm_proc", None)
-        if not proc:
-            return True
-        ok = True
         try:
-            if proc.poll() is None:
-                proc.terminate()
-                try:
-                    proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                    proc.wait(timeout=5)
-            if proc.poll() is None:
-                ok = False
-            else:
-                log.info("mitmproxy terminated")
-        except Exception as exc:
-            ok = False
-            log.error(f"mitmproxy cleanup failed: {exc}")
-        if ok:
-            self._mitm_proc = None
-            self._close_mitmproxy_log()
-        return ok
+            ok = getattr(self, "mitm_manager", None) and self.mitm_manager.terminate()
+            return bool(ok)
+        finally:
+            self._mitm_log_path = None
 
     def close(self) -> None:
         """Release non-network resources when a session never started."""
@@ -1023,15 +893,8 @@ class NetShaper:
                           for s in self.sessions.values()],
             "gw":     self.gw,
             "own_ip": self.own_ip,
-            "global_rules_applied": self._global_rules_applied,
-            "global_rule_comment": (
-                self._global_rule_comment()
-                if self._global_rules_applied else None
-            ),
-            "global_firewall_binaries": list(
-                getattr(self, "_global_firewall_binaries_applied", [])),
-            "global_rules_created": list(
-                getattr(self, "_global_rules_created", [])),
+            # Persist managed firewall state instead of internal copies
+            **(self.firewall_manager.get_state_for_persistence() or {}),
             "shaper_base_initialized": getattr(
                 getattr(self, "shaper", None), "_base_initialized", False),
             "shaper_root_qdisc_pending": getattr(
@@ -1056,236 +919,13 @@ class NetShaper:
             return False
 
     def load_state_and_cleanup(self) -> bool:
+        # Delegate stale session recovery to the refactored RecoveryManager
         if not os.path.isdir(config.STATE_DIR):
             return True
-        recovery_ok = True
-        recovery_attempted = False
-        for state_path in sorted(glob.glob(os.path.join(config.STATE_DIR, "*", "state.json"))):
-            cleanup_ok = True
-            try:
-                with open(state_path, encoding="utf-8") as f:
-                    data = json.load(f)
-                iface = data.get("interface")
-                if not iface:
-                    continue
-                owner = data.get("owner") or {}
-                if self._process_is_live(
-                        owner.get("pid"), owner.get("process_start_time")):
-                    log.info(
-                        f"Skipping live NetShaper session: {state_path}"
-                    )
-                    recovery_ok = False
-                    continue
-                print_flush(f"  [!] Stale session on {iface} — cleaning up…")
-                recovery_attempted = True
-
-                def run_recovery(description: str, command: list[str]) -> None:
-                    nonlocal cleanup_ok
-                    if not SubprocessRunner.run(
-                            command, check=False, silent=True):
-                        cleanup_ok = False
-                        log.error(f"Stale cleanup failed ({description})")
-
-                def inspect_stale_resource(
-                        command: list[str],
-                        *,
-                        output_contains: Optional[str] = None,
-                ) -> InspectionStatus:
-                    inspection = inspect_resource(command)
-                    if inspection.status is not InspectionStatus.PRESENT:
-                        return inspection.status
-                    if (
-                            output_contains is not None
-                            and output_contains not in inspection.stdout):
-                        return InspectionStatus.ABSENT
-                    return InspectionStatus.PRESENT
-
-                def run_recovery_if_present(
-                        description: str,
-                        command: list[str],
-                        exists_command: list[str],
-                        *,
-                        output_contains: Optional[str] = None) -> None:
-                    nonlocal cleanup_ok
-                    status = inspect_stale_resource(
-                            exists_command,
-                            output_contains=output_contains)
-                    if status is InspectionStatus.ABSENT:
-                        log.info(
-                            f"Stale cleanup skipped ({description} already absent)"
-                        )
-                        return
-                    if status is InspectionStatus.ERROR:
-                        cleanup_ok = False
-                        log.error(
-                            f"Stale cleanup failed ({description}): "
-                            "resource inspection failed"
-                        )
-                        return
-                    run_recovery(description, command)
-
-                def require_binary(binary: str, reason: str) -> bool:
-                    nonlocal cleanup_ok
-                    if shutil.which(binary):
-                        return True
-                    cleanup_ok = False
-                    log.error(
-                        f"Stale cleanup failed ({reason}): "
-                        f"{binary} unavailable"
-                    )
-                    return False
-
-                if data.get("global_rules_applied"):
-                    binaries = data.get("global_firewall_binaries")
-                    if binaries is None:
-                        binaries = [
-                            binary for binary in ["iptables", "ip6tables"]
-                            if shutil.which(binary)
-                        ]
-                    comment = data.get("global_rule_comment")
-                    rule_records = data.get("global_rules_created")
-                    if rule_records is None:
-                        rule_records = []
-                        for binary in binaries:
-                            for spec in self._global_firewall_rule_specs(
-                                    binary, iface, comment):
-                                rule_records.append({
-                                    "binary": binary,
-                                    "description": spec["description"],
-                                    "delete": spec["delete"],
-                                    "check": spec["check"],
-                                })
-                    for record in rule_records:
-                        binary = record.get("binary")
-                        if not binary:
-                            continue
-                        if not require_binary(binary, "global firewall rules"):
-                            continue
-                        run_recovery_if_present(
-                            record.get("description")
-                            or f"{binary} global firewall rule",
-                            record["delete"],
-                            record["check"],
-                        )
-
-                for target in data.get("targets", []):
-                    ip = target.get("ip")
-                    if not ip:
-                        continue
-                    binaries = ["ip6tables"] if ":" in ip else ["iptables"]
-                    suffix = ip.replace(".", "_").replace(":", "_")
-                    chain_specs = [
-                        ("mangle", "POSTROUTING",
-                         target.get("mangle_chain") or f"NS-MNG-{suffix}"),
-                        ("nat", "PREROUTING",
-                         target.get("nat_chain") or f"NS-NAT-{suffix}"),
-                    ]
-                    for binary in binaries:
-                        if not require_binary(binary, f"target firewall {ip}"):
-                            continue
-                        if target.get("dns"):
-                            rule_comment = target.get("firewall_rule_comment")
-                            for proto in ["udp", "tcp"]:
-                                rule_spec = self._target_input_rule_spec(
-                                    binary, iface, ip, proto, 53,
-                                    rule_comment)
-                                run_recovery_if_present(
-                                    f"{binary} DNS input {ip}/{proto}",
-                                    rule_spec["delete"],
-                                    rule_spec["check"],
-                                )
-                        http_port = target.get("http_redirect_port")
-                        if http_port:
-                            rule_comment = target.get("firewall_rule_comment")
-                            rule_spec = self._target_input_rule_spec(
-                                binary, iface, ip, "tcp", int(http_port),
-                                rule_comment)
-                            run_recovery_if_present(
-                                f"{binary} HTTP input {ip}",
-                                rule_spec["delete"],
-                                rule_spec["check"],
-                            )
-                        for table, hook, chain_name in chain_specs:
-                            # Guard on chain existence rather than the jump-rule
-                            # check (-C HOOK -j CHAIN), which returns ERROR on
-                            # iptables-nft when the target chain is absent
-                            # ("RULE_CHECK failed (Invalid argument)").
-                            _cst = inspect_stale_resource(
-                                [binary, "-t", table, "-L", chain_name])
-                            if _cst is InspectionStatus.ABSENT:
-                                log.info(
-                                    f"Stale cleanup skipped "
-                                    f"({binary} unlink {chain_name} already absent)"
-                                )
-                            elif _cst is InspectionStatus.ERROR:
-                                cleanup_ok = False
-                                log.error(
-                                    f"Stale cleanup failed "
-                                    f"({binary} unlink {chain_name}): "
-                                    "resource inspection failed"
-                                )
-                            else:
-                                _jst = inspect_stale_resource(
-                                    [binary, "-t", table, "-C", hook,
-                                     "-j", chain_name])
-                                if _jst is InspectionStatus.PRESENT:
-                                    run_recovery(
-                                        f"{binary} unlink {chain_name}",
-                                        [binary, "-t", table, "-D", hook,
-                                         "-j", chain_name],
-                                    )
-                                elif _jst is InspectionStatus.ERROR:
-                                    # nft backend can't verify; attempt removal,
-                                    # tolerate failure (rule may already be gone)
-                                    SubprocessRunner.run(
-                                        [binary, "-t", table, "-D", hook,
-                                         "-j", chain_name],
-                                        check=False, silent=True,
-                                    )
-                            run_recovery_if_present(
-                                f"{binary} flush {chain_name}",
-                                [binary, "-t", table, "-F", chain_name],
-                                [binary, "-t", table, "-L", chain_name],
-                            )
-                            run_recovery_if_present(
-                                f"{binary} delete {chain_name}",
-                                [binary, "-t", table, "-X", chain_name],
-                                [binary, "-t", table, "-L", chain_name],
-                            )
-
-                if (
-                        data.get("shaper_base_initialized")
-                        or data.get("shaper_root_qdisc_pending")):
-                    if require_binary("tc", "traffic shaper"):
-                        run_recovery_if_present(
-                            "tc root qdisc",
-                            ["tc", "qdisc", "del", "dev", iface, "root"],
-                            ["tc", "qdisc", "show", "dev", iface, "root"],
-                            output_contains="qdisc htb 1:",
-                        )
-
-                snapshot = self._snapshot_from_state(data)
-                cleanup_ok = StateSnapshotManager.restore(
-                    snapshot,
-                    restore_firewall=False,
-                ) and cleanup_ok
-                if cleanup_ok:
-                    log.info("Stale rules cleaned.")
-                    os.remove(state_path)
-                    try:
-                        os.rmdir(os.path.dirname(state_path))
-                    except OSError:
-                        pass
-                else:
-                    recovery_ok = False
-                    log.error(f"Leaving recovery state in place: {state_path}")
-            except Exception as exc:
-                recovery_ok = False
-                log.error(f"Could not recover state file {state_path}: {exc}")
-        current_interface = getattr(self, "interface", None)
-        if recovery_attempted and recovery_ok and current_interface:
+        recovery_ok = self.recovery_manager.recover_stale_state()
+        if recovery_ok and getattr(self, "interface", None):
             self.state_snapshot = StateSnapshotManager.capture(
-                current_interface,
+                self.interface,
                 getattr(self, "session_id", ""),
             )
         return recovery_ok

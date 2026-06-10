@@ -12,12 +12,13 @@ import time
 from typing import Optional
 
 from netshaper import config
+from netshaper.exceptions import NetShaperError
 from netshaper.system import check_local_port
 
 log = logging.getLogger("netshaper")
 
 
-class MitmProxyError(RuntimeError):
+class MitmProxyError(NetShaperError):
     """Raised when mitmproxy operations fail."""
     pass
 
@@ -31,7 +32,7 @@ class MitmProxyManager:
     def __init__(self, own_ip: str):
         """
         Initialize mitmproxy manager.
-        
+
         Args:
             own_ip: Local IP address where mitmproxy binds
         """
@@ -73,14 +74,14 @@ class MitmProxyManager:
         """
         Launch mitmweb in transparent mode.
         Poll for readiness without hard-coded sleep.
-        
+
         Args:
             port: Port for transparent proxy
             web_port: Port for web dashboard
-            
+
         Returns:
             True if mitmproxy became ready, False otherwise
-            
+
         Raises:
             MitmProxyError: If mitmproxy binary not found
         """
@@ -146,7 +147,7 @@ class MitmProxyManager:
     def terminate(self) -> bool:
         """
         Terminate mitmproxy process gracefully or forcefully.
-        
+
         Returns:
             True if process terminated cleanly, False otherwise
         """
