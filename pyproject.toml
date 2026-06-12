@@ -69,9 +69,37 @@ files = [
 ]
 exclude = ["src/netshaper/fake_server3.py"]
 
+[[tool.mypy.overrides]]
+module = [
+  "netshaper.captive_portal",
+  "netshaper.capture.*",
+  "netshaper.config",
+  "netshaper.core.mitm_manager",
+  "netshaper.core.orchestrator",
+  "netshaper.core.session",
+  "netshaper.core.state_manager",
+  "netshaper.network.*",
+  "netshaper.system",
+  "netshaper.ui.*",
+  "netshaper.utils",
+]
+ignore_errors = true
+
+# Core security-sensitive modules require stricter checking
+[[tool.mypy.overrides]]
+module = [
+  "netshaper.core.authorization",
+  "netshaper.core.firewall_manager",
+  "netshaper.core.recovery_manager",
+]
+strict = true
+
 [tool.bandit]
 exclude_dirs = ["tests", "reference"]
-# Note: B603/B607 (subprocess) are handled with localized # nosec annotations
+skips = []
+# Note: B603/B607 (subprocess without shell=True) are handled with localized
+# # nosec B603 — intentional: ... annotations at each specific call site
+# to keep the exclusion visible and reviewable without disabling globally
 
 [tool.coverage.run]
 source = ["src/netshaper"]

@@ -385,7 +385,8 @@ def main():
 
         try:
             PortalHandler.portal_config = http_config
-            http_server = HTTPServer(("0.0.0.0", args.http_port), PortalHandler)
+            # Captive portal intentionally listens on all interfaces for clients.
+            http_server = HTTPServer(("0.0.0.0", args.http_port), PortalHandler)  # nosec B104
         except OSError as e:
             raise RuntimeError(f"Cannot bind HTTP port {args.http_port}: {e}") from e
 

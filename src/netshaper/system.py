@@ -9,7 +9,7 @@ NetShaper — OS / system utilities.
 import logging
 import os
 import socket
-import subprocess
+import subprocess  # nosec B404
 import sys
 from dataclasses import dataclass
 from enum import Enum
@@ -70,7 +70,8 @@ def inspect_resource(args) -> InspectionResult:
     if config.DRY_RUN:
         return InspectionResult(InspectionStatus.ABSENT)
     try:
-        result = subprocess.run(
+        # subprocess uses shell=False with pre-validated resource inspection args.
+        result = subprocess.run(  # nosec B603
             args,
             capture_output=True,
             text=True,
@@ -120,7 +121,7 @@ class SubprocessRunner:
             print(f"[DRY-RUN] {' '.join(str(a) for a in args)}", flush=True)
             return True
         try:
-            # B603: subprocess with shell=False — args are pre-validated (binary paths)
+            # subprocess uses shell=False with command args built by NetShaper.
             res = subprocess.run(  # nosec B603
                 args,
                 capture_output=True,

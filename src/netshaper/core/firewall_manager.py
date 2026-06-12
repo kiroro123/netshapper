@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import logging
 import shutil
-from typing import List, Optional
+from typing import Any, Callable, List, Optional
 
 from netshaper.system import InspectionStatus, SubprocessRunner, inspect_resource
 from netshaper.exceptions import NetShaperError
@@ -27,19 +27,26 @@ class FirewallManager:
     Tracks applied rules and supports cleanup/rollback.
     """
 
-    def __init__(self, interface: str, session_id: str):
+    def __init__(
+        self,
+        interface: str,
+        session_id: str,
+        journal: Optional[Callable[[], bool]] = None,
+    ):
         """
         Initialize firewall manager for an interface.
 
         Args:
             interface: Network interface name
             session_id: Session ID for rule comments
+            journal: Optional callback used to persist incremental state
         """
         self.interface = interface
         self.session_id = session_id
+        self._journal = journal
         self._global_rules_applied = False
         self._global_firewall_binaries_applied: List[str] = []
-        self._global_rules_created: List[dict] = []
+        self._global_rules_created: List[dict[str, Any]] = []
 
     def _global_rule_comment(self) -> str:
         """Unique comment for firewall rules in this session."""
@@ -50,7 +57,7 @@ class FirewallManager:
         binary: str,
         iface: str,
         comment: Optional[str],
-    ) -> List[dict]:
+    ) -> List[dict[str, Any]]:
         """Generate rule specifications for global forwarding."""
         comment_args = (
             ["-m", "comment", "--comment", comment] if comment else []
@@ -190,7 +197,7 @@ class FirewallManager:
         proto: str,
         port: int,
         comment: Optional[str],
-    ) -> dict:
+    ) -> dict[str, Any]:
         """Generate rule specification for per-target INPUT rules."""
         comment_args = (
             ["-m", "comment", "--comment", comment] if comment else []
@@ -247,9 +254,10 @@ class FirewallManager:
             raise FirewallError("Failed to apply global forwarding rules")
 
         self._global_rules_applied = True
+        self._journal_state()
         log.info("Global dual-stack forwarding + MASQUERADE enabled")
 
-    def _record_global_rule(self, binary: str, spec: dict) -> None:
+    def _record_global_rule(self, binary: str, spec: dict[str, Any]) -> None:
         """Record a global rule for later cleanup."""
         record = {
             "binary": binary,
@@ -260,8 +268,15 @@ class FirewallManager:
         self._global_rules_created.append(record)
         if binary not in self._global_firewall_binaries_applied:
             self._global_firewall_binaries_applied.append(binary)
+        self._global_rules_applied = True
+        self._journal_state()
 
-    def _global_rule_records_for_cleanup(self) -> List[dict]:
+    def _journal_state(self) -> bool:
+        if self._journal is None:
+            return True
+        return self._journal()
+
+    def _global_rule_records_for_cleanup(self) -> List[dict[str, Any]]:
         """Get all global rules that need cleanup."""
         records = list(self._global_rules_created)
         if records:
@@ -332,7 +347,7 @@ class FirewallManager:
 
         return ok
 
-    def get_state_for_persistence(self) -> dict:
+    def get_state_for_persistence(self) -> dict[str, Any]:
         """Get firewall state for persistence/recovery."""
         return {
             "global_rules_applied": self._global_rules_applied,

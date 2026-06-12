@@ -23,7 +23,7 @@ import psutil
 
 from netshaper import config
 from netshaper.capture.sniffer import PacketSniffer, RollingPacketSniffer
-from netshaper.core.authorization import AuthorizationError, AuthorizationPolicy
+from netshaper.core.authorization import AuthorizationPolicy
 from netshaper.core.firewall_manager import FirewallManager
 from netshaper.core.mitm_manager import MitmProxyManager, MitmProxyError
 from netshaper.core.recovery_manager import RecoveryManager
@@ -33,11 +33,8 @@ from netshaper.models import Device, MarkIDPool
 from netshaper.network.discovery import NetworkDiscovery
 from netshaper.network.shaper import TrafficShaper
 from netshaper.system import (
-    InspectionStatus,
-    SubprocessRunner,
     SystemChecker,
     check_local_port,
-    inspect_resource,
 )
 from netshaper.utils import print_flush
 
@@ -47,10 +44,7 @@ log = logging.getLogger("netshaper")
 class NetShaper:
     def __init__(self, interface: str, authorized_cidrs: Sequence):
         normalized = self._normalize_authorized_cidrs(authorized_cidrs)
-        # Use the immutable AuthorizationPolicy for runtime checks and
-        # expose the CIDRs as an immutable tuple for backward compatibility.
         self._auth_policy = AuthorizationPolicy(normalized)
-        self.authorized_cidrs = self._auth_policy.cidrs
         SystemChecker.check()
         self.interface   = interface
         self.session_id  = f"NS-{uuid.uuid4().hex[:6].upper()}"
@@ -66,9 +60,11 @@ class NetShaper:
         self.gw_ipv6     = self.disc.get_default_gateway_ipv6()
         self.shaper      = TrafficShaper(interface)
         self.mark_pool   = MarkIDPool()
-        # Instantiate subsystem managers implemented in the refactor so
-        # runtime uses the auditable managers instead of the in-file copies.
-        self.firewall_manager = FirewallManager(interface, getattr(self, 'session_id', ''))
+        self.firewall_manager = FirewallManager(
+            interface,
+            self.session_id,
+            journal=self._sync_firewall_state,
+        )
         self.mitm_manager = MitmProxyManager(getattr(self, 'own_ip', None))
         self.recovery_manager = RecoveryManager(interface)
         self.sessions:   Dict[str, TargetSession] = {}
@@ -77,12 +73,7 @@ class NetShaper:
         self.is_shutting_down  = False
         self.sniffer: Optional[Union[PacketSniffer, RollingPacketSniffer]] = None
         self.stop_event  = threading.Event()
-        self._global_rules_applied = False
-        self._global_firewall_binaries_applied: List[str] = []
-        self._global_rules_created: List[dict] = []
-        self._mitm_proc  = None
         self._mitm_log_path: Optional[str] = None
-        self._mitm_log_handle = None
         self._monitor_thread: Optional[threading.Thread] = None
         self._runtime_errors: List[str] = []
         self._started_at: Optional[float] = None
@@ -95,6 +86,11 @@ class NetShaper:
         self.state_snapshot = StateSnapshotManager.capture(interface, self.session_id)
 
     # ── Helpers ───────────────────────────────────────────────────────────────
+    @property
+    def authorized_cidrs(self) -> tuple:
+        policy = getattr(self, "_auth_policy", None)
+        return policy.cidrs if policy else ()
+
     @staticmethod
     def _normalize_authorized_cidrs(raw_values: Sequence) -> list:
         networks = []
@@ -126,19 +122,16 @@ class NetShaper:
         return networks
 
     def _assert_authorized_target(self, raw_ip: str) -> None:
-        # Delegate validation to the centralized AuthorizationPolicy to
-        # ensure the runtime path uses the immutable CIDR allowlist.
-        try:
-            self._auth_policy.assert_target_authorized(
-                raw_ip,
-                own_ip=getattr(self, "own_ip", None),
-                own_ipv6=getattr(self, "own_ipv6", None),
-                gateway=getattr(self, "gw", None),
-                gateway_ipv6=getattr(self, "gw_ipv6", None),
-            )
-        except AuthorizationError:
-            # Surface the typed AuthorizationError to callers.
-            raise
+        policy = getattr(self, "_auth_policy", None)
+        if not policy:
+            raise ValueError("authorized_cidrs is empty; refusing target")
+        policy.assert_target_authorized(
+            raw_ip,
+            own_ip=getattr(self, "own_ip", None),
+            own_ipv6=getattr(self, "own_ipv6", None),
+            gateway=getattr(self, "gw", None),
+            gateway_ipv6=getattr(self, "gw_ipv6", None),
+        )
 
     @staticmethod
     def _process_start_time(pid: int) -> Optional[str]:
@@ -342,34 +335,6 @@ class NetShaper:
 
         return issues
 
-    def _open_mitmproxy_log(self):
-        if config.DRY_RUN:
-            return None
-        os.makedirs(self._session_state_dir(), mode=0o700, exist_ok=True)
-        self._mitm_log_path = os.path.join(
-            self._session_state_dir(), "mitmproxy.log"
-        )
-        self._mitm_log_handle = open(
-            self._mitm_log_path,
-            "a",
-            encoding="utf-8",
-            buffering=1,
-        )
-        self._mitm_log_handle.write(
-            f"{self._timestamp()} starting mitmproxy\n"
-        )
-        return self._mitm_log_handle
-
-    def _close_mitmproxy_log(self) -> None:
-        handle = getattr(self, "_mitm_log_handle", None)
-        if not handle:
-            return
-        try:
-            handle.write(f"{self._timestamp()} mitmproxy stopped\n")
-            handle.close()
-        finally:
-            self._mitm_log_handle = None
-
     @staticmethod
     def scale_bytes(val: float) -> str:
         for unit in ["KB", "MB", "GB"]:
@@ -379,191 +344,72 @@ class NetShaper:
         return f"{val:.1f} TB"
 
     # ── Global forwarding rules ───────────────────────────────────────────────
-    def _global_rule_comment(self) -> str:
-        return f"netshaper:{self.session_id}:global"
-
-    @staticmethod
-    def _global_firewall_rule_specs(
-            binary: str,
-            iface: str,
-            comment: Optional[str]) -> List[dict]:
-        comment_args = (
-            ["-m", "comment", "--comment", comment]
-            if comment else []
-        )
-        return [
-            {
-                "description": f"{binary} forward same-interface accept",
-                "apply": [
-                    binary, "-I", "FORWARD", "1",
-                    "-i", iface, "-o", iface,
-                    *comment_args,
-                    "-j", "ACCEPT",
-                ],
-                "delete": [
-                    binary, "-D", "FORWARD",
-                    "-i", iface, "-o", iface,
-                    *comment_args,
-                    "-j", "ACCEPT",
-                ],
-                "check": [
-                    binary, "-C", "FORWARD",
-                    "-i", iface, "-o", iface,
-                    *comment_args,
-                    "-j", "ACCEPT",
-                ],
-            },
-            {
-                "description": f"{binary} established forward accept",
-                "apply": [
-                    binary, "-I", "FORWARD", "1",
-                    "-m", "state", "--state", "ESTABLISHED,RELATED",
-                    *comment_args,
-                    "-j", "ACCEPT",
-                ],
-                "delete": [
-                    binary, "-D", "FORWARD",
-                    "-m", "state", "--state", "ESTABLISHED,RELATED",
-                    *comment_args,
-                    "-j", "ACCEPT",
-                ],
-                "check": [
-                    binary, "-C", "FORWARD",
-                    "-m", "state", "--state", "ESTABLISHED,RELATED",
-                    *comment_args,
-                    "-j", "ACCEPT",
-                ],
-            },
-            {
-                "description": f"{binary} masquerade",
-                "apply": [
-                    binary, "-t", "nat", "-A", "POSTROUTING",
-                    "-o", iface,
-                    *comment_args,
-                    "-j", "MASQUERADE",
-                ],
-                "delete": [
-                    binary, "-t", "nat", "-D", "POSTROUTING",
-                    "-o", iface,
-                    *comment_args,
-                    "-j", "MASQUERADE",
-                ],
-                "check": [
-                    binary, "-t", "nat", "-C", "POSTROUTING",
-                    "-o", iface,
-                    *comment_args,
-                    "-j", "MASQUERADE",
-                ],
-            },
-        ]
-
-    @staticmethod
-    def _inspect_rule(command: List[str]) -> InspectionStatus:
-        return inspect_resource(command).status
-
-    @staticmethod
-    def _target_input_rule_spec(
-            binary: str,
-            iface: str,
-            ip: str,
-            proto: str,
-            port: int,
-            comment: Optional[str]) -> dict:
-        comment_args = (
-            ["-m", "comment", "--comment", comment]
-            if comment else []
-        )
-        base = [
-            "-i", iface, "-s", ip,
-            "-p", proto, "--dport", str(port),
-            *comment_args,
-            "-j", "ACCEPT",
-        ]
-        return {
-            "delete": [binary, "-D", "INPUT", *base],
-            "check": [binary, "-C", "INPUT", *base],
-        }
-
     def _journal_state_if_ready(self) -> bool:
         required = ("session_id", "interface", "state_snapshot", "sessions")
         if not all(hasattr(self, name) for name in required):
             return True
         return self.save_state()
 
-    def _record_global_rule(self, binary: str, spec: dict) -> bool:
-        if not hasattr(self, "_global_rules_created"):
-            self._global_rules_created = []
-        if not hasattr(self, "_global_firewall_binaries_applied"):
-            self._global_firewall_binaries_applied = []
-        record = {
-            "binary": binary,
-            "description": spec["description"],
-            "delete": spec["delete"],
-            "check": spec["check"],
-        }
-        self._global_rules_created.append(record)
-        if binary not in self._global_firewall_binaries_applied:
-            self._global_firewall_binaries_applied.append(binary)
-        self._global_rules_applied = True
+    def _sync_firewall_state(self, *, journal: bool = True) -> bool:
+        manager = getattr(self, "firewall_manager", None)
+        if manager is None:
+            return True
+        self._global_rules_applied = manager._global_rules_applied
+        self._global_firewall_binaries_applied = list(
+            manager._global_firewall_binaries_applied
+        )
+        self._global_rules_created = list(manager._global_rules_created)
+        if not journal:
+            return True
         return self._journal_state_if_ready()
 
-    def _global_rule_records_for_cleanup(self) -> List[dict]:
-        records = list(getattr(self, "_global_rules_created", []))
-        if records:
-            return records
-        if not getattr(self, "_global_rules_applied", False):
-            return []
-        records = []
-        comment = (
-            self._global_rule_comment()
-            if hasattr(self, "session_id") else None
+    def _get_firewall_manager(self) -> FirewallManager:
+        if hasattr(self, "firewall_manager") and self.firewall_manager is not None:
+            return self.firewall_manager
+        manager = FirewallManager(
+            getattr(self, "interface", ""),
+            getattr(self, "session_id", ""),
+            journal=self._sync_firewall_state,
         )
-        for binary in getattr(self, "_global_firewall_binaries_applied", []):
-            for spec in self._global_firewall_rule_specs(
-                    binary, self.interface, comment):
-                records.append({
-                    "binary": binary,
-                    "description": spec["description"],
-                    "delete": spec["delete"],
-                    "check": spec["check"],
-                })
-        return records
+        if getattr(self, "_global_rules_applied", False):
+            manager._global_rules_applied = True
+            manager._global_firewall_binaries_applied = list(
+                getattr(self, "_global_firewall_binaries_applied", [])
+            )
+            manager._global_rules_created = list(
+                getattr(self, "_global_rules_created", [])
+            )
+        self.firewall_manager = manager
+        return manager
 
     def _apply_global_rules(self) -> None:
-        # Delegate global forwarding rule application to the FirewallManager
+        manager = self._get_firewall_manager()
         try:
-            self.firewall_manager.apply_global_rules()
+            manager.apply_global_rules()
         except Exception as exc:
+            self._sync_firewall_state(journal=False)
             raise RuntimeError("Failed to apply global forwarding rules") from exc
-
-    def _restore_original_forwarding(self) -> bool:
-        ok = True
-        if self.state_snapshot.ipv4_forwarding is not None:
-            ok = SubprocessRunner.run(
-                ["sysctl", "-w", f"net.ipv4.ip_forward={self.state_snapshot.ipv4_forwarding}"],
-                silent=True,
-            ) and ok
-        if self.state_snapshot.ipv6_forwarding is not None:
-            ok = SubprocessRunner.run(
-                ["sysctl", "-w", f"net.ipv6.conf.all.forwarding={self.state_snapshot.ipv6_forwarding}"],
-                silent=True,
-            ) and ok
-        if self.state_snapshot.route_localnet is not None:
-            ok = SubprocessRunner.run(
-                [
-                    "sysctl", "-w",
-                    f"net.ipv4.conf.{self.interface}.route_localnet={self.state_snapshot.route_localnet}",
-                ],
-                silent=True,
-            ) and ok
-        return ok
+        self._sync_firewall_state(journal=False)
 
     def _remove_global_rules(self) -> bool:
-        # Delegate removal to FirewallManager (it will also restore sysctls)
-        try:
-            return self.firewall_manager.remove_global_rules()
-        except Exception:
-            return False
+        manager = self._get_firewall_manager()
+        result = manager.remove_global_rules()
+        self._sync_firewall_state(journal=False)
+        return result
+
+    def _get_mitm_manager(self) -> MitmProxyManager:
+        if hasattr(self, "mitm_manager") and self.mitm_manager is not None:
+            return self.mitm_manager
+        manager = MitmProxyManager(getattr(self, "own_ip", None))
+        self.mitm_manager = manager
+        return manager
+
+    def _get_recovery_manager(self) -> RecoveryManager:
+        if hasattr(self, "recovery_manager") and self.recovery_manager is not None:
+            return self.recovery_manager
+        manager = RecoveryManager(getattr(self, "interface", ""))
+        self.recovery_manager = manager
+        return manager
 
     # ── Discovery ─────────────────────────────────────────────────────────────
     def discover(self) -> List[Device]:
@@ -812,10 +658,10 @@ class NetShaper:
             log.info(f"mitmproxy already running on :{port}")
             return True
         try:
-            ok = self.mitm_manager.launch(port=port, web_port=web_port)
-            if ok:
-                st = self.mitm_manager.get_state_for_persistence() or {}
-                self._mitm_log_path = st.get("mitm_log_path")
+            manager = self._get_mitm_manager()
+            ok = manager.launch(port=port, web_port=web_port)
+            st = manager.get_state_for_persistence() or {}
+            self._mitm_log_path = st.get("mitm_log_path")
             return ok
         except MitmProxyError:
             print_flush("  [!] mitmweb not found.  pip install mitmproxy")
@@ -831,7 +677,6 @@ class NetShaper:
     def close(self) -> None:
         """Release non-network resources when a session never started."""
         self._terminate_mitmproxy()
-        self._close_mitmproxy_log()
         self._release_instance_lock()
 
     # ── State persistence ─────────────────────────────────────────────────────
@@ -868,33 +713,42 @@ class NetShaper:
         )
 
     def save_state(self) -> bool:
+        targets = [
+            {
+                "ip": s.target.ip,
+                "dns": self._session_dns_recorded(s),
+                "limit": s.limit,
+                "http_redirect_port": (
+                    getattr(s.firewall, "_http_redirect_port", None)
+                    if s.firewall else None
+                ),
+                "firewall_rule_comment": (
+                    getattr(s.firewall, "_rule_comment", None)
+                    if s.firewall else None
+                ),
+                "mangle_chain": (
+                    getattr(s.firewall, "MANGLE", None)
+                    if s.firewall else None
+                ),
+                "nat_chain": (
+                    getattr(s.firewall, "NAT", None)
+                    if s.firewall else None
+                ),
+            }
+            for s in self.sessions.values()
+        ]
+
+        firewall_state = (
+            self._get_firewall_manager().get_state_for_persistence() or {}
+        )
+
         data = {
             "session_id": self.session_id,
             "interface": self.interface,
-            "targets":   [{"ip": s.target.ip,
-                           "dns": self._session_dns_recorded(s),
-                           "limit": s.limit,
-                           "http_redirect_port": (
-                               getattr(s.firewall, "_http_redirect_port", None)
-                               if s.firewall else None
-                           ),
-                           "firewall_rule_comment": (
-                               getattr(s.firewall, "_rule_comment", None)
-                               if s.firewall else None
-                           ),
-                           "mangle_chain": (
-                               getattr(s.firewall, "MANGLE", None)
-                               if s.firewall else None
-                           ),
-                           "nat_chain": (
-                               getattr(s.firewall, "NAT", None)
-                               if s.firewall else None
-                           )}
-                          for s in self.sessions.values()],
-            "gw":     self.gw,
+            "targets": targets,
+            "gw": self.gw,
             "own_ip": self.own_ip,
-            # Persist managed firewall state instead of internal copies
-            **(self.firewall_manager.get_state_for_persistence() or {}),
+            **firewall_state,
             "shaper_base_initialized": getattr(
                 getattr(self, "shaper", None), "_base_initialized", False),
             "shaper_root_qdisc_pending": getattr(
@@ -922,7 +776,7 @@ class NetShaper:
         # Delegate stale session recovery to the refactored RecoveryManager
         if not os.path.isdir(config.STATE_DIR):
             return True
-        recovery_ok = self.recovery_manager.recover_stale_state()
+        recovery_ok = self._get_recovery_manager().recover_stale_state()
         if recovery_ok and getattr(self, "interface", None):
             self.state_snapshot = StateSnapshotManager.capture(
                 self.interface,

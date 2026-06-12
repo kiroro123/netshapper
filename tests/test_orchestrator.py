@@ -3,9 +3,10 @@ import os
 import tempfile
 import threading
 import unittest
-from ipaddress import ip_network
 from unittest import mock
 
+from netshaper.core.authorization import AuthorizationError, AuthorizationPolicy
+from netshaper.core.mitm_manager import MitmProxyManager
 from netshaper.core.orchestrator import NetShaper
 from netshaper.models import Device
 
@@ -15,7 +16,7 @@ class NetShaperCleanupTests(unittest.TestCase):
     def _set_authorized(
             ns: NetShaper,
             cidrs: tuple[str, ...] = ("192.0.2.0/24",)) -> None:
-        ns.authorized_cidrs = [ip_network(cidr) for cidr in cidrs]
+        ns._auth_policy = AuthorizationPolicy(cidrs)
 
     def test_constructor_requires_authorized_cidrs_before_system_checks(self):
         with mock.patch("netshaper.core.orchestrator.SystemChecker.check"
@@ -51,10 +52,8 @@ class NetShaperCleanupTests(unittest.TestCase):
         ns.sessions = {}
         ns.sniffer = mock.Mock()
         ns.sniffer.stop.side_effect = RuntimeError("sniffer stop failed")
-        mitm_proc = mock.Mock()
-        mitm_proc.poll.return_value = None
-        mitm_proc.terminate.side_effect = RuntimeError("mitm stop failed")
-        ns._mitm_proc = mitm_proc
+        ns.mitm_manager = mock.Mock()
+        ns.mitm_manager.terminate.side_effect = RuntimeError("mitm stop failed")
         ns._remove_global_rules = mock.Mock(side_effect=RuntimeError("rules failed"))
         ns.state_snapshot = mock.Mock()
         ns.shaper = mock.Mock()
@@ -70,7 +69,7 @@ class NetShaperCleanupTests(unittest.TestCase):
             ns.cleanup()
 
         ns.sniffer.stop.assert_called_once()
-        mitm_proc.terminate.assert_called_once()
+        ns.mitm_manager.terminate.assert_called_once()
         ns._remove_global_rules.assert_called_once()
         restore_mock.assert_called_once_with(
             ns.state_snapshot,
@@ -150,7 +149,7 @@ class NetShaperCleanupTests(unittest.TestCase):
         ns.gw_ipv6 = None
         ns.disc = mock.Mock()
 
-        with self.assertRaisesRegex(ValueError, "outside authorized"):
+        with self.assertRaisesRegex(AuthorizationError, "outside authorized"):
             ns.add_target("198.51.100.10")
 
         ns.disc.resolve_mac.assert_not_called()
@@ -188,7 +187,7 @@ class NetShaperCleanupTests(unittest.TestCase):
         ns.own_ip = "192.0.2.1"
 
         with mock.patch("netshaper.core.orchestrator.config.DRY_RUN", True), \
-             mock.patch("netshaper.core.orchestrator.subprocess.Popen") as popen_mock, \
+             mock.patch("netshaper.core.mitm_manager.subprocess.Popen") as popen_mock, \
              mock.patch("netshaper.core.orchestrator.print_flush"):
             result = ns.launch_mitmproxy()
 
@@ -210,7 +209,7 @@ class NetShaperCleanupTests(unittest.TestCase):
 
     def test_discover_fails_closed_without_authorized_cidrs(self):
         ns = NetShaper.__new__(NetShaper)
-        ns.authorized_cidrs = []
+        ns._auth_policy = None
         ns.disc = mock.Mock()
 
         with self.assertRaisesRegex(ValueError, "authorized_cidrs"):
@@ -241,7 +240,6 @@ class NetShaperCleanupTests(unittest.TestCase):
         ns.own_ip = "192.0.2.1"
         ns.session_id = "NS-TEST"
         ns._mitm_log_path = None
-        ns._mitm_log_handle = None
         proc = mock.Mock()
         proc.poll.side_effect = [None, None, 0]
 
@@ -250,17 +248,19 @@ class NetShaperCleanupTests(unittest.TestCase):
              mock.patch("netshaper.core.orchestrator.config.DRY_RUN", False), \
              mock.patch("netshaper.core.orchestrator.check_local_port",
                         return_value=False), \
-             mock.patch("netshaper.core.orchestrator.subprocess.Popen",
+             mock.patch("netshaper.core.mitm_manager.check_local_port",
+                        return_value=False), \
+             mock.patch("netshaper.core.mitm_manager.subprocess.Popen",
                         return_value=proc), \
-             mock.patch("netshaper.core.orchestrator.time.sleep"), \
-             mock.patch("netshaper.core.orchestrator.log"):
+             mock.patch("netshaper.core.mitm_manager.time.sleep"), \
+             mock.patch("netshaper.core.mitm_manager.log"):
             result = ns.launch_mitmproxy()
 
         self.assertFalse(result)
         proc.terminate.assert_called_once()
         proc.wait.assert_called_once_with(timeout=5)
-        self.assertIsNone(ns._mitm_proc)
-        self.assertIsNone(ns._mitm_log_handle)
+        self.assertIsNone(ns.mitm_manager._mitm_proc)
+        self.assertIsNone(ns.mitm_manager._mitm_log_handle)
         self.assertTrue(ns._mitm_log_path.endswith("mitmproxy.log"))
 
     def test_failed_mitmproxy_termination_keeps_process_for_retry(self):
@@ -268,7 +268,8 @@ class NetShaperCleanupTests(unittest.TestCase):
         proc = mock.Mock()
         proc.poll.return_value = None
         proc.terminate.side_effect = RuntimeError("nope")
-        ns._mitm_proc = proc
+        ns.mitm_manager = MitmProxyManager("192.0.2.1")
+        ns.mitm_manager._mitm_proc = proc
 
         with mock.patch("netshaper.core.orchestrator.log"):
             first = ns._terminate_mitmproxy()
@@ -279,7 +280,7 @@ class NetShaperCleanupTests(unittest.TestCase):
 
         self.assertFalse(first)
         self.assertTrue(second)
-        self.assertIsNone(ns._mitm_proc)
+        self.assertIsNone(ns.mitm_manager._mitm_proc)
         self.assertEqual(proc.terminate.call_count, 2)
 
     def test_start_monitor_thread_records_crashes(self):
@@ -310,7 +311,6 @@ class NetShaperCleanupTests(unittest.TestCase):
         ns.sniffer = mock.Mock()
         ns.sniffer.is_running.return_value = False
         ns.sniffer.last_error = "disk full"
-        ns._mitm_proc = None
         ns.own_ip = "192.0.2.1"
 
         with mock.patch("netshaper.core.orchestrator.config.DRY_RUN", False):
@@ -349,9 +349,9 @@ class NetShaperCleanupTests(unittest.TestCase):
         ns._global_firewall_binaries_applied = []
         ns._global_rules_created = []
 
-        with mock.patch("netshaper.core.orchestrator.shutil.which",
+        with mock.patch("netshaper.core.firewall_manager.shutil.which",
                         return_value="/sbin/tool"), \
-             mock.patch("netshaper.core.orchestrator.SubprocessRunner.run",
+             mock.patch("netshaper.core.firewall_manager.SubprocessRunner.run",
                         return_value=True) as runner_mock:
             ns._apply_global_rules()
 
@@ -390,9 +390,9 @@ class NetShaperCleanupTests(unittest.TestCase):
             False, False, False,
         ]
 
-        with mock.patch("netshaper.core.orchestrator.shutil.which",
+        with mock.patch("netshaper.core.firewall_manager.shutil.which",
                         return_value="/sbin/tool"), \
-             mock.patch("netshaper.core.orchestrator.SubprocessRunner.run",
+             mock.patch("netshaper.core.firewall_manager.SubprocessRunner.run",
                         side_effect=runner_results) as runner_mock:
             with self.assertRaisesRegex(RuntimeError, "global forwarding"):
                 ns._apply_global_rules()
@@ -400,7 +400,7 @@ class NetShaperCleanupTests(unittest.TestCase):
         self.assertTrue(ns._global_rules_applied)
         self.assertEqual(ns._global_firewall_binaries_applied, ["iptables"])
         self.assertEqual(len(ns._global_rules_created), 1)
-        self.assertEqual(ns.save_state.call_count, 4)
+        ns.save_state.assert_called_once()
 
         runner_mock.reset_mock()
         runner_mock.return_value = True
@@ -410,11 +410,11 @@ class NetShaperCleanupTests(unittest.TestCase):
             ipv6_forwarding=None,
             route_localnet=None,
         )
-        with mock.patch("netshaper.core.orchestrator.shutil.which",
+        with mock.patch("netshaper.core.firewall_manager.shutil.which",
                         return_value="/sbin/tool"), \
              mock.patch("netshaper.system.subprocess.run",
                         return_value=mock.Mock(returncode=0)), \
-             mock.patch("netshaper.core.orchestrator.SubprocessRunner.run",
+             mock.patch("netshaper.core.firewall_manager.SubprocessRunner.run",
                         return_value=True) as cleanup_runner_mock:
             result = ns._remove_global_rules()
 
@@ -436,11 +436,11 @@ class NetShaperCleanupTests(unittest.TestCase):
         ns._global_firewall_binaries_applied = ["iptables"]
         ns._global_rules_created = []
 
-        with mock.patch("netshaper.core.orchestrator.shutil.which",
+        with mock.patch("netshaper.core.firewall_manager.shutil.which",
                         return_value="/sbin/iptables"), \
-             mock.patch("netshaper.core.orchestrator.subprocess.run",
+             mock.patch("netshaper.system.subprocess.run",
                         return_value=mock.Mock(returncode=0)), \
-             mock.patch("netshaper.core.orchestrator.SubprocessRunner.run",
+             mock.patch("netshaper.core.firewall_manager.SubprocessRunner.run",
                         return_value=True) as runner_mock:
             result = ns._remove_global_rules()
 
@@ -472,10 +472,10 @@ class NetShaperCleanupTests(unittest.TestCase):
         ns._global_firewall_binaries_applied = []
         ns._global_rules_created = []
 
-        with mock.patch("netshaper.core.orchestrator.shutil.which",
+        with mock.patch("netshaper.core.firewall_manager.shutil.which",
                         return_value="/sbin/iptables"), \
-             mock.patch("netshaper.core.orchestrator.subprocess.run") as run_mock, \
-             mock.patch("netshaper.core.orchestrator.SubprocessRunner.run"
+             mock.patch("netshaper.system.subprocess.run") as run_mock, \
+             mock.patch("netshaper.core.firewall_manager.SubprocessRunner.run"
                         ) as runner_mock:
             result = ns._remove_global_rules()
 
@@ -496,11 +496,11 @@ class NetShaperCleanupTests(unittest.TestCase):
         ns._global_firewall_binaries_applied = ["iptables"]
         ns._global_rules_created = []
 
-        with mock.patch("netshaper.core.orchestrator.shutil.which",
+        with mock.patch("netshaper.core.firewall_manager.shutil.which",
                         return_value="/sbin/iptables"), \
-             mock.patch("netshaper.core.orchestrator.subprocess.run",
+             mock.patch("netshaper.system.subprocess.run",
                         return_value=mock.Mock(returncode=1)), \
-             mock.patch("netshaper.core.orchestrator.SubprocessRunner.run"
+             mock.patch("netshaper.core.firewall_manager.SubprocessRunner.run"
                         ) as runner_mock:
             result = ns._remove_global_rules()
 
@@ -527,11 +527,11 @@ class NetShaperCleanupTests(unittest.TestCase):
             stderr="Permission denied (you must be root)",
         )
 
-        with mock.patch("netshaper.core.orchestrator.shutil.which",
+        with mock.patch("netshaper.core.firewall_manager.shutil.which",
                         return_value="/sbin/iptables"), \
              mock.patch("netshaper.system.subprocess.run",
                         return_value=inspect_error), \
-             mock.patch("netshaper.core.orchestrator.SubprocessRunner.run"
+             mock.patch("netshaper.core.firewall_manager.SubprocessRunner.run"
                         ) as runner_mock, \
              mock.patch("netshaper.core.orchestrator.log"):
             result = ns._remove_global_rules()
@@ -571,12 +571,14 @@ class NetShaperCleanupTests(unittest.TestCase):
 
             with mock.patch("netshaper.core.orchestrator.config.STATE_DIR", tmp), \
                  mock.patch("netshaper.core.orchestrator.print_flush"), \
-                 mock.patch("netshaper.core.orchestrator.subprocess.run",
+                 mock.patch("netshaper.system.subprocess.run",
                             return_value=mock.Mock(
                                 returncode=0,
                                 stdout="qdisc htb 1: root refcnt 2\n",
                             )), \
-                 mock.patch("netshaper.core.orchestrator.SubprocessRunner.run",
+                 mock.patch("netshaper.core.recovery_manager.shutil.which",
+                            return_value="/sbin/tool"), \
+                 mock.patch("netshaper.core.recovery_manager.SubprocessRunner.run",
                             return_value=True) as runner_mock, \
                  mock.patch("netshaper.core.orchestrator.StateSnapshotManager.restore",
                             return_value=True) as restore_mock:
@@ -624,12 +626,14 @@ class NetShaperCleanupTests(unittest.TestCase):
 
             with mock.patch("netshaper.core.orchestrator.config.STATE_DIR", tmp), \
                  mock.patch("netshaper.core.orchestrator.print_flush"), \
-                 mock.patch("netshaper.core.orchestrator.subprocess.run",
+                 mock.patch("netshaper.system.subprocess.run",
                             return_value=mock.Mock(
                                 returncode=0,
                                 stdout="qdisc htb 1: root refcnt 2\n",
                             )), \
-                 mock.patch("netshaper.core.orchestrator.SubprocessRunner.run",
+                 mock.patch("netshaper.core.recovery_manager.shutil.which",
+                            return_value="/sbin/tool"), \
+                 mock.patch("netshaper.core.recovery_manager.SubprocessRunner.run",
                             return_value=True) as runner_mock, \
                  mock.patch("netshaper.core.orchestrator.StateSnapshotManager.restore",
                             return_value=True):
@@ -676,11 +680,11 @@ class NetShaperCleanupTests(unittest.TestCase):
 
             with mock.patch("netshaper.core.orchestrator.config.STATE_DIR", tmp), \
                  mock.patch("netshaper.core.orchestrator.print_flush"), \
-                 mock.patch("netshaper.core.orchestrator.shutil.which",
+                 mock.patch("netshaper.core.recovery_manager.shutil.which",
                             return_value="/sbin/iptables"), \
-                 mock.patch("netshaper.core.orchestrator.subprocess.run",
+                 mock.patch("netshaper.system.subprocess.run",
                             return_value=mock.Mock(returncode=0, stdout="")), \
-                 mock.patch("netshaper.core.orchestrator.SubprocessRunner.run",
+                 mock.patch("netshaper.core.recovery_manager.SubprocessRunner.run",
                             return_value=True) as runner_mock, \
                  mock.patch("netshaper.core.orchestrator.StateSnapshotManager.restore",
                             return_value=True):
@@ -736,11 +740,11 @@ class NetShaperCleanupTests(unittest.TestCase):
 
             with mock.patch("netshaper.core.orchestrator.config.STATE_DIR", tmp), \
                  mock.patch("netshaper.core.orchestrator.print_flush"), \
-                 mock.patch("netshaper.core.orchestrator.shutil.which",
+                 mock.patch("netshaper.core.recovery_manager.shutil.which",
                             return_value="/sbin/iptables"), \
                  mock.patch("netshaper.system.subprocess.run",
                             return_value=inspect_error), \
-                 mock.patch("netshaper.core.orchestrator.SubprocessRunner.run"
+                 mock.patch("netshaper.core.recovery_manager.SubprocessRunner.run"
                             ) as runner_mock, \
                  mock.patch("netshaper.core.orchestrator.StateSnapshotManager.restore",
                             return_value=True), \
@@ -789,11 +793,11 @@ class NetShaperCleanupTests(unittest.TestCase):
 
             with mock.patch("netshaper.core.orchestrator.config.STATE_DIR", tmp), \
                  mock.patch("netshaper.core.orchestrator.print_flush"), \
-                 mock.patch("netshaper.core.orchestrator.shutil.which",
+                 mock.patch("netshaper.core.recovery_manager.shutil.which",
                             return_value="/sbin/iptables"), \
-                 mock.patch("netshaper.core.orchestrator.subprocess.run",
+                 mock.patch("netshaper.system.subprocess.run",
                             return_value=mock.Mock(returncode=0, stdout="")), \
-                 mock.patch("netshaper.core.orchestrator.SubprocessRunner.run",
+                 mock.patch("netshaper.core.recovery_manager.SubprocessRunner.run",
                             return_value=True) as runner_mock, \
                  mock.patch("netshaper.core.orchestrator.StateSnapshotManager.restore",
                             return_value=True):
@@ -850,12 +854,12 @@ class NetShaperCleanupTests(unittest.TestCase):
 
             with mock.patch("netshaper.core.orchestrator.config.STATE_DIR", tmp), \
                  mock.patch("netshaper.core.orchestrator.print_flush"), \
-                 mock.patch("netshaper.core.orchestrator.shutil.which",
+                 mock.patch("netshaper.core.recovery_manager.shutil.which",
                             return_value="/sbin/tool"), \
-                 mock.patch("netshaper.core.orchestrator.subprocess.run",
+                 mock.patch("netshaper.system.subprocess.run",
                             return_value=absent), \
                  mock.patch(
-                     "netshaper.core.orchestrator.SubprocessRunner.run"
+                     "netshaper.core.recovery_manager.SubprocessRunner.run"
                  ) as runner_mock, \
                  mock.patch("netshaper.core.orchestrator.StateSnapshotManager.restore",
                             return_value=True), \
@@ -947,7 +951,7 @@ class NetShaperCleanupTests(unittest.TestCase):
 
             with mock.patch("netshaper.core.orchestrator.config.STATE_DIR", tmp), \
                  mock.patch("netshaper.core.orchestrator.print_flush"), \
-                 mock.patch("netshaper.core.orchestrator.shutil.which",
+                 mock.patch("netshaper.core.recovery_manager.shutil.which",
                             return_value=None), \
                  mock.patch("netshaper.core.orchestrator.StateSnapshotManager.restore",
                             return_value=True), \
@@ -989,7 +993,7 @@ class NetShaperCleanupTests(unittest.TestCase):
 
             with mock.patch("netshaper.core.orchestrator.config.STATE_DIR", tmp), \
                  mock.patch("netshaper.core.orchestrator.print_flush"), \
-                 mock.patch("netshaper.core.orchestrator.shutil.which",
+                 mock.patch("netshaper.core.recovery_manager.shutil.which",
                             return_value=None), \
                  mock.patch("netshaper.core.orchestrator.StateSnapshotManager.restore",
                             return_value=True), \
@@ -1011,7 +1015,7 @@ class NetShaperCleanupTests(unittest.TestCase):
         ns._global_rules_applied = True
         ns._global_firewall_binaries_applied = ["iptables"]
 
-        with mock.patch("netshaper.core.orchestrator.shutil.which",
+        with mock.patch("netshaper.core.firewall_manager.shutil.which",
                         return_value=None), \
              mock.patch("netshaper.core.orchestrator.log"):
             result = ns._remove_global_rules()

@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import logging
 import os
-import subprocess
+import subprocess  # nosec B404
 import time
 from typing import Optional
 
@@ -99,7 +99,8 @@ class MitmProxyManager:
         log_handle = None
         try:
             log_handle = self._open_log(config.STATE_DIR)
-            self._mitm_proc = subprocess.Popen(
+            # mitmweb is the intentional child process for transparent proxying.
+            self._mitm_proc = subprocess.Popen(  # nosec B603 B607
                 [
                     "mitmweb",
                     "--mode",

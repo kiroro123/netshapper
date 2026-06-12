@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-import subprocess
+import subprocess  # nosec B404
 
 log = logging.getLogger("netshaper")
 
@@ -22,7 +22,8 @@ class CommandBackend:
 
 class RealCommandBackend(CommandBackend):
     def run(self, command: list[str]) -> None:
-        subprocess.run(command, check=False)
+        # Real backend intentionally executes pre-built command vectors.
+        subprocess.run(command, check=False)  # nosec B603
 
 
 class DryRunCommandBackend(CommandBackend):

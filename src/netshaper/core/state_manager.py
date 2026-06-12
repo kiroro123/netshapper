@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-import subprocess
+import subprocess  # nosec B404
 from dataclasses import dataclass
 from typing import Optional
 
@@ -35,7 +35,7 @@ class StateSnapshotManager:
     @staticmethod
     def _run(args: list[str]) -> str:
         try:
-            # B603: subprocess with shell=False — args are ipv4/ipv6 commands with pre-validated data
+            # subprocess uses shell=False with pre-validated system commands.
             completed = subprocess.run(args, capture_output=True, text=True, check=False)  # nosec B603
             return completed.stdout.strip() if completed.returncode == 0 else ""
         except FileNotFoundError:
@@ -88,7 +88,7 @@ class StateSnapshotManager:
                 print(f"[DRY-RUN] {' '.join(str(a) for a in args)}", flush=True)
                 return True
             try:
-                # B603: subprocess with shell=False — firewall restore cmds internally safe
+                # subprocess uses shell=False with args from state file audit trail.
                 result = subprocess.run(  # nosec B603
                     args,
                     capture_output=True,
@@ -125,7 +125,7 @@ class StateSnapshotManager:
                         print(f"[DRY-RUN] {binary}-restore < snapshot", flush=True)
                         continue
                     try:
-                        # B603: subprocess with shell=False — restore is internally constructed
+                        # subprocess uses shell=False with iptables/ip6tables restore.
                         result = subprocess.run(  # nosec B603
                             [f"{binary}-restore"],
                             input=rules,
