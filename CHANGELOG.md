@@ -2,6 +2,12 @@
 
 All notable changes to this project are documented in this file.
 
+## [1.0] - 2026-06-15
+
+### Release
+- Promoted NetShaper from pre-release `0.8.0` to `1.0`.
+- Keeps the manager-boundary refactor, stricter CI gate, and expanded manager tests as the baseline for the stable release line.
+
 ## [0.8.0] - 2026-06-10
 
 ### 🔴 Critical Security Improvements
