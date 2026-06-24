@@ -215,7 +215,9 @@ No `sudo` requirement in dry-run mode, but target scope is still validated.
 
 ## Logs
 
-Normal runs write to `/var/log/netshaper.log`. `--dry-run` logs to the console
+Normal runs write to `/var/log/netshaper.log`. Set `NETSHAPER_LOG_FILE` to
+override the path and `NETSHAPER_LOG_LEVEL` to change verbosity. `--dry-run`
+logs to the console
 only.
 
 ## Runtime Evidence

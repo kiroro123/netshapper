@@ -18,26 +18,44 @@ DRY_RUN: bool = False
 # BUG FIX: moved from /tmp (symlink-attack surface) to /run (root-owned dir).
 # SystemChecker.check() creates the directory before first write.
 STATE_DIR = "/run/netshaper"
-LOG_FILE  = "/var/log/netshaper.log"
+LOG_FILE = "/var/log/netshaper.log"
 LOG_MAX_BYTES = 5 * 1024 * 1024
 LOG_BACKUP_COUNT = 3
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 
-def _secure_log_handler() -> logging.Handler | None:
+
+def _configured_log_file() -> str:
+    """Return the runtime log path, allowing an environment override."""
+    return os.environ.get("NETSHAPER_LOG_FILE", LOG_FILE)
+
+
+def _configured_log_level() -> int:
+    """Return a validated logging level from the environment."""
+    level_name = os.environ.get("NETSHAPER_LOG_LEVEL", "INFO").upper()
+    level = getattr(logging, level_name, logging.INFO)
+    return level if isinstance(level, int) else logging.INFO
+
+
+def _secure_log_handler(log_file: str | None = None) -> logging.Handler | None:
     """Create a mode-0600 rotating log handler, or return None on failure."""
+    path = log_file or _configured_log_file()
     try:
-        os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
-        fd = os.open(LOG_FILE, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        fd = os.open(path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
         os.close(fd)
-        os.chmod(LOG_FILE, 0o600)
+        os.chmod(path, 0o600)
         handler = RotatingFileHandler(
-            LOG_FILE,
+            path,
             maxBytes=LOG_MAX_BYTES,
             backupCount=LOG_BACKUP_COUNT,
         )
         handler.setFormatter(logging.Formatter(
-            '%(asctime)s [%(levelname)s] %(message)s', datefmt='%H:%M:%S'))
+            "%(asctime)s [%(levelname)s] [%(name)s] %(message)s",
+            datefmt="%H:%M:%S",
+        ))
         return handler
     except OSError:
         return None
@@ -47,18 +65,22 @@ def configure_logging(console_only: bool = False) -> None:
     """Attach handlers lazily so importing config does not create files."""
     if logging.getLogger().handlers:
         return
+    log_file = _configured_log_file()
     _ch = logging.StreamHandler()
     _ch.setFormatter(logging.Formatter(
-        '[NetShaper] %(asctime)s - %(levelname)s - %(message)s', datefmt='%H:%M:%S'))
+        "[NetShaper] %(asctime)s - %(levelname)s - "
+        "[%(name)s] %(message)s",
+        datefmt="%H:%M:%S",
+    ))
     handlers = [_ch]
     if not console_only:
-        _fh = _secure_log_handler()
+        _fh = _secure_log_handler(log_file)
         if _fh is not None:
             handlers.insert(0, _fh)
-    logging.basicConfig(level=logging.INFO, handlers=handlers)
+    logging.basicConfig(level=_configured_log_level(), handlers=handlers)
     if not console_only and len(handlers) == 1:
         logging.getLogger("netshaper").warning(
-            "Could not open %s; using console logging only", LOG_FILE
+            "Could not open %s; using console logging only", log_file
         )
 
 # ── Banner ────────────────────────────────────────────────────────────────────
