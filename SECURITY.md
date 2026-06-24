@@ -126,6 +126,17 @@ Before running in a new environment:
    # Should be empty
    ```
 
+## Training-Mode Boundaries
+
+- ARP/NDP burst controls are capped at 5 packets per cycle with a minimum
+  interval of 0.25 seconds.
+- DNSSEC suppression models removal of CD/DO/AD signaling and DNSSEC record
+  visibility. A validating endpoint is expected to fail closed.
+- The HSTS/IDN page is static, has no credential form, and only accepts IDN
+  examples under reserved training suffixes.
+- Preloaded or established HSTS is not bypassed. Only the first-visit,
+  no-policy downgrade condition is demonstrated.
+
 ## Responsible Disclosure
 
 If you discover a security vulnerability in NetShaper:

@@ -1,7 +1,5 @@
-"""
-NetShaper — terminal I/O helpers and ANSI colour utilities.
-"""
-import subprocess
+"""NetShaper — terminal I/O helpers and ANSI colour utilities."""
+import subprocess  # nosec B404
 import sys
 
 # ANSI colour codes — gracefully disabled on non-TTY outputs
@@ -28,7 +26,8 @@ def print_flush(*args, **kwargs) -> None:
 def safe_input(prompt: str = "") -> str:
     """Read a line from stdin with terminal sanity restored first."""
     if sys.stdin.isatty() and sys.stdout.isatty():
-        subprocess.run(["stty", "sane"], check=False)
+        # Fixed terminal reset command; no shell expansion is used.
+        subprocess.run(["stty", "sane"], check=False)  # nosec B603 B607
     if prompt:
         sys.stdout.write(prompt)
         sys.stdout.flush()

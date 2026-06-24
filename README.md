@@ -114,8 +114,11 @@ A typical flow for testing a target device:
 ## Features
 
 - Dual-stack ARP + NDP spoofing (IPv4 and IPv6 MITM)
+- Bounded ARP/NDP burst controls for cache-race training
 - Per-target DNS redirect and captive portal (HTTP)
-- Bandwidth throttling via Linux `tc` HTB
+- DNSSEC suppression/fail-closed modeling in the fake resolver
+- Reserved-domain HSTS and IDN/Punycode training page (no credential capture)
+- Bandwidth throttling and controlled impairment via Linux `tc` HTB + netem
 - Packet capture with optional rolling `.pcap` files
 - Transparent HTTPS inspection via mitmproxy
 - Atomic state persistence and automatic stale-session recovery
@@ -160,6 +163,25 @@ Optional DNS/HTTP captive-portal helper (separate terminal):
 ```bash
 sudo env PYTHONPATH="$PWD/src" python -m netshaper.fake_server3 --smart-spoof-all --host-ip <your-ip>
 ```
+
+Lab behavior examples:
+
+```bash
+# Bounded ARP/NDP burst: at most 5 packets every 0.25 seconds.
+sudo env PYTHONPATH="$PWD/src" python -m netshaper -i <interface> \
+  --allow-cidr <authorized-cidr> --targets <ip> \
+  --arp-burst 3 --arp-interval 0.5
+
+# Model DNSSEC suppression and serve the static HSTS/IDN lesson.
+sudo env PYTHONPATH="$PWD/src" python -m netshaper.fake_server3 \
+  --host-ip <your-ip> --suppress-dnssec --web-security-demo \
+  --idn-demo-domain арр.test
+```
+
+The web lesson is available at `/training/web-security`. IDN examples are
+restricted to reserved `.test`, `.example`, `.invalid`, and `.localhost`
+domains. Established or preloaded HSTS is not bypassed; the lesson demonstrates
+the first-visit downgrade boundary and browser IDN display behavior.
 
 ## User Guide
 

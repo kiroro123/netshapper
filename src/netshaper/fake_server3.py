@@ -17,6 +17,7 @@ NetShaper packaged fake server
 
 import argparse
 import errno
+import html
 import os
 import pwd
 import socket
@@ -90,6 +91,29 @@ DNS_SMART_SPOOF_ALL = os.environ.get("DNS_SMART_SPOOF_ALL", "").lower() in (
 DNS_VERBOSE     = os.environ.get("DNS_VERBOSE", "").lower() in ("1", "true", "yes")
 DNS_MAX_WORKERS = int(os.environ.get("DNS_MAX_WORKERS", "16"))
 SERVE_CA_CERT   = os.environ.get("SERVE_CA_CERT", "").lower() in ("1", "true", "yes")
+DNS_SUPPRESS_DNSSEC = os.environ.get(
+    "DNS_SUPPRESS_DNSSEC", ""
+).lower() in ("1", "true", "yes")
+WEB_SECURITY_DEMO = os.environ.get(
+    "WEB_SECURITY_DEMO", ""
+).lower() in ("1", "true", "yes")
+IDN_DEMO_DOMAINS: list[tuple[str, str]] = []
+
+RESERVED_TRAINING_SUFFIXES = (
+    ".test",
+    ".example",
+    ".invalid",
+    ".localhost",
+)
+
+DNSSEC_QTYPES = {
+    43,  # DS
+    46,  # RRSIG
+    47,  # NSEC
+    48,  # DNSKEY
+    50,  # NSEC3
+    51,  # NSEC3PARAM
+}
 
 
 def parse_domain_csv(value: str) -> set[str]:
@@ -99,6 +123,73 @@ def parse_domain_csv(value: str) -> set[str]:
 DNS_SPOOF_DOMAINS = parse_domain_csv(os.environ.get("DNS_SPOOF_DOMAINS", ""))
 DNS_FORWARD_DOMAINS = parse_domain_csv(os.environ.get("DNS_FORWARD_DOMAINS", ""))
 DNS_BLOCK_DOMAINS = parse_domain_csv(os.environ.get("DNS_BLOCK_DOMAINS", ""))
+
+
+def normalize_idn_demo_domain(value: str) -> tuple[str, str]:
+    """Return (Unicode, ASCII/IDNA) for a reserved training-only domain."""
+    unicode_domain = value.strip().rstrip(".").lower()
+    if not unicode_domain or "/" in unicode_domain or "@" in unicode_domain:
+        raise ValueError(f"invalid IDN demo domain: {value!r}")
+    try:
+        ascii_domain = unicode_domain.encode("idna").decode("ascii")
+    except UnicodeError as exc:
+        raise ValueError(f"invalid IDN demo domain: {value!r}") from exc
+    if not ascii_domain.endswith(RESERVED_TRAINING_SUFFIXES):
+        raise ValueError(
+            "IDN demo domains must end in .test, .example, .invalid, "
+            "or .localhost"
+        )
+    return unicode_domain, ascii_domain
+
+
+def render_web_security_demo(domains: list[tuple[str, str]]) -> bytes:
+    """Render a static, non-credential-capturing HSTS and IDN training page."""
+    rows = "".join(
+        "<tr>"
+        f"<td>{html.escape(unicode_domain)}</td>"
+        f"<td><code>{html.escape(ascii_domain)}</code></td>"
+        "</tr>"
+        for unicode_domain, ascii_domain in domains
+    )
+    if not rows:
+        rows = (
+            "<tr><td>арр.test</td><td><code>xn--80a6aa.test</code></td></tr>"
+        )
+    document = f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>NetShaper Web Security Lab</title>
+  <style>
+    body {{ max-width: 54rem; margin: 3rem auto; font: 16px/1.5 sans-serif; }}
+    table {{ border-collapse: collapse; width: 100%; }}
+    th, td {{ border: 1px solid #bbb; padding: .55rem; text-align: left; }}
+    code {{ background: #eee; padding: .1rem .25rem; }}
+  </style>
+</head>
+<body>
+  <h1>HSTS and IDN training lab</h1>
+  <p>This page intentionally contains no sign-in form and stores no credentials.</p>
+  <h2>HSTS outcomes</h2>
+  <ul>
+    <li><strong>Preloaded or previously learned HSTS:</strong> the browser upgrades
+        to HTTPS before an HTTP intermediary can rewrite the request.</li>
+    <li><strong>First visit without HSTS:</strong> a lab intermediary can demonstrate
+        an HTTP downgrade before the browser learns the policy.</li>
+    <li><strong>HSTS sent over HTTP:</strong> ignored by conforming browsers. This
+        response includes such a header so the behavior can be observed.</li>
+  </ul>
+  <h2>Reserved-domain IDN examples</h2>
+  <table>
+    <thead><tr><th>Unicode label</th><th>ASCII/Punycode form</th></tr></thead>
+    <tbody>{rows}</tbody>
+  </table>
+  <p>Browser display policy varies; security-sensitive UI should compare the
+     canonical ASCII form and highlight mixed scripts.</p>
+</body>
+</html>
+"""
+    return document.encode("utf-8")
 
 SAFE_DOMAIN_CATEGORIES = {
     "connectivity": {
@@ -255,6 +346,104 @@ def dns_qdcount(data: bytes) -> int | None:
     if len(data) < 12:
         return None
     return (data[4] << 8) | data[5]
+
+
+def _skip_dns_name(data: bytes, offset: int) -> int | None:
+    """Return the next wire offset after a DNS name without following pointers."""
+    while offset < len(data):
+        length = data[offset]
+        if length == 0:
+            return offset + 1
+        if (length & 0xC0) == 0xC0:
+            return offset + 2 if offset + 1 < len(data) else None
+        if length & 0xC0:
+            return None
+        offset += 1 + length
+    return None
+
+
+def _skip_dns_rr(data: bytes, offset: int) -> tuple[int, int, int] | None:
+    """Return (next_offset, rr_type, ttl_offset) for one resource record."""
+    name_end = _skip_dns_name(data, offset)
+    if name_end is None or name_end + 10 > len(data):
+        return None
+    rr_type = int.from_bytes(data[name_end:name_end + 2], "big")
+    ttl_offset = name_end + 4
+    rdlength = int.from_bytes(data[name_end + 8:name_end + 10], "big")
+    next_offset = name_end + 10 + rdlength
+    if next_offset > len(data):
+        return None
+    return next_offset, rr_type, ttl_offset
+
+
+def _find_opt_ttl_offset(data: bytes) -> int | None:
+    """Locate the EDNS OPT TTL field, whose low 16 bits contain the DO flag."""
+    if len(data) < 12:
+        return None
+    qdcount = int.from_bytes(data[4:6], "big")
+    ancount = int.from_bytes(data[6:8], "big")
+    nscount = int.from_bytes(data[8:10], "big")
+    arcount = int.from_bytes(data[10:12], "big")
+    offset = 12
+
+    for _ in range(qdcount):
+        name_end = _skip_dns_name(data, offset)
+        if name_end is None or name_end + 4 > len(data):
+            return None
+        offset = name_end + 4
+
+    for _ in range(ancount + nscount):
+        record = _skip_dns_rr(data, offset)
+        if record is None:
+            return None
+        offset = record[0]
+
+    for _ in range(arcount):
+        record = _skip_dns_rr(data, offset)
+        if record is None:
+            return None
+        next_offset, rr_type, ttl_offset = record
+        if rr_type == 41:  # OPT
+            return ttl_offset
+        offset = next_offset
+    return None
+
+
+def suppress_dnssec_query(data: bytes) -> tuple[bytes, bool]:
+    """
+    Model a non-validating intermediary by clearing CD and EDNS DO.
+
+    A validating endpoint should treat the resulting unsigned answer as a
+    validation failure; this option does not defeat endpoint validation.
+    """
+    if len(data) < 12:
+        return data, False
+    altered = bytearray(data)
+    changed = False
+
+    flags = int.from_bytes(altered[2:4], "big")
+    new_flags = flags & ~0x0010  # CD (Checking Disabled)
+    if new_flags != flags:
+        altered[2:4] = new_flags.to_bytes(2, "big")
+        changed = True
+
+    ttl_offset = _find_opt_ttl_offset(data)
+    if ttl_offset is not None and ttl_offset + 4 <= len(altered):
+        if altered[ttl_offset + 2] & 0x80:  # EDNS DO bit
+            altered[ttl_offset + 2] &= 0x7F
+            changed = True
+
+    return bytes(altered), changed
+
+
+def suppress_dnssec_response(data: bytes) -> bytes:
+    """Clear the AD bit on an upstream answer in DNSSEC suppression mode."""
+    if len(data) < 4:
+        return data
+    altered = bytearray(data)
+    flags = int.from_bytes(altered[2:4], "big") & ~0x0020
+    altered[2:4] = flags.to_bytes(2, "big")
+    return bytes(altered)
 
 
 def domain_matches(domain: str, patterns: set[str]) -> bool:
@@ -460,6 +649,31 @@ def parse_args():
         default=DNS_MAX_WORKERS,
         help="Maximum concurrent DNS forwarding workers.",
     )
+    parser.add_argument(
+        "--suppress-dnssec",
+        action="store_true",
+        help=(
+            "Lab model: clear CD/DO on forwarded queries, clear AD on replies, "
+            "and return NODATA for DNSSEC record types."
+        ),
+    )
+    parser.add_argument(
+        "--web-security-demo",
+        action="store_true",
+        help=(
+            "Serve a non-credential-capturing HSTS/IDN lesson at "
+            "/training/web-security."
+        ),
+    )
+    parser.add_argument(
+        "--idn-demo-domain",
+        action="append",
+        default=[],
+        help=(
+            "Unicode domain shown in the web lesson; restricted to reserved "
+            ".test/.example/.invalid/.localhost names."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -468,12 +682,24 @@ def configure_dns(args) -> None:
     global DNS_SPOOF_ALL, DNS_SMART_SPOOF_ALL, DNS_SPOOF_DOMAINS
     global DNS_FORWARD_DOMAINS, DNS_BLOCK_DOMAINS, DNS_FORWARD_CATEGORIES
     global DNS_UPSTREAM, DNS_VERBOSE, DNS_MAX_WORKERS, SERVE_CA_CERT
+    global DNS_SUPPRESS_DNSSEC
+    global WEB_SECURITY_DEMO, IDN_DEMO_DOMAINS
     DNS_SPOOF_ALL = DNS_SPOOF_ALL or args.spoof_all
     DNS_SMART_SPOOF_ALL = DNS_SMART_SPOOF_ALL or args.smart_spoof_all
     DNS_VERBOSE = DNS_VERBOSE or args.verbose_dns
     DNS_UPSTREAM = args.upstream
     DNS_MAX_WORKERS = max(1, args.dns_workers)
     SERVE_CA_CERT = SERVE_CA_CERT or args.serve_ca_cert
+    DNS_SUPPRESS_DNSSEC = (
+        DNS_SUPPRESS_DNSSEC or getattr(args, "suppress_dnssec", False)
+    )
+    WEB_SECURITY_DEMO = (
+        WEB_SECURITY_DEMO or getattr(args, "web_security_demo", False)
+    )
+    IDN_DEMO_DOMAINS = [
+        normalize_idn_demo_domain(domain)
+        for domain in getattr(args, "idn_demo_domain", [])
+    ]
     cli_domains = {
         domain.strip().rstrip(".").lower()
         for item in args.spoof
@@ -536,6 +762,16 @@ def print_dns_startup(port: int) -> None:
     print_flush(f"{cyan('[DNS]')} Dual-stack DNS listening on port {port}  (YOUR_IP={YOUR_IP})")
     print_flush(f"{cyan('[DNS]')} Upstream={DNS_UPSTREAM}  Spoof={mode}")
     print_flush(f"{cyan('[DNS]')} Forward={forwarded}  Block={blocked}  SmartCategories={categories}")
+    if DNS_SUPPRESS_DNSSEC:
+        print_flush(
+            f"{yellow('[DNS]')} DNSSEC suppression model enabled "
+            "(validating clients should fail closed)"
+        )
+    if WEB_SECURITY_DEMO:
+        print_flush(
+            f"{cyan('[Portal]')} Web security lesson: "
+            "/training/web-security"
+        )
 
 
 def handle_dns_query(sock: socket.socket, data: bytes, addr) -> None:
@@ -557,7 +793,12 @@ def handle_dns_query(sock: socket.socket, data: bytes, addr) -> None:
 
         action, reason = decide_dns_policy(domain, qtype)
 
-        if action == "spoof":
+        if DNS_SUPPRESS_DNSSEC and qtype in DNSSEC_QTYPES:
+            response = build_dns_response(data, question_end, qtype)
+            print_flush(
+                f"{yellow('[DNS]')} DNSSEC-NODATA {domain} qtype={qtype}"
+            )
+        elif action == "spoof":
             response = build_dns_response(data, question_end, qtype)
             print_flush(
                 f"{green('[DNS]')} SPOOF {domain} qtype={qtype} -> {YOUR_IP} "
@@ -572,9 +813,19 @@ def handle_dns_query(sock: socket.socket, data: bytes, addr) -> None:
                     f"{cyan('[DNS]')} FORWARD {domain} qtype={qtype} -> {DNS_UPSTREAM} "
                     f"reason={reason}"
                 )
-            response = forward_dns_query(data)
+            forwarded_query = data
+            dnssec_changed = False
+            if DNS_SUPPRESS_DNSSEC:
+                forwarded_query, dnssec_changed = suppress_dnssec_query(data)
+            response = forward_dns_query(forwarded_query)
             if response is None:
                 return
+            if DNS_SUPPRESS_DNSSEC:
+                response = suppress_dnssec_response(response)
+                if DNS_VERBOSE and dnssec_changed:
+                    print_flush(
+                        f"{yellow('[DNS]')} DNSSEC flags suppressed for {domain}"
+                    )
 
         sock.sendto(response, addr)
 
@@ -655,7 +906,38 @@ class CaptivePortalHandler(BaseHTTPRequestHandler):
         client = self.client_address[0]
         path   = self.path
 
-        # 1. OS captive-portal probes → 204 No Content
+        # 1. Static HSTS/IDN training page (no forms or credential capture)
+        if path == "/training/web-security":
+            if not WEB_SECURITY_DEMO:
+                msg = b"Web security training demo is disabled."
+                self.send_response(404)
+                self.send_header("Content-Type", "text/plain")
+                self.send_header("Content-Length", str(len(msg)))
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(msg)
+                return
+            content = render_web_security_demo(IDN_DEMO_DOMAINS)
+            print_flush(f"{green('[Portal]')} Serving web security lab to {client}")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(content)))
+            self.send_header(
+                "Content-Security-Policy",
+                "default-src 'none'; style-src 'unsafe-inline'",
+            )
+            self.send_header("X-Content-Type-Options", "nosniff")
+            # Deliberately sent over HTTP: conforming browsers must ignore it.
+            self.send_header(
+                "Strict-Transport-Security",
+                "max-age=31536000; includeSubDomains",
+            )
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(content)
+            return
+
+        # 2. OS captive-portal probes → 204 No Content
         if any(probe in path for probe in CAPTIVE_CHECK_PATHS):
             print_flush(f"{cyan('[Portal]')} Captive check  {client}  {path}")
             self.send_response(204)
@@ -663,7 +945,7 @@ class CaptivePortalHandler(BaseHTTPRequestHandler):
             self.end_headers()
             return
 
-        # 2. CA certificate delivery
+        # 3. CA certificate delivery
         #    Served over plain HTTP intentionally — client must be able to
         #    fetch the cert BEFORE trusting TLS; that's the whole install flow.
         if path == "/cert":
@@ -699,7 +981,7 @@ class CaptivePortalHandler(BaseHTTPRequestHandler):
                 self.wfile.write(msg)
             return
 
-        # 3. Root / index
+        # 4. Root / index
         if path in ("/", "/index.html"):
             if os.path.exists(INDEX_FILE_PATH):
                 print_flush(f"{green('[Portal]')} Serving index.html to {client}")
@@ -721,7 +1003,7 @@ class CaptivePortalHandler(BaseHTTPRequestHandler):
                 self.wfile.write(msg)
             return
 
-        # 4. Everything else → redirect to captive portal
+        # 5. Everything else → redirect to captive portal
         print_flush(f"{cyan('[Portal]')} Redirecting {client}  {path}  → /index.html")
         self.send_response(302)
         self.send_header("Location", f"http://{YOUR_IP}/index.html")

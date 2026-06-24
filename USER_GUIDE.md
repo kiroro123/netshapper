@@ -105,6 +105,39 @@ You can also set throttle non-interactively:
 snetshaper -i <interface> --allow-cidr 192.168.1.0/24 --targets 192.168.1.5 --limit 2.5
 ```
 
+Feature `4` also supports controlled `tc netem` impairment:
+
+```bash
+snetshaper -i eth0 \
+  --allow-cidr 192.168.1.0/24 \
+  --targets 192.168.1.5 \
+  --limit 5 \
+  --latency-ms 120 \
+  --jitter-ms 20 \
+  --loss-percent 1.5
+```
+
+Available impairment flags are `--latency-ms`, `--jitter-ms`,
+`--loss-percent`, `--corruption-percent`, `--duplicate-percent`, and
+`--reorder-percent`. Jitter and reordering require a non-zero latency.
+All resources are journaled and removed during normal or stale-session cleanup.
+
+## ARP/NDP Cache-Race Training
+
+Feature `1` supports bounded packet timing controls:
+
+```bash
+snetshaper -i eth0 \
+  --allow-cidr 192.168.1.0/24 \
+  --targets 192.168.1.5 \
+  --arp-burst 3 \
+  --arp-interval 0.5
+```
+
+`--arp-burst` accepts 1-5 packets per cycle. `--arp-interval` accepts
+0.25-10 seconds. The same settings apply to NDP when the selected device has
+IPv6 information.
+
 ## Fake Server Modes
 
 | Flag | Behaviour |
@@ -121,6 +154,18 @@ snetshaper -i <interface> --allow-cidr 192.168.1.0/24 --targets 192.168.1.5 --li
 | `--host-ip <ip>` | Override the IP returned in spoofed A records |
 | `--dns-workers 16` | Set maximum concurrent DNS forwarding workers |
 | `--serve-ca-cert` | Explicitly enable serving the mitmproxy CA at `/cert` |
+| `--suppress-dnssec` | Clear CD/DO upstream, clear AD downstream, and return NODATA for DNSSEC record queries |
+| `--web-security-demo` | Enable the static lesson at `/training/web-security` |
+| `--idn-demo-domain арр.test` | Add a Unicode/Punycode example using a reserved training domain |
+
+DNSSEC suppression mode models a non-validating intermediary. It does not
+defeat validation on the endpoint: a correctly validating client should reject
+the unsigned result.
+
+The web security lesson contains no sign-in form and captures no credentials.
+It explains that preloaded or previously learned HSTS upgrades the request
+before an HTTP intermediary can act. IDN examples must end in `.test`,
+`.example`, `.invalid`, or `.localhost`.
 
 ## Non-Interactive Mode
 
@@ -130,10 +175,9 @@ Skip discovery and set all options from the command line:
 snetshaper -i eth0 --allow-cidr 192.168.1.0/24 --targets 192.168.1.5,192.168.1.6 --limit 1.5
 ```
 
-`--targets` accepts space-separated or comma-separated IPs. `--limit` sets
-bandwidth in Mbps; feature 4 (throttle) is automatically enabled when it is
-provided. `--allow-cidr` is required and should match the written
-authorization scope for the test.
+`--targets` accepts space-separated or comma-separated IPs. `--limit` and the
+netem flags configure feature 4 after it is selected. `--allow-cidr` is
+required and should match the written authorization scope for the test.
 
 ## Discovery Behaviour
 

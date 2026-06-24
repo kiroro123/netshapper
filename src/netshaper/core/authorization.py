@@ -6,14 +6,17 @@ Raises typed exceptions on authorization violations.
 """
 from __future__ import annotations
 
+from collections.abc import Sequence
 import logging
-from ipaddress import ip_address, ip_network
-from typing import Optional, Sequence
+from ipaddress import IPv4Network, IPv6Network, ip_address, ip_network
+from netshaper.exceptions import NetShaperError
+from typing import Optional, cast
 
 log = logging.getLogger("netshaper")
+Network = IPv4Network | IPv6Network
 
 
-class AuthorizationError(ValueError):
+class AuthorizationError(NetShaperError):
     """Raised when a target IP violates authorization policy."""
     pass
 
@@ -24,24 +27,25 @@ class AuthorizationPolicy:
     Provides read-only interface to prevent accidental mutation.
     """
 
-    def __init__(self, authorized_cidrs: Sequence):
+    def __init__(self, authorized_cidrs: Sequence[object]):
         """
         Initialize from raw CIDR values (strings or network objects).
         Converts to immutable tuple for thread-safety.
-        
+
         Args:
             authorized_cidrs: List of strings like "10.0.0.0/8" or network objects
-            
+
         Raises:
             ValueError: If no CIDRs provided or invalid format
         """
-        networks = []
+        networks: list[Network] = []
         for token in authorized_cidrs or []:
+            raw_items: Sequence[object]
             if isinstance(token, str):
                 raw_items = token.split(",")
             else:
                 raw_items = [token]
-            
+
             for item in raw_items:
                 if isinstance(item, str):
                     item = item.strip()
@@ -56,16 +60,16 @@ class AuthorizationPolicy:
                         and hasattr(item, "prefixlen")
                     ):
                         raise ValueError(f"invalid authorized CIDR object: {item!r}")
-                    networks.append(item)
-        
+                    networks.append(cast(Network, item))
+
         if not networks:
             raise ValueError("authorized_cidrs is required before creating NetShaper")
-        
+
         # Store as immutable tuple
-        self._authorized_cidrs: tuple = tuple(networks)
+        self._authorized_cidrs: tuple[Network, ...] = tuple(networks)
 
     @property
-    def cidrs(self) -> tuple:
+    def cidrs(self) -> tuple[Network, ...]:
         """Read-only access to authorized CIDRs."""
         return self._authorized_cidrs
 
@@ -79,11 +83,11 @@ class AuthorizationPolicy:
     ) -> None:
         """
         Validate that target IP is authorized and not reserved.
-        
+
         Args:
             raw_ip: IP address to validate
             own_ip, own_ipv6, gateway, gateway_ipv6: Local addresses to reject
-            
+
         Raises:
             AuthorizationError: If IP is not authorized or is reserved
         """
@@ -108,7 +112,7 @@ class AuthorizationPolicy:
         # Check CIDR allowlist
         if not self._authorized_cidrs:
             raise AuthorizationError("authorized_cidrs is empty; refusing target")
-        
+
         if not any(
             parsed.version == network.version and parsed in network
             for network in self._authorized_cidrs

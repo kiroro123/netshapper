@@ -43,15 +43,13 @@ jobs:
           ruff check src/netshaper/
           bandit -r src/netshaper/ -ll
 
-      - name: Privileged Test Clearance
-        run: |
-          echo "To merge to main, the following must be completed:"
-          echo "1. Run privileged network namespace tests on self-hosted runner"
-          echo "2. Verify no regressions in traffic shaping"
-          echo "3. Test stale session recovery"
-          echo ""
-          echo "Run this locally before merge:"
-          echo "  sudo pytest tests/test_netns_integration.py -v"
-          echo ""
-          echo "If you are a maintainer and have verified these:"
-          echo "  Set label: 'privileged-tests-passed'"
+      - name: Require privileged-test label
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const labels = (context.payload.pull_request.labels || []).map(l => l.name)
+            if (!labels.includes('privileged-tests-passed')) {
+              core.setFailed("Missing required label: privileged-tests-passed. Run privileged tests on an approved runner and add the label to proceed.")
+            } else {
+              core.info('privileged-tests-passed label present; merge clearance granted')
+            }

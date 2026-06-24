@@ -2,6 +2,7 @@
 NetShaper — Linux tc HTB traffic shaper.
 """
 import logging
+from dataclasses import dataclass
 from typing import Callable, List, Optional, Set, Tuple
 
 from netshaper.system import (
@@ -14,6 +15,71 @@ from netshaper.system import (
 log = logging.getLogger("netshaper")
 
 
+@dataclass(frozen=True)
+class ShapingProfile:
+    """Validated bandwidth and network-impairment settings."""
+
+    bandwidth_mbps: Optional[float] = None
+    latency_ms: int = 0
+    jitter_ms: int = 0
+    loss_percent: float = 0.0
+    corruption_percent: float = 0.0
+    duplicate_percent: float = 0.0
+    reorder_percent: float = 0.0
+
+    def __post_init__(self) -> None:
+        if (
+                self.bandwidth_mbps is not None
+                and not 0.1 <= self.bandwidth_mbps <= 1000):
+            raise ValueError("bandwidth_mbps must be between 0.1 and 1000")
+        if not 0 <= self.latency_ms <= 60_000:
+            raise ValueError("latency_ms must be between 0 and 60000")
+        if not 0 <= self.jitter_ms <= 60_000:
+            raise ValueError("jitter_ms must be between 0 and 60000")
+        for name in (
+                "loss_percent",
+                "corruption_percent",
+                "duplicate_percent",
+                "reorder_percent"):
+            value = getattr(self, name)
+            if not 0 <= value <= 100:
+                raise ValueError(f"{name} must be between 0 and 100")
+        if self.jitter_ms and not self.latency_ms:
+            raise ValueError("jitter_ms requires latency_ms")
+        if self.reorder_percent and not self.latency_ms:
+            raise ValueError("reorder_percent requires latency_ms")
+
+    @property
+    def has_impairments(self) -> bool:
+        return any((
+            self.latency_ms,
+            self.loss_percent,
+            self.corruption_percent,
+            self.duplicate_percent,
+            self.reorder_percent,
+        ))
+
+    def netem_arguments(self) -> List[str]:
+        args: List[str] = []
+        if self.latency_ms:
+            args.extend(["delay", f"{self.latency_ms}ms"])
+            if self.jitter_ms:
+                args.extend([
+                    f"{self.jitter_ms}ms",
+                    "distribution",
+                    "normal",
+                ])
+        if self.loss_percent:
+            args.extend(["loss", f"{self.loss_percent:g}%"])
+        if self.corruption_percent:
+            args.extend(["corrupt", f"{self.corruption_percent:g}%"])
+        if self.duplicate_percent:
+            args.extend(["duplicate", f"{self.duplicate_percent:g}%"])
+        if self.reorder_percent:
+            args.extend(["reorder", f"{self.reorder_percent:g}%"])
+        return args
+
+
 class TrafficShaper:
     def __init__(self, interface: str):
         self.interface         = interface
@@ -21,6 +87,7 @@ class TrafficShaper:
         self._root_qdisc_pending = False
         self._active_marks: Set[int] = set()
         self._target_filters: Set[Tuple[int, str]] = set()
+        self._target_qdiscs: Set[int] = set()
         self._target_classes: Set[int] = set()
         self._tracked_mark_bases: Set[int] = set()
 
@@ -72,6 +139,7 @@ class TrafficShaper:
         self._root_qdisc_pending = False
         self._active_marks.clear()
         self._target_filters.clear()
+        self._target_qdiscs.clear()
         self._target_classes.clear()
         self._tracked_mark_bases.clear()
 
@@ -122,12 +190,28 @@ class TrafficShaper:
                     f"Failed to journal NetShaper root qdisc on {self.interface}"
                 )
 
-    def apply_target(self, target_ip: str, mbps: float,
+    def apply_target(self, target_ip: str, mbps: Optional[float] = None,
                      mark_base: int = 10,
-                     journal: Optional[Callable[[], bool]] = None) -> None:
-        k = int(mbps * 1000)
+                     journal: Optional[Callable[[], bool]] = None,
+                     profile: Optional[ShapingProfile] = None) -> None:
+        if profile is None:
+            if mbps is None:
+                raise ValueError("mbps or profile is required")
+            profile = ShapingProfile(bandwidth_mbps=mbps)
+        rate_mbps = (
+            profile.bandwidth_mbps
+            if profile.bandwidth_mbps is not None
+            else mbps
+        )
+        # HTB requires a class rate even when only netem is requested.
+        if rate_mbps is None:
+            rate_mbps = 1000.0
+        if not 0.1 <= rate_mbps <= 1000:
+            raise ValueError("mbps must be between 0.1 and 1000")
+        k = int(rate_mbps * 1000)
         self._init_root(journal)
         created_classes: List[int] = []
+        created_qdiscs: List[int] = []
         created_filters: List[Tuple[int, str]] = []
         for mark in [mark_base, mark_base + 10]:
             classid = f"1:{mark}"
@@ -136,7 +220,7 @@ class TrafficShaper:
                  "parent", "1:", "classid", classid,
                  "htb", "rate", f"{k}kbit", "burst", "15k"]):
                 rollback_ok = self._rollback_failed_target(
-                    created_filters, created_classes)
+                    created_filters, created_qdiscs, created_classes)
                 message = f"Failed to create traffic class {classid}"
                 if not rollback_ok:
                     message += "; rollback incomplete"
@@ -145,11 +229,32 @@ class TrafficShaper:
             self._target_classes.add(mark)
             if not self._journal_resource(journal):
                 rollback_ok = self._rollback_failed_target(
-                    created_filters, created_classes)
+                    created_filters, created_qdiscs, created_classes)
                 message = f"Failed to journal traffic class {classid}"
                 if not rollback_ok:
                     message += "; rollback incomplete"
                 raise RuntimeError(message)
+            if profile.has_impairments:
+                if not SubprocessRunner.run(
+                    ["tc", "qdisc", "add", "dev", self.interface,
+                     "parent", classid, "handle", f"{mark}:",
+                     "netem", *profile.netem_arguments()]
+                ):
+                    rollback_ok = self._rollback_failed_target(
+                        created_filters, created_qdiscs, created_classes)
+                    message = f"Failed to create netem qdisc for {classid}"
+                    if not rollback_ok:
+                        message += "; rollback incomplete"
+                    raise RuntimeError(message)
+                created_qdiscs.append(mark)
+                self._target_qdiscs.add(mark)
+                if not self._journal_resource(journal):
+                    rollback_ok = self._rollback_failed_target(
+                        created_filters, created_qdiscs, created_classes)
+                    message = f"Failed to journal netem qdisc for {classid}"
+                    if not rollback_ok:
+                        message += "; rollback incomplete"
+                    raise RuntimeError(message)
             for proto in ["ip", "ipv6"]:
                 if not SubprocessRunner.run(
                     ["tc", "filter", "add", "dev", self.interface,
@@ -157,7 +262,7 @@ class TrafficShaper:
                      "handle", str(mark), "fw", "flowid", classid],
                     silent=True):
                     rollback_ok = self._rollback_failed_target(
-                        created_filters, created_classes)
+                        created_filters, created_qdiscs, created_classes)
                     message = f"Failed to create traffic filter for mark {mark}"
                     if not rollback_ok:
                         message += "; rollback incomplete"
@@ -166,7 +271,7 @@ class TrafficShaper:
                 self._target_filters.add((mark, proto))
                 if not self._journal_resource(journal):
                     rollback_ok = self._rollback_failed_target(
-                        created_filters, created_classes)
+                        created_filters, created_qdiscs, created_classes)
                     message = f"Failed to journal traffic filter for mark {mark}"
                     if not rollback_ok:
                         message += "; rollback incomplete"
@@ -174,14 +279,16 @@ class TrafficShaper:
         self._tracked_mark_bases.add(mark_base)
         self._active_marks.add(mark_base)
         log.info(
-            f"Shaping {target_ip}: {mbps} Mbps "
-            f"(marks {mark_base}/{mark_base + 10})")
+            f"Shaping {target_ip}: {rate_mbps} Mbps "
+            f"(netem={'on' if profile.has_impairments else 'off'}, "
+            f"marks {mark_base}/{mark_base + 10})")
 
     def _rollback_failed_target(
             self,
             filters: List[Tuple[int, str]],
+            qdiscs: List[int],
             classes: List[int]) -> bool:
-        ok = self._rollback_created(filters, classes)
+        ok = self._rollback_created(filters, qdiscs, classes)
         if self._base_initialized and not self._active_marks:
             ok = self.cleanup() and ok
         return ok
@@ -189,12 +296,19 @@ class TrafficShaper:
     def _rollback_created(
             self,
             filters: List[Tuple[int, str]],
+            qdiscs: List[int],
             classes: List[int]) -> bool:
         ok = True
         for mark, proto in reversed(filters):
             status = self._delete_filter(mark, proto)
             if status in (InspectionStatus.PRESENT, InspectionStatus.ABSENT):
                 self._target_filters.discard((mark, proto))
+            else:
+                ok = False
+        for mark in reversed(qdiscs):
+            status = self._delete_qdisc(mark)
+            if status in (InspectionStatus.PRESENT, InspectionStatus.ABSENT):
+                self._target_qdiscs.discard(mark)
             else:
                 ok = False
         for mark in reversed(classes):
@@ -234,6 +348,19 @@ class TrafficShaper:
             else InspectionStatus.ABSENT
         )
 
+    def _qdisc_state(self, mark: int) -> InspectionStatus:
+        result = inspect_resource(
+            ["tc", "qdisc", "show", "dev", self.interface,
+             "parent", f"1:{mark}"])
+        if result.status != InspectionStatus.PRESENT:
+            return result.status
+        output = result.stdout.lower()
+        return (
+            InspectionStatus.PRESENT
+            if f"qdisc netem {mark}:" in output
+            else InspectionStatus.ABSENT
+        )
+
     def _delete_filter(self, mark: int, proto: str) -> InspectionStatus:
         if SubprocessRunner.run(
                 ["tc", "filter", "del", "dev", self.interface,
@@ -257,6 +384,17 @@ class TrafficShaper:
             return InspectionStatus.ABSENT
         return InspectionStatus.ERROR
 
+    def _delete_qdisc(self, mark: int) -> InspectionStatus:
+        if SubprocessRunner.run(
+                ["tc", "qdisc", "del", "dev", self.interface,
+                 "parent", f"1:{mark}", "handle", f"{mark}:", "netem"],
+                check=False, silent=True):
+            return InspectionStatus.PRESENT
+        status = self._qdisc_state(mark)
+        if status is InspectionStatus.ABSENT:
+            return InspectionStatus.ABSENT
+        return InspectionStatus.ERROR
+
     def cleanup_target(self, mark_base: int) -> bool:
         ok = True
         expected_filters = {
@@ -267,6 +405,8 @@ class TrafficShaper:
         expected_classes = {mark_base, mark_base + 10}
         if not hasattr(self, "_target_filters"):
             self._target_filters = set()
+        if not hasattr(self, "_target_qdiscs"):
+            self._target_qdiscs = set()
         if not hasattr(self, "_target_classes"):
             self._target_classes = set()
         if not hasattr(self, "_tracked_mark_bases"):
@@ -286,6 +426,12 @@ class TrafficShaper:
                 self._target_filters.discard((mark, proto))
             else:
                 ok = False
+        for mark in sorted(self._target_qdiscs.intersection(expected_classes)):
+            status = self._delete_qdisc(mark)
+            if status in (InspectionStatus.PRESENT, InspectionStatus.ABSENT):
+                self._target_qdiscs.discard(mark)
+            else:
+                ok = False
         for mark in sorted(self._target_classes.intersection(expected_classes)):
             status = self._delete_class(mark)
             if status in (InspectionStatus.PRESENT, InspectionStatus.ABSENT):
@@ -294,6 +440,7 @@ class TrafficShaper:
                 ok = False
         remaining = (
             self._target_filters.intersection(expected_filters)
+            or self._target_qdiscs.intersection(expected_classes)
             or self._target_classes.intersection(expected_classes)
         )
         if ok and not remaining:

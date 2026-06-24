@@ -2,22 +2,19 @@
 """
 NetShaper — Captive Portal + Fake DNS Server
 
-Refactored version with:
 - DnsConfig dataclass for immutable DNS configuration
-- HTTPPortalConfig dataclass for HTTP configuration  
+- HTTPPortalConfig dataclass for HTTP configuration
 - CLI arguments for hardcoded paths
 - Phase 1/2 privilege dropping
 """
 
 import argparse
-import errno
 import logging
 import os
 import pwd
 import socket
 import sys
 import threading
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from ipaddress import ip_address
@@ -27,10 +24,10 @@ from typing import Optional, Set
 import psutil
 
 try:
-    from netshaper.utils import bold, cyan, green, print_flush, red, yellow
+    from netshaper.utils import bold, cyan, print_flush
 except ModuleNotFoundError:
     # Allows direct execution for development
-    from utils import bold, cyan, green, print_flush, red, yellow
+    from utils import bold, cyan, print_flush
 
 log = logging.getLogger("netshaper.captive_portal")
 
@@ -388,7 +385,8 @@ def main():
 
         try:
             PortalHandler.portal_config = http_config
-            http_server = HTTPServer(("0.0.0.0", args.http_port), PortalHandler)
+            # Captive portal intentionally listens on all interfaces for clients.
+            http_server = HTTPServer(("0.0.0.0", args.http_port), PortalHandler)  # nosec B104
         except OSError as e:
             raise RuntimeError(f"Cannot bind HTTP port {args.http_port}: {e}") from e
 

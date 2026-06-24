@@ -22,6 +22,42 @@ class CliTests(unittest.TestCase):
             args = cli.parse_args()
         self.assertEqual(args.limit, 7.5)
 
+    def test_parse_args_accepts_bounded_arp_training_controls(self):
+        with mock.patch("sys.argv", [
+            "netshaper", "--arp-interval", "0.5", "--arp-burst", "3"
+        ]):
+            args = cli.parse_args()
+
+        self.assertEqual(args.arp_interval, 0.5)
+        self.assertEqual(args.arp_burst, 3)
+
+    def test_parse_args_rejects_unbounded_arp_training_controls(self):
+        with mock.patch("sys.argv", [
+            "netshaper", "--arp-interval", "0.01", "--arp-burst", "20"
+        ]), mock.patch("sys.stderr"), self.assertRaises(SystemExit):
+            cli.parse_args()
+
+    def test_parse_args_accepts_netem_flags(self):
+        with mock.patch("sys.argv", [
+            "netshaper",
+            "--latency-ms", "100",
+            "--jitter-ms", "10",
+            "--loss-percent", "1.5",
+            "--duplicate-percent", "0.2",
+        ]):
+            args = cli.parse_args()
+
+        self.assertEqual(args.latency_ms, 100)
+        self.assertEqual(args.jitter_ms, 10)
+        self.assertEqual(args.loss_percent, 1.5)
+        self.assertEqual(args.duplicate_percent, 0.2)
+
+    def test_parse_args_rejects_reordering_without_latency(self):
+        with mock.patch("sys.argv", [
+            "netshaper", "--reorder-percent", "1"
+        ]), mock.patch("sys.stderr"), self.assertRaises(SystemExit):
+            cli.parse_args()
+
     def test_parse_args_accepts_emergency_restore_flags(self):
         with mock.patch("sys.argv", [
             "netshaper",
@@ -157,6 +193,8 @@ class CliTests(unittest.TestCase):
             captive_portal=False,
             http_redirect_port=None,
             limit=None,
+            arp_interval=2.0,
+            arp_burst=1,
         )
         ns.launch_sniffer.assert_called_once_with(
             target_ips=targets,
@@ -196,6 +234,8 @@ class CliTests(unittest.TestCase):
             captive_portal=False,
             http_redirect_port=None,
             limit=None,
+            arp_interval=2.0,
+            arp_burst=1,
         )
         ns.launch_sniffer.assert_called_once_with(
             target_ips=["192.0.2.10"],

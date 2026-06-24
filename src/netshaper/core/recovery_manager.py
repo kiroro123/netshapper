@@ -10,17 +10,17 @@ import json
 import logging
 import os
 import shutil
-import subprocess
-from typing import Callable, List, Optional
+from typing import Any, List, Optional
 
 from netshaper import config
-from netshaper.core.state_manager import NetworkStateSnapshot, StateSnapshotManager
+from netshaper.core.state_manager import StateSnapshotManager
 from netshaper.system import InspectionStatus, SubprocessRunner, inspect_resource
+from netshaper.exceptions import NetShaperError
 
 log = logging.getLogger("netshaper")
 
 
-class RecoveryError(RuntimeError):
+class RecoveryError(NetShaperError):
     """Raised when recovery operations fail."""
     pass
 
@@ -34,7 +34,7 @@ class RecoveryManager:
     def __init__(self, interface: str):
         """
         Initialize recovery manager for an interface.
-        
+
         Args:
             interface: Network interface name
         """
@@ -85,7 +85,7 @@ class RecoveryManager:
         proto: str,
         port: int,
         comment: Optional[str],
-    ) -> dict:
+    ) -> dict[str, Any]:
         """Generate rule specification for per-target INPUT rules."""
         comment_args = (
             ["-m", "comment", "--comment", comment] if comment else []
@@ -113,7 +113,7 @@ class RecoveryManager:
         binary: str,
         iface: str,
         comment: Optional[str],
-    ) -> List[dict]:
+    ) -> List[dict[str, Any]]:
         """Generate global firewall rule specs for stale cleanup."""
         comment_args = (
             ["-m", "comment", "--comment", comment] if comment else []
@@ -205,7 +205,7 @@ class RecoveryManager:
     def recover_stale_state(self) -> bool:
         """
         Scan for stale sessions and clean them up.
-        
+
         Returns:
             True if all recoveries succeeded, False if any failed
         """
@@ -213,7 +213,6 @@ class RecoveryManager:
             return True
 
         recovery_ok = True
-        recovery_attempted = False
 
         import glob
 
@@ -223,8 +222,6 @@ class RecoveryManager:
             cleanup_ok = self._cleanup_stale_session(state_path)
             if not cleanup_ok:
                 recovery_ok = False
-            else:
-                recovery_attempted = True
 
         return recovery_ok
 
@@ -276,7 +273,7 @@ class RecoveryManager:
 
         return cleanup_ok
 
-    def _cleanup_global_rules(self, data: dict, iface: str) -> bool:
+    def _cleanup_global_rules(self, data: dict[str, Any], iface: str) -> bool:
         """Clean global firewall rules from stale session."""
         cleanup_ok = True
 
@@ -333,7 +330,7 @@ class RecoveryManager:
 
         return cleanup_ok
 
-    def _cleanup_target_rules(self, data: dict, iface: str) -> bool:
+    def _cleanup_target_rules(self, data: dict[str, Any], iface: str) -> bool:
         """Clean per-target firewall rules from stale session."""
         cleanup_ok = True
 
@@ -362,11 +359,18 @@ class RecoveryManager:
                         rule_spec = self._target_input_rule_spec(
                             binary, iface, ip, proto, 53, rule_comment
                         )
-                        if SubprocessRunner.run(
-                            rule_spec["delete"], check=False, silent=True
-                        ):
-                            log.info(
-                                f"[Recovery] Removed {binary} DNS INPUT {ip}/{proto}"
+                        rule_status = self._inspect_stale_resource(rule_spec["check"])
+                        if rule_status is InspectionStatus.PRESENT:
+                            if SubprocessRunner.run(
+                                rule_spec["delete"], check=False, silent=True
+                            ):
+                                log.info(
+                                    f"[Recovery] Removed {binary} DNS INPUT {ip}/{proto}"
+                                )
+                        elif rule_status is InspectionStatus.ERROR:
+                            cleanup_ok = False
+                            log.error(
+                                f"[Recovery] Cannot inspect DNS INPUT rule for {ip}/{proto}"
                             )
 
                 http_port = target.get("http_redirect_port")
@@ -375,10 +379,17 @@ class RecoveryManager:
                     rule_spec = self._target_input_rule_spec(
                         binary, iface, ip, "tcp", int(http_port), rule_comment
                     )
-                    if SubprocessRunner.run(
-                        rule_spec["delete"], check=False, silent=True
-                    ):
-                        log.info(f"[Recovery] Removed {binary} HTTP INPUT {ip}")
+                    http_status = self._inspect_stale_resource(rule_spec["check"])
+                    if http_status is InspectionStatus.PRESENT:
+                        if SubprocessRunner.run(
+                            rule_spec["delete"], check=False, silent=True
+                        ):
+                            log.info(f"[Recovery] Removed {binary} HTTP INPUT {ip}")
+                    elif http_status is InspectionStatus.ERROR:
+                        cleanup_ok = False
+                        log.error(
+                            f"[Recovery] Cannot inspect HTTP INPUT rule for {ip}"
+                        )
 
                 # Clean mangle/nat chains
                 for table, hook, chain_name in chain_specs:
@@ -443,7 +454,7 @@ class RecoveryManager:
 
         return cleanup_ok
 
-    def _cleanup_traffic_shaper(self, data: dict, iface: str) -> bool:
+    def _cleanup_traffic_shaper(self, data: dict[str, Any], iface: str) -> bool:
         """Clean traffic shaper (tc) rules from stale session."""
         cleanup_ok = True
 
@@ -478,42 +489,11 @@ class RecoveryManager:
 
         return cleanup_ok
 
-    def _restore_sysctl_settings(self, data: dict) -> bool:
+    def _restore_sysctl_settings(self, data: dict[str, Any]) -> bool:
         """Restore sysctl settings to pre-session state."""
-        cleanup_ok = True
-
         snapshot_data = data.get("snapshot", {})
         snapshot = StateSnapshotManager.snapshot_from_state(snapshot_data)
-
-        if snapshot.ipv4_forwarding is not None:
-            if SubprocessRunner.run(
-                ["sysctl", "-w", f"net.ipv4.ip_forward={snapshot.ipv4_forwarding}"],
-                silent=True,
-            ):
-                log.info("[Recovery] Restored IPv4 forwarding")
-            else:
-                cleanup_ok = False
-
-        if snapshot.ipv6_forwarding is not None:
-            if SubprocessRunner.run(
-                ["sysctl", "-w", f"net.ipv6.conf.all.forwarding={snapshot.ipv6_forwarding}"],
-                silent=True,
-            ):
-                log.info("[Recovery] Restored IPv6 forwarding")
-            else:
-                cleanup_ok = False
-
-        if snapshot.route_localnet is not None:
-            if SubprocessRunner.run(
-                [
-                    "sysctl",
-                    "-w",
-                    f"net.ipv4.conf.{self.interface}.route_localnet={snapshot.route_localnet}",
-                ],
-                silent=True,
-            ):
-                log.info("[Recovery] Restored route_localnet")
-            else:
-                cleanup_ok = False
-
-        return cleanup_ok
+        ok = StateSnapshotManager.restore(snapshot, restore_firewall=False)
+        if ok:
+            log.info("[Recovery] Restored sysctl settings")
+        return ok

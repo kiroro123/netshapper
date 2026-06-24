@@ -7,7 +7,7 @@ import os
 import re
 import socket
 import struct
-import subprocess
+import subprocess  # nosec B404
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -304,7 +304,8 @@ class NetworkDiscovery:
             scope_networks: Optional[Sequence[IPv4Network]] = None) -> None:
         scopes = scope_networks or [subnet]
         try:
-            result = subprocess.run(
+            # Uses the system ip tool with fixed args for neighbor-cache reads.
+            result = subprocess.run(  # nosec B603 B607
                 ["ip", "-4", "neigh", "show", "dev", self.interface],
                 capture_output=True,
                 text=True,
@@ -552,7 +553,8 @@ class NetworkDiscovery:
         )
         for command in commands:
             try:
-                result = subprocess.run(
+                # Resolver commands are fixed; the IP value is parsed upstream.
+                result = subprocess.run(  # nosec B603
                     command,
                     capture_output=True,
                     text=True,

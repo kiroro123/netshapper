@@ -18,7 +18,7 @@ from netshaper.models import Device
 from netshaper.network.backends import RealPacketBackend
 from netshaper.network.firewall import FirewallManager
 from netshaper.network.spoofers import ARPSpoofer, NDPSpoofer
-from netshaper.network.shaper import TrafficShaper
+from netshaper.network.shaper import ShapingProfile, TrafficShaper
 
 log = logging.getLogger("netshaper")
 
@@ -53,11 +53,13 @@ class TargetSession:
         self.dns_on      = False
         self.throttle_on = False
         self.limit:    Optional[float] = None
+        self.shaping_profile: Optional[ShapingProfile] = None
         self._mark_id: Optional[int]   = None
 
     def setup(self, dns_spoof: bool = False, captive_portal: bool = False,
               http_redirect_port: Optional[int] = None,
               limit: Optional[float] = None,
+              shaping_profile: Optional[ShapingProfile] = None,
               mark_base: int = 10) -> None:
         session_id = getattr(self, "session_id", None)
         journal = getattr(self, "_journal", None)
@@ -78,12 +80,13 @@ class TargetSession:
                     f"Failed to add redirect rules for {self.target.ip}"
                 )
             self.dns_on = dns_spoof
-        if limit is not None:
+        if limit is not None or shaping_profile is not None:
             self.shaper.apply_target(
                 self.target.ip,
                 limit,
                 mark_base,
                 journal=journal,
+                profile=shaping_profile,
             )
             if not self.firewall.add_shaping(self.target.ip, mark_base):
                 self.shaper.cleanup_target(mark_base)
@@ -91,10 +94,21 @@ class TargetSession:
                     f"Failed to add shaping firewall marks for {self.target.ip}"
                 )
             self.throttle_on = True
-            self.limit        = limit
+            self.limit = (
+                shaping_profile.bandwidth_mbps
+                if shaping_profile is not None
+                else limit
+            )
+            self.shaping_profile = shaping_profile
             self._mark_id     = mark_base
 
-    def start_spoof(self, arp_on: bool = True) -> None:
+    def start_spoof(
+        self,
+        arp_on: bool = True,
+        *,
+        interval: float = 2.0,
+        burst: int = 1,
+    ) -> None:
         if config.DRY_RUN:
             log.info(f"[DRY-RUN] Would start spoofers for {self.target.ip}")
             return
@@ -104,7 +118,9 @@ class TargetSession:
             self.arp_spoof = ARPSpoofer(
                 self.interface, self.target.ip, self.target.mac,
                 self.gateway_ip, self.gateway_mac, self.own_mac, self,
-                packet_backend=packet_backend)
+                packet_backend=packet_backend,
+                interval=interval,
+                burst=burst)
             self.arp_spoof.start()
         if (arp_on
                 and self.target.ipv6
@@ -113,7 +129,9 @@ class TargetSession:
             self.ndp_spoof = NDPSpoofer(
                 self.interface, self.target.ipv6, self.target.mac,
                 self.gateway_ipv6, self.gateway_mac, self.own_mac, self,
-                packet_backend=packet_backend)
+                packet_backend=packet_backend,
+                interval=interval,
+                burst=burst)
             self.ndp_spoof.start()
 
     def stop_spoof(self) -> None:
@@ -159,6 +177,7 @@ class TargetSession:
                 self.throttle_on = False
                 self._mark_id = None
                 self.limit = None
+                self.shaping_profile = None
         if errors:
             log.warning(
                 f"Target {self.target.ip} cleanup completed with "
