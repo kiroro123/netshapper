@@ -115,7 +115,7 @@ A typical flow for testing a target device:
 
 - Dual-stack ARP + NDP spoofing (IPv4 and IPv6 MITM)
 - Per-target DNS redirect and captive portal (HTTP)
-- Bandwidth throttling via Linux `tc` HTB
+- Bandwidth throttling and controlled impairment via Linux `tc` HTB + netem
 - Packet capture with optional rolling `.pcap` files
 - Transparent HTTPS inspection via mitmproxy
 - Atomic state persistence and automatic stale-session recovery

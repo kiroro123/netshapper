@@ -3,9 +3,38 @@ from types import SimpleNamespace
 from unittest import mock
 
 from netshaper.core.session import TargetSession
+from netshaper.network.shaper import ShapingProfile
 
 
 class TargetSessionCleanupTests(unittest.TestCase):
+    def test_setup_passes_shaping_profile_to_shaper(self):
+        session = TargetSession.__new__(TargetSession)
+        session.target = SimpleNamespace(ip="192.0.2.10")
+        session.interface = "eth0"
+        session.session_id = "NS-TEST"
+        session._journal = None
+        session.firewall = None
+        session.shaper = mock.Mock()
+        profile = ShapingProfile(
+            bandwidth_mbps=5.0,
+            latency_ms=100,
+        )
+
+        with mock.patch("netshaper.core.session.FirewallManager") as fw_cls:
+            firewall = fw_cls.return_value
+            firewall.add_shaping.return_value = True
+            session.setup(shaping_profile=profile, mark_base=10)
+
+        session.shaper.apply_target.assert_called_once_with(
+            "192.0.2.10",
+            None,
+            10,
+            journal=None,
+            profile=profile,
+        )
+        self.assertTrue(session.throttle_on)
+        self.assertEqual(session.shaping_profile, profile)
+
     def test_dry_run_start_spoof_does_not_construct_spoofers(self):
         session = TargetSession.__new__(TargetSession)
         session.target = SimpleNamespace(ip="192.0.2.10")

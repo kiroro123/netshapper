@@ -7,6 +7,7 @@ from unittest import mock
 
 from netshaper.core.orchestrator import NetShaper
 from netshaper.core.state_manager import NetworkStateSnapshot, StateSnapshotManager
+from netshaper.network.shaper import ShapingProfile
 
 
 class StateSnapshotTests(unittest.TestCase):
@@ -33,7 +34,12 @@ class StateSnapshotTests(unittest.TestCase):
                 "192.0.2.20": SimpleNamespace(
                     target=SimpleNamespace(ip="192.0.2.20"),
                     dns_on=False,
-                    limit=None,
+                    limit=5.0,
+                    shaping_profile=ShapingProfile(
+                        bandwidth_mbps=5.0,
+                        latency_ms=100,
+                        loss_percent=1.0,
+                    ),
                     firewall=SimpleNamespace(
                         _http_redirect_port=None,
                         _rule_comment="netshaper:NS-TEST:192.0.2.20",
@@ -67,6 +73,18 @@ class StateSnapshotTests(unittest.TestCase):
             self.assertEqual(
                 data["targets"][0]["firewall_rule_comment"],
                 "netshaper:NS-TEST:192.0.2.20",
+            )
+            self.assertEqual(
+                data["targets"][0]["shaping_profile"],
+                {
+                    "bandwidth_mbps": 5.0,
+                    "latency_ms": 100,
+                    "jitter_ms": 0,
+                    "loss_percent": 1.0,
+                    "corruption_percent": 0.0,
+                    "duplicate_percent": 0.0,
+                    "reorder_percent": 0.0,
+                },
             )
 
     def test_save_state_records_global_rule_comment(self):

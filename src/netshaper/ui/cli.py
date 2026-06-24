@@ -24,6 +24,7 @@ from netshaper import config
 
 from netshaper.config import VERSION
 from netshaper.models import Device
+from netshaper.network.shaper import ShapingProfile
 from netshaper.system import SystemChecker, check_local_port
 from netshaper.utils import bold, cyan, green, print_flush, safe_input
 
@@ -64,6 +65,31 @@ def parse_args() -> argparse.Namespace:
         help="Set bandwidth throttling in Mbps without using the interactive prompt.",
     )
     parser.add_argument(
+        "--latency-ms",
+        type=int,
+        default=0,
+        help="Add target latency with tc netem (0-60000 ms).",
+    )
+    parser.add_argument(
+        "--jitter-ms",
+        type=int,
+        default=0,
+        help="Add normally distributed delay variation; requires --latency-ms.",
+    )
+    for option, destination, description in (
+        ("--loss-percent", "loss_percent", "random packet loss"),
+        ("--corruption-percent", "corruption_percent", "random corruption"),
+        ("--duplicate-percent", "duplicate_percent", "packet duplication"),
+        ("--reorder-percent", "reorder_percent", "packet reordering"),
+    ):
+        parser.add_argument(
+            option,
+            dest=destination,
+            type=float,
+            default=0.0,
+            help=f"Add {description} with tc netem (0-100 percent).",
+        )
+    parser.add_argument(
         "--emergency-restore-state",
         metavar="PATH",
         help=(
@@ -89,6 +115,18 @@ def parse_args() -> argparse.Namespace:
         ]
     if args.limit is not None and not 0.1 <= args.limit <= 1000:
         parser.error("--limit must be between 0.1 and 1000 Mbps")
+    try:
+        ShapingProfile(
+            bandwidth_mbps=args.limit,
+            latency_ms=args.latency_ms,
+            jitter_ms=args.jitter_ms,
+            loss_percent=args.loss_percent,
+            corruption_percent=args.corruption_percent,
+            duplicate_percent=args.duplicate_percent,
+            reorder_percent=args.reorder_percent,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
     return args
 
 
@@ -360,6 +398,7 @@ def run_active_session(
     sniff_on: bool,
     save_pcap: bool,
     rolling: bool,
+    shaping_profile: Optional[ShapingProfile] = None,
 ) -> None:
     try:
         target_ips = [target_ip(target) for target in targets]
@@ -369,14 +408,16 @@ def run_active_session(
         if not ns.save_state():
             raise RuntimeError("Could not update recovery state after global rules.")
         for target in targets:
-            ns.add_target(
-                target,
-                arp_on=arp_on,
-                dns_spoof=dns_spoof_on,
-                captive_portal=captive_portal,
-                http_redirect_port=http_redirect_port,
-                limit=limit if throttle_on else None,
-            )
+            target_options = {
+                "arp_on": arp_on,
+                "dns_spoof": dns_spoof_on,
+                "captive_portal": captive_portal,
+                "http_redirect_port": http_redirect_port,
+                "limit": limit if throttle_on else None,
+            }
+            if shaping_profile is not None:
+                target_options["shaping_profile"] = shaping_profile
+            ns.add_target(target, **target_options)
             if not ns.save_state():
                 raise RuntimeError("Could not update recovery state after target setup.")
 
@@ -564,6 +605,19 @@ def main() -> None:
             print_flush("      For HTTPS, install the mitmproxy CA on the target device.")
 
         limit = args.limit if throttle_on and args.limit is not None else pick_limit_ui() if throttle_on else None
+        shaping_profile = (
+            ShapingProfile(
+                bandwidth_mbps=limit,
+                latency_ms=args.latency_ms,
+                jitter_ms=args.jitter_ms,
+                loss_percent=args.loss_percent,
+                corruption_percent=args.corruption_percent,
+                duplicate_percent=args.duplicate_percent,
+                reorder_percent=args.reorder_percent,
+            )
+            if throttle_on
+            else None
+        )
         save_pcap = False
         rolling = False
         if sniff_on:
@@ -607,6 +661,11 @@ def main() -> None:
         if captive_portal:
             print_flush(f"    HTTP -> port: {http_redirect_port}")
         print_flush(f"  Throttle      : {green(f'{limit} Mbps') if throttle_on else 'No'}")
+        if shaping_profile and shaping_profile.has_impairments:
+            print_flush(
+                "    Netem       : "
+                + " ".join(shaping_profile.netem_arguments())
+            )
         print_flush(f"  mitmproxy     : {_yn(mitm_on)}")
         print_flush(f"  Sniffer       : {_yn(sniff_on)}")
         if sniff_on and save_pcap:
@@ -635,6 +694,7 @@ def main() -> None:
                 sniff_on=sniff_on,
                 save_pcap=save_pcap,
                 rolling=rolling,
+                shaping_profile=shaping_profile,
             )
         except KeyboardInterrupt:
             ns.stop_event.set()

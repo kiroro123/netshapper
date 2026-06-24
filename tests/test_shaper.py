@@ -1,11 +1,91 @@
 import unittest
 from unittest import mock
 
-from netshaper.network.shaper import TrafficShaper
+from netshaper.network.shaper import ShapingProfile, TrafficShaper
 from netshaper.system import InspectionResult, InspectionStatus
 
 
 class TrafficShaperTests(unittest.TestCase):
+    def test_shaping_profile_builds_netem_arguments(self):
+        profile = ShapingProfile(
+            bandwidth_mbps=5.0,
+            latency_ms=120,
+            jitter_ms=20,
+            loss_percent=1.5,
+            corruption_percent=0.1,
+            duplicate_percent=0.2,
+            reorder_percent=2.0,
+        )
+
+        self.assertEqual(
+            profile.netem_arguments(),
+            [
+                "delay", "120ms", "20ms", "distribution", "normal",
+                "loss", "1.5%",
+                "corrupt", "0.1%",
+                "duplicate", "0.2%",
+                "reorder", "2%",
+            ],
+        )
+
+    def test_shaping_profile_rejects_jitter_without_latency(self):
+        with self.assertRaisesRegex(ValueError, "jitter_ms requires"):
+            ShapingProfile(jitter_ms=10)
+
+    @mock.patch("netshaper.network.shaper.SubprocessRunner.run")
+    @mock.patch("netshaper.network.shaper.inspect_resource")
+    def test_apply_target_adds_netem_to_both_mark_classes(
+            self, inspect_mock, runner_mock):
+        inspect_mock.side_effect = [
+            InspectionResult(InspectionStatus.ABSENT),
+            InspectionResult(
+                InspectionStatus.PRESENT,
+                stdout="qdisc htb 1: root refcnt 2",
+            ),
+        ]
+        runner_mock.return_value = True
+        shaper = TrafficShaper("eth0")
+        profile = ShapingProfile(
+            bandwidth_mbps=5.0,
+            latency_ms=100,
+            jitter_ms=10,
+            loss_percent=1.0,
+        )
+
+        shaper.apply_target("192.0.2.10", profile=profile)
+
+        for mark in (10, 20):
+            runner_mock.assert_any_call(
+                [
+                    "tc", "qdisc", "add", "dev", "eth0",
+                    "parent", f"1:{mark}", "handle", f"{mark}:",
+                    "netem", "delay", "100ms", "10ms",
+                    "distribution", "normal", "loss", "1%",
+                ],
+            )
+        self.assertEqual(shaper._target_qdiscs, {10, 20})
+
+    @mock.patch("netshaper.network.shaper.SubprocessRunner.run")
+    def test_cleanup_target_removes_tracked_netem_qdiscs(self, runner_mock):
+        runner_mock.return_value = True
+        shaper = TrafficShaper("eth0")
+        shaper._active_marks.add(10)
+        shaper._tracked_mark_bases.add(10)
+        shaper._target_qdiscs = {10, 20}
+
+        result = shaper.cleanup_target(10)
+
+        self.assertTrue(result)
+        runner_mock.assert_any_call(
+            [
+                "tc", "qdisc", "del", "dev", "eth0",
+                "parent", "1:10", "handle", "10:", "netem",
+            ],
+            check=False,
+            silent=True,
+        )
+        self.assertEqual(shaper._target_qdiscs, set())
+
     @mock.patch("netshaper.network.shaper.SubprocessRunner.run")
     @mock.patch("netshaper.network.shaper.inspect_resource")
     def test_apply_target_refuses_to_replace_foreign_root_qdisc(

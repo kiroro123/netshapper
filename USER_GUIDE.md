@@ -105,6 +105,23 @@ You can also set throttle non-interactively:
 snetshaper -i <interface> --allow-cidr 192.168.1.0/24 --targets 192.168.1.5 --limit 2.5
 ```
 
+Feature `4` also supports controlled `tc netem` impairment:
+
+```bash
+snetshaper -i eth0 \
+  --allow-cidr 192.168.1.0/24 \
+  --targets 192.168.1.5 \
+  --limit 5 \
+  --latency-ms 120 \
+  --jitter-ms 20 \
+  --loss-percent 1.5
+```
+
+Available impairment flags are `--latency-ms`, `--jitter-ms`,
+`--loss-percent`, `--corruption-percent`, `--duplicate-percent`, and
+`--reorder-percent`. Jitter and reordering require a non-zero latency.
+All resources are journaled and removed during normal or stale-session cleanup.
+
 ## Fake Server Modes
 
 | Flag | Behaviour |
@@ -130,10 +147,9 @@ Skip discovery and set all options from the command line:
 snetshaper -i eth0 --allow-cidr 192.168.1.0/24 --targets 192.168.1.5,192.168.1.6 --limit 1.5
 ```
 
-`--targets` accepts space-separated or comma-separated IPs. `--limit` sets
-bandwidth in Mbps; feature 4 (throttle) is automatically enabled when it is
-provided. `--allow-cidr` is required and should match the written
-authorization scope for the test.
+`--targets` accepts space-separated or comma-separated IPs. `--limit` and the
+netem flags configure feature 4 after it is selected. `--allow-cidr` is
+required and should match the written authorization scope for the test.
 
 ## Discovery Behaviour
 

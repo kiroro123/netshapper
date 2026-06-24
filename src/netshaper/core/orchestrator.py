@@ -17,6 +17,7 @@ import tempfile
 import threading
 import time
 import uuid
+from dataclasses import asdict
 from typing import Dict, List, Optional, Sequence, Union
 
 import psutil
@@ -31,7 +32,7 @@ from netshaper.core.session import TargetSession
 from netshaper.core.state_manager import NetworkStateSnapshot, StateSnapshotManager
 from netshaper.models import Device, MarkIDPool
 from netshaper.network.discovery import NetworkDiscovery
-from netshaper.network.shaper import TrafficShaper
+from netshaper.network.shaper import ShapingProfile, TrafficShaper
 from netshaper.system import (
     SystemChecker,
     check_local_port,
@@ -442,6 +443,7 @@ class NetShaper:
         captive_portal: bool = False,
         http_redirect_port: Optional[int] = None,
         limit: Optional[float] = None,
+        shaping_profile: Optional[ShapingProfile] = None,
     ) -> None:
         """Add an interception session.
 
@@ -493,6 +495,7 @@ class NetShaper:
                 captive_portal=captive_portal,
                 http_redirect_port=http_redirect_port,
                 limit=limit,
+                shaping_profile=shaping_profile,
                 mark_base=mark_base,
             )
             session.start_spoof(arp_on=arp_on)
@@ -718,6 +721,11 @@ class NetShaper:
                 "ip": s.target.ip,
                 "dns": self._session_dns_recorded(s),
                 "limit": s.limit,
+                "shaping_profile": (
+                    asdict(getattr(s, "shaping_profile"))
+                    if getattr(s, "shaping_profile", None) is not None
+                    else None
+                ),
                 "http_redirect_port": (
                     getattr(s.firewall, "_http_redirect_port", None)
                     if s.firewall else None
