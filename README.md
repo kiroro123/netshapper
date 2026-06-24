@@ -234,7 +234,10 @@ Treat Git history and packet captures as sensitive material.
 
 ## Logs and Debugging
 
-When running normally (not `--dry-run`), NetShaper writes to `/var/log/netshaper.log`.
+When running normally (not `--dry-run`), NetShaper writes to
+`/var/log/netshaper.log`. Set `NETSHAPER_LOG_FILE` to use another path and
+`NETSHAPER_LOG_LEVEL` to select a standard Python logging level such as
+`DEBUG`, `INFO`, or `WARNING`.
 
 After startup, the CLI prints a verified evidence block:
 - Session ID, timestamp, interface
