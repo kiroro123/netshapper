@@ -102,7 +102,13 @@ class TargetSession:
             self.shaping_profile = shaping_profile
             self._mark_id     = mark_base
 
-    def start_spoof(self, arp_on: bool = True) -> None:
+    def start_spoof(
+        self,
+        arp_on: bool = True,
+        *,
+        interval: float = 2.0,
+        burst: int = 1,
+    ) -> None:
         if config.DRY_RUN:
             log.info(f"[DRY-RUN] Would start spoofers for {self.target.ip}")
             return
@@ -112,7 +118,9 @@ class TargetSession:
             self.arp_spoof = ARPSpoofer(
                 self.interface, self.target.ip, self.target.mac,
                 self.gateway_ip, self.gateway_mac, self.own_mac, self,
-                packet_backend=packet_backend)
+                packet_backend=packet_backend,
+                interval=interval,
+                burst=burst)
             self.arp_spoof.start()
         if (arp_on
                 and self.target.ipv6
@@ -121,7 +129,9 @@ class TargetSession:
             self.ndp_spoof = NDPSpoofer(
                 self.interface, self.target.ipv6, self.target.mac,
                 self.gateway_ipv6, self.gateway_mac, self.own_mac, self,
-                packet_backend=packet_backend)
+                packet_backend=packet_backend,
+                interval=interval,
+                burst=burst)
             self.ndp_spoof.start()
 
     def stop_spoof(self) -> None:

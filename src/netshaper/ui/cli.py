@@ -25,6 +25,7 @@ from netshaper import config
 from netshaper.config import VERSION
 from netshaper.models import Device
 from netshaper.network.shaper import ShapingProfile
+from netshaper.network.spoofers import validate_spoof_timing
 from netshaper.system import SystemChecker, check_local_port
 from netshaper.utils import bold, cyan, green, print_flush, safe_input
 
@@ -63,6 +64,18 @@ def parse_args() -> argparse.Namespace:
         "--limit",
         type=float,
         help="Set bandwidth throttling in Mbps without using the interactive prompt.",
+    )
+    parser.add_argument(
+        "--arp-interval",
+        type=float,
+        default=2.0,
+        help="Seconds between ARP/NDP training cycles (0.25-10).",
+    )
+    parser.add_argument(
+        "--arp-burst",
+        type=int,
+        default=1,
+        help="Packets sent per ARP/NDP training cycle (1-5).",
     )
     parser.add_argument(
         "--latency-ms",
@@ -115,6 +128,10 @@ def parse_args() -> argparse.Namespace:
         ]
     if args.limit is not None and not 0.1 <= args.limit <= 1000:
         parser.error("--limit must be between 0.1 and 1000 Mbps")
+    try:
+        validate_spoof_timing(args.arp_interval, args.arp_burst)
+    except ValueError as exc:
+        parser.error(str(exc))
     try:
         ShapingProfile(
             bandwidth_mbps=args.limit,
@@ -399,6 +416,8 @@ def run_active_session(
     save_pcap: bool,
     rolling: bool,
     shaping_profile: Optional[ShapingProfile] = None,
+    arp_interval: float = 2.0,
+    arp_burst: int = 1,
 ) -> None:
     try:
         target_ips = [target_ip(target) for target in targets]
@@ -414,6 +433,8 @@ def run_active_session(
                 "captive_portal": captive_portal,
                 "http_redirect_port": http_redirect_port,
                 "limit": limit if throttle_on else None,
+                "arp_interval": arp_interval,
+                "arp_burst": arp_burst,
             }
             if shaping_profile is not None:
                 target_options["shaping_profile"] = shaping_profile
@@ -656,6 +677,11 @@ def main() -> None:
         print_flush(cyan('-' * W))
         print_flush(f"  Targets       : {cyan(', '.join(target_ips))}")
         print_flush(f"  ARP spoof     : {_yn(arp_on)}")
+        if arp_on:
+            print_flush(
+                f"    Burst/timing: {args.arp_burst} packet(s) "
+                f"every {args.arp_interval:g}s"
+            )
         print_flush(f"  DNS spoof     : {_yn(dns_spoof_on)}")
         print_flush(f"  Captive portal: {_yn(captive_portal)}")
         if captive_portal:
@@ -695,6 +721,8 @@ def main() -> None:
                 save_pcap=save_pcap,
                 rolling=rolling,
                 shaping_profile=shaping_profile,
+                arp_interval=args.arp_interval,
+                arp_burst=args.arp_burst,
             )
         except KeyboardInterrupt:
             ns.stop_event.set()

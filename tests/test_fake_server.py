@@ -189,6 +189,52 @@ class CertificateHandlerTests(unittest.TestCase):
         self.assertIn(b"CA certificate serving is disabled", response)
 
 
+class WebSecurityDemoTests(unittest.TestCase):
+    def setUp(self):
+        self.original_enabled = fake_server3.WEB_SECURITY_DEMO
+        self.original_domains = list(fake_server3.IDN_DEMO_DOMAINS)
+
+    def tearDown(self):
+        fake_server3.WEB_SECURITY_DEMO = self.original_enabled
+        fake_server3.IDN_DEMO_DOMAINS = self.original_domains
+
+    def test_rejects_non_reserved_idn_demo_domain(self):
+        with self.assertRaisesRegex(ValueError, "must end"):
+            fake_server3.normalize_idn_demo_domain("example.com")
+
+    def test_normalizes_reserved_unicode_domain_to_punycode(self):
+        unicode_domain, ascii_domain = (
+            fake_server3.normalize_idn_demo_domain("арр.test")
+        )
+
+        self.assertEqual(unicode_domain, "арр.test")
+        self.assertTrue(ascii_domain.startswith("xn--"))
+        self.assertTrue(ascii_domain.endswith(".test"))
+
+    def test_training_page_is_disabled_by_default(self):
+        fake_server3.WEB_SECURITY_DEMO = False
+
+        response = handle_http_request("/training/web-security")
+
+        self.assertIn(b"HTTP/1.0 404 Not Found", response)
+
+    def test_training_page_has_no_form_and_explains_hsts_limit(self):
+        fake_server3.WEB_SECURITY_DEMO = True
+        fake_server3.IDN_DEMO_DOMAINS = [
+            fake_server3.normalize_idn_demo_domain("арр.test")
+        ]
+
+        with mock.patch("netshaper.fake_server3.print_flush"):
+            response = handle_http_request("/training/web-security")
+
+        self.assertIn(b"HTTP/1.0 200 OK", response)
+        self.assertIn(b"Strict-Transport-Security:", response)
+        self.assertIn(b"Preloaded or previously learned HSTS", response)
+        self.assertIn(b"xn--", response)
+        self.assertNotIn(b"<form", response.lower())
+        self.assertNotIn(b"password", response.lower())
+
+
 class DnsForwardingTests(unittest.TestCase):
     def setUp(self):
         self.original_upstream = fake_server3.DNS_UPSTREAM
@@ -223,6 +269,65 @@ class DnsForwardingTests(unittest.TestCase):
             0,
         )
         upstream_sock.sendto.assert_called_once_with(b"query", sockaddr)
+
+
+class DnssecSuppressionTests(unittest.TestCase):
+    def _make_query_with_opt(self, *, do: bool = True, cd: bool = True) -> bytes:
+        flags = 0x0110 if cd else 0x0100
+        header = (
+            b"\x12\x34"
+            + flags.to_bytes(2, "big")
+            + b"\x00\x01\x00\x00\x00\x00\x00\x01"
+        )
+        question = b"\x07example\x03com\x00\x00\x01\x00\x01"
+        z_flags = 0x8000 if do else 0
+        opt = (
+            b"\x00"
+            + b"\x00\x29"
+            + b"\x04\xd0"
+            + (z_flags).to_bytes(4, "big")
+            + b"\x00\x00"
+        )
+        return header + question + opt
+
+    def test_suppress_dnssec_query_clears_cd_and_do(self):
+        query = self._make_query_with_opt()
+
+        altered, changed = fake_server3.suppress_dnssec_query(query)
+
+        self.assertTrue(changed)
+        self.assertEqual(int.from_bytes(altered[2:4], "big") & 0x0010, 0)
+        ttl_offset = fake_server3._find_opt_ttl_offset(altered)
+        self.assertIsNotNone(ttl_offset)
+        self.assertEqual(altered[ttl_offset + 2] & 0x80, 0)
+
+    def test_suppress_dnssec_response_clears_ad(self):
+        response = b"\x12\x34\x81\xa0" + b"\x00" * 8
+
+        altered = fake_server3.suppress_dnssec_response(response)
+
+        self.assertEqual(int.from_bytes(altered[2:4], "big") & 0x0020, 0)
+
+    def test_dnssec_qtype_returns_nodata_without_upstream(self):
+        query = ParseDnsQuestionTests()._make_query(
+            "signed.example.test", qtype=48
+        )
+        sock = mock.Mock()
+        original = fake_server3.DNS_SUPPRESS_DNSSEC
+        fake_server3.DNS_SUPPRESS_DNSSEC = True
+        try:
+            with mock.patch(
+                "netshaper.fake_server3.forward_dns_query"
+            ) as forward_mock, mock.patch("netshaper.fake_server3.print_flush"):
+                fake_server3.handle_dns_query(
+                    sock, query, ("192.0.2.5", 5353)
+                )
+        finally:
+            fake_server3.DNS_SUPPRESS_DNSSEC = original
+
+        forward_mock.assert_not_called()
+        response = sock.sendto.call_args.args[0]
+        self.assertEqual(response[6:8], b"\x00\x00")
 
 
 class ServeDnsTests(unittest.TestCase):

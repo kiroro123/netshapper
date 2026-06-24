@@ -103,5 +103,30 @@ class ARPSpooferShutdownTests(unittest.TestCase):
         self.assertEqual(backend.send.call_count, 6)
 
 
+class SpoofTimingTests(unittest.TestCase):
+    def test_burst_helper_sends_bounded_count(self):
+        from netshaper.network import spoofers
+
+        backend = mock.Mock()
+        packet = object()
+        spoofers._send_burst(backend, packet, "eth0", 3)
+
+        self.assertEqual(backend.send.call_count, 3)
+        backend.send.assert_called_with(packet, "eth0")
+
+    def test_timing_rejects_unbounded_values(self):
+        from netshaper.network.spoofers import validate_spoof_timing
+
+        for interval, burst in ((0.1, 1), (2.0, 0), (2.0, 6)):
+            with self.subTest(interval=interval, burst=burst):
+                with self.assertRaises(ValueError):
+                    validate_spoof_timing(interval, burst)
+
+    def test_timing_accepts_lab_bounds(self):
+        from netshaper.network.spoofers import validate_spoof_timing
+
+        self.assertEqual(validate_spoof_timing(0.25, 5), (0.25, 5))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

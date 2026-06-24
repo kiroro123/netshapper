@@ -444,6 +444,8 @@ class NetShaper:
         http_redirect_port: Optional[int] = None,
         limit: Optional[float] = None,
         shaping_profile: Optional[ShapingProfile] = None,
+        arp_interval: float = 2.0,
+        arp_burst: int = 1,
     ) -> None:
         """Add an interception session.
 
@@ -498,7 +500,11 @@ class NetShaper:
                 shaping_profile=shaping_profile,
                 mark_base=mark_base,
             )
-            session.start_spoof(arp_on=arp_on)
+            session.start_spoof(
+                arp_on=arp_on,
+                interval=arp_interval,
+                burst=arp_burst,
+            )
         except Exception as exc:
             cleanup_ok = False
             try:
@@ -523,7 +529,8 @@ class NetShaper:
         log.info(
             f"Target {target.ip} added "
             f"(ARP={arp_on} DNS={dns_spoof} "
-            f"Portal={captive_portal} HTTP→{http_redirect_port})"
+            f"Portal={captive_portal} HTTP→{http_redirect_port} "
+            f"ARP-burst={arp_burst}@{arp_interval:.2f}s)"
         )
 
 
@@ -722,7 +729,7 @@ class NetShaper:
                 "dns": self._session_dns_recorded(s),
                 "limit": s.limit,
                 "shaping_profile": (
-                    asdict(getattr(s, "shaping_profile"))
+                    asdict(s.shaping_profile)
                     if getattr(s, "shaping_profile", None) is not None
                     else None
                 ),
