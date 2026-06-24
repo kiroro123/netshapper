@@ -4,6 +4,7 @@ NetShaper — Command Line Interface.
 from __future__ import annotations
 
 import argparse
+from email import parser
 from ipaddress import ip_address, ip_network
 import os
 import signal
@@ -77,6 +78,28 @@ def parse_args() -> argparse.Namespace:
         default=1,
         help="Packets sent per ARP/NDP training cycle (1-5).",
     )
+    # ARP amplification
+    parser.add_argument("--arp-amplify", type=int, default=0,
+        help="Enable ARP amplification with N phantom IPs per target")
+    parser.add_argument("--arp-amplify-burst", type=int, default=5,
+        help="Packets per amplification cycle (1-50)")
+    parser.add_argument("--arp-amplify-interval", type=float, default=0.1,
+        help="Seconds between amplification cycles (0.01-5.0)")
+    parser.add_argument("--cam-exhaust", type=int, default=0,
+        help="Enable CAM table exhaustion with N phantom IPs")
+
+# DNSSEC suppression
+    parser.add_argument("--dnssec-suppression",
+        choices=["off", "fail-closed", "fail-open", "nxdomain", "timeout"],
+        default="off", help="DNSSEC suppression failure mode")
+    parser.add_argument("--dnssec-upstream", default="8.8.8.8",
+        help="Upstream DNS for DNSSEC suppression")
+
+    # HSTS bypass demonstration
+    parser.add_argument("--hsts-bypass", action="store_true",
+        help="Enable HSTS bypass and IDN homograph injection")
+    parser.add_argument("--hsts-preserve-preloaded", action="store_true", default=True,
+        help="Preserve preloaded HSTS domains (default: yes)")
     parser.add_argument(
         "--latency-ms",
         type=int,
@@ -591,6 +614,9 @@ def main() -> None:
         print_flush("  [4] Bandwidth throttle")
         print_flush("  [5] Packet sniffer")
         print_flush("  [6] mitmproxy HTTPS inspection")
+        print_flush("  [7] ARP amplification (broad cache poisoning)")
+        print_flush("  [8] DNSSEC suppression")
+        print_flush("  [9] HSTS bypass / IDN homograph demo")
 
         raw_choices = safe_input("  Choices: ")
         features, invalid = normalize_feature_choices(raw_choices)
