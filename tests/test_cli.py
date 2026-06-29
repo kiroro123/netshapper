@@ -84,9 +84,57 @@ class CliTests(unittest.TestCase):
             cli.parse_args()
 
     def test_normalize_feature_choices_rejects_bad_input(self):
-        features, invalid = cli.normalize_feature_choices("1 9 x")
+        features, invalid = cli.normalize_feature_choices("1 10 x")
         self.assertEqual(features, {1})
-        self.assertEqual(invalid, ["9", "x"])
+        self.assertEqual(invalid, ["10", "x"])
+
+    def test_normalize_feature_choices_accepts_exploit_features(self):
+        features, invalid = cli.normalize_feature_choices("7 8 9")
+        self.assertEqual(features, {7, 8, 9})
+        self.assertEqual(invalid, [])
+
+    def test_parse_args_accepts_exploit_flags(self):
+        with mock.patch("sys.argv", [
+            "netshaper",
+            "--arp-amplify", "128",
+            "--arp-amplify-burst", "10",
+            "--arp-amplify-interval", "0.2",
+            "--cam-exhaust", "64",
+            "--dnssec-suppression", "fail-open",
+            "--dnssec-upstream", "1.1.1.1",
+            "--hsts-bypass",
+        ]):
+            args = cli.parse_args()
+
+        self.assertEqual(args.arp_amplify, 128)
+        self.assertEqual(args.arp_amplify_burst, 10)
+        self.assertEqual(args.arp_amplify_interval, 0.2)
+        self.assertEqual(args.cam_exhaust, 64)
+        self.assertEqual(args.dnssec_suppression, "fail-open")
+        self.assertEqual(args.dnssec_upstream, "1.1.1.1")
+        self.assertTrue(args.hsts_bypass)
+
+    def test_resolve_exploit_options_merges_menu_and_flags(self):
+        with mock.patch("sys.argv", [
+            "netshaper",
+            "--dnssec-suppression", "nxdomain",
+            "--arp-amplify", "32",
+        ]):
+            args = cli.parse_args()
+
+        exploit = cli.resolve_exploit_options(args, {8, 9})
+        self.assertEqual(exploit.dnssec_mode, "nxdomain")
+        self.assertEqual(exploit.arp_amplify, 32)
+        self.assertTrue(exploit.hsts_bypass)
+
+    def test_resolve_exploit_options_uses_defaults_for_menu_only(self):
+        with mock.patch("sys.argv", ["netshaper"]):
+            args = cli.parse_args()
+
+        exploit = cli.resolve_exploit_options(args, {7, 8, 9})
+        self.assertEqual(exploit.arp_amplify, 256)
+        self.assertEqual(exploit.dnssec_mode, "fail-closed")
+        self.assertTrue(exploit.hsts_bypass)
 
     def test_normalize_feature_choices_accepts_comma_separated_values(self):
         features, invalid = cli.normalize_feature_choices("1, 3,5 6")
@@ -334,6 +382,39 @@ class CliTests(unittest.TestCase):
         ns.runtime_evidence_lines.assert_called_once()
         ns.cleanup.assert_called_once()
 
+    def test_run_active_session_starts_arp_amplification_when_requested(self):
+        ns = mock.Mock()
+        ns.stop_event = mock.Mock()
+        ns.stop_event.wait.return_value = True
+        ns.save_state.return_value = True
+        ns.runtime_health_issues.return_value = []
+        ns.runtime_evidence_lines.return_value = ["Session ID: NS-TEST"]
+        exploit = cli.ExploitOptions(arp_amplify=64, cam_exhaust=32)
+
+        with mock.patch("netshaper.ui.cli.print_flush"):
+            cli.run_active_session(
+                ns,
+                ["192.0.2.10"],
+                arp_on=True,
+                dns_spoof_on=False,
+                captive_portal=False,
+                http_redirect_port=None,
+                throttle_on=False,
+                limit=None,
+                sniff_on=False,
+                save_pcap=False,
+                rolling=False,
+                exploit=exploit,
+            )
+
+        ns.start_arp_amplification.assert_called_once_with(
+            phantom_count=64,
+            burst=5,
+            interval=0.1,
+            cam_exhaust=32,
+        )
+        ns.cleanup.assert_called_once()
+
     def test_main_exits_when_stale_recovery_fails(self):
         ns = mock.Mock()
         ns.load_state_and_cleanup.return_value = False
@@ -459,7 +540,7 @@ class CliTests(unittest.TestCase):
              mock.patch("netshaper.ui.cli.pick_targets_ui",
                         return_value=[target]), \
              mock.patch("netshaper.ui.cli.safe_input",
-                        side_effect=["2", "n"]), \
+                        side_effect=["2", "n", "n"]), \
              mock.patch("netshaper.ui.cli.check_local_port",
                         return_value=False), \
              mock.patch("netshaper.ui.cli.run_active_session") as run_mock, \

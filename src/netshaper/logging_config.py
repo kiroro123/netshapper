@@ -24,7 +24,7 @@ def setup_logging(
 ) -> None:
     """
     Configure logging with file and optional console output.
-    
+
     Args:
         level: Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
         log_file: Path to log file (requires writable directory)
@@ -33,23 +33,23 @@ def setup_logging(
     # Get root logger
     root_logger = logging.getLogger("netshaper")
     root_logger.setLevel(getattr(logging, level, logging.INFO))
-    
+
     # Clear any existing handlers
     root_logger.handlers.clear()
-    
+
     # Format for structured logs
     formatter = logging.Formatter(
         "[%(asctime)s] [%(name)s] [%(levelname)s] %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
-    
+
     # Console handler (stderr)
     if console:
         console_handler = logging.StreamHandler(sys.stderr)
         console_handler.setLevel(getattr(logging, level, logging.INFO))
         console_handler.setFormatter(formatter)
         root_logger.addHandler(console_handler)
-    
+
     # File handler (if log directory is writable)
     try:
         if log_file:
@@ -62,7 +62,7 @@ def setup_logging(
             file_handler.setLevel(getattr(logging, level, logging.INFO))
             file_handler.setFormatter(formatter)
             root_logger.addHandler(file_handler)
-    except (OSError, PermissionError) as e:
+    except (OSError, PermissionError):
         # Silently skip file logging if directory is not writable
         # (common in unprivileged test environments)
         pass
