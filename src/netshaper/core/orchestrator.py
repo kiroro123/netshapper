@@ -706,7 +706,7 @@ class NetShaper:
 
         if cam_exhaust:
             amplifier.start_cam_exhaustion(
-                self.gw_mac,
+                self.gw,
                 subnet,
                 phantom_count=cam_exhaust,
                 burst=bounded_burst,
