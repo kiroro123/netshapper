@@ -156,3 +156,50 @@ class AuthorizationPolicy:
             raise AuthorizationError(
                 f"CIDR scope {requested} is outside authorized allowlist"
             )
+
+    @staticmethod
+    def _validate_bssid_format(raw_bssid: str) -> None:
+        """Validate BSSID (MAC address) format: aa:bb:cc:dd:ee:ff"""
+        if not isinstance(raw_bssid, str):
+            raise AuthorizationError(f"BSSID must be a string, got {type(raw_bssid).__name__}")
+        import re
+        if not re.match(r"^[0-9a-fA-F]{2}(:[0-9a-fA-F]{2}){5}$", raw_bssid):
+            raise AuthorizationError(
+                f"invalid BSSID format {raw_bssid!r}; expected aa:bb:cc:dd:ee:ff"
+            )
+
+    @staticmethod
+    def _validate_essid_format(raw_essid: str) -> None:
+        """Validate ESSID format: UTF-8 string, 0-32 bytes"""
+        if not isinstance(raw_essid, str):
+            raise AuthorizationError(f"ESSID must be a string, got {type(raw_essid).__name__}")
+        essid_bytes = raw_essid.encode("utf-8")
+        if len(essid_bytes) > 32:
+            raise AuthorizationError(
+                f"ESSID exceeds 32 bytes: {len(essid_bytes)} bytes"
+            )
+
+    def assert_bssid_authorized(
+        self,
+        raw_bssid: str,
+        authorized_bssids: tuple[str, ...],
+    ) -> None:
+        """Validate that a BSSID is in the authorized allowlist."""
+        self._validate_bssid_format(raw_bssid)
+        bssid_upper = raw_bssid.upper()
+        if not any(b.upper() == bssid_upper for b in authorized_bssids):
+            raise AuthorizationError(
+                f"BSSID {raw_bssid} is outside authorized allowlist"
+            )
+
+    def assert_essid_authorized(
+        self,
+        raw_essid: str,
+        authorized_essids: tuple[str, ...],
+    ) -> None:
+        """Validate that an ESSID is in the authorized allowlist."""
+        self._validate_essid_format(raw_essid)
+        if raw_essid not in authorized_essids:
+            raise AuthorizationError(
+                f"ESSID {raw_essid!r} is outside authorized allowlist"
+            )
