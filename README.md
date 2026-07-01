@@ -59,6 +59,7 @@ NetShaper is organized into independently auditable components:
 | **TrafficShaper** | Linux `tc`-based bandwidth throttling via HTB qdisc | Qdisc lifecycle, rate limiting |
 | **PacketSniffer** | Captures packets to .pcap using libpcap | Packet capture, rolling files |
 | **NetworkDiscovery** | ARP sweep and hostname resolution | Network scanning, host enumeration |
+| **PluginLoader** | Discovers and loads third-party extension modules | Plugin registry, entry point discovery |
 
 ## Workflow: DNS Redirect + Captive Portal + HTTPS Inspection
 
@@ -124,6 +125,7 @@ A typical flow for testing a target device:
 - Atomic state persistence and automatic stale-session recovery
 - Full `--dry-run` mode — prints commands without touching the system
 - Modular, independently auditable components
+- **Plugin system:** Load third-party extension modules (WiFi recon, BLE scanning, etc.)
 
 ## Requirements
 
@@ -182,6 +184,62 @@ The web lesson is available at `/training/web-security`. IDN examples are
 restricted to reserved `.test`, `.example`, `.invalid`, and `.localhost`
 domains. Established or preloaded HSTS is not bypassed; the lesson demonstrates
 the first-visit downgrade boundary and browser IDN display behavior.
+
+## Plugin System
+
+NetShaper supports third-party extension modules (plugins) for specialized capabilities
+like wireless reconnaissance or Bluetooth scanning.
+
+### Installing a Plugin
+
+Plugins are installed as Python packages with an entry point:
+
+```bash
+pip install netshaper-wifi-recon  # example plugin package
+```
+
+The plugin must declare itself in its `pyproject.toml`:
+
+```toml
+[project.entry-points."netshaper.plugins"]
+wifi-recon = "netshaper_wifi_recon:WifiReconPlugin"
+```
+
+### Using a Plugin
+
+Pass `--plugin` to the CLI:
+
+```bash
+sudo env PYTHONPATH="$PWD/src" python -m netshaper -i <interface> \
+  --allow-cidr <authorized-cidr> \
+  --plugin wifi-recon \
+  --plugin-config config.json
+```
+
+Plugins are started before target discovery and stopped on session shutdown. Plugin state
+is persisted alongside the main NetShaper session state.
+
+### Plugin Configuration
+
+A JSON config file can be passed to all loaded plugins:
+
+```json
+{
+  "wifi_scan_timeout": 10,
+  "verbose": true
+}
+```
+
+### Dry-Run with Plugins
+
+Plugins see the `--dry-run` flag and should print commands instead of executing them:
+
+```bash
+sudo env PYTHONPATH="$PWD/src" python -m netshaper -i <interface> \
+  --allow-cidr <authorized-cidr> \
+  --plugin wifi-recon \
+  --dry-run
+```
 
 ## User Guide
 

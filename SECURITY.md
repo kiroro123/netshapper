@@ -137,6 +137,45 @@ Before running in a new environment:
 - Preloaded or established HSTS is not bypassed. Only the first-visit,
   no-policy downgrade condition is demonstrated.
 
+### 5. Plugin Code Execution — Third-Party Module Loading
+
+**Risk Level:** High (Intentional for extensibility)
+
+**Description:**
+NetShaper supports loading third-party plugins via setuptools entry points. Plugins are
+arbitrary Python code that runs in the same process as NetShaper and have access to:
+- The immutable `AuthorizationPolicy` (read-only)
+- Session state and persistence (via `get_state_for_persistence()`)
+- Network configuration and firewall state
+- All NetShaper APIs
+
+**Why This Exists:**
+Plugins enable extensibility (e.g., WifiRecon, BLEScan) without requiring core changes.
+Future modules are completely isolated and independently auditable.
+
+**Risk Scenarios:**
+- A malicious or compromised plugin could exfiltrate target information
+- A plugin bug could crash NetShaper or leave stale state uncleaned
+- A plugin could log sensitive data to accessible files
+- RF compliance violations by wireless/BLE plugins (plugin vendor responsibility)
+
+**Mitigation:**
+- **Source audit:** Only load plugins from trusted sources (entry-point packages with known provenance)
+- **Filesystem security:** Check `/opt/netshaper-plugins/` (phase 1b) for world-writable permissions
+- **Privilege:** Plugins run as the user who invokes NetShaper (typically root in production)
+- **State isolation:** Plugin state is saved but not restored across crashes unless plugin re-registers
+- **Cleanup:** Plugins are stopped cleanly on shutdown; unresponsive plugins are logged
+- **Review:** Audit plugin code before loading, especially custom modules
+
+**RF Compliance (Wireless/BLE Plugins):**
+NetShaper does not perform RF transmission itself. Wireless/BLE plugins are responsible for:
+- Regulatory compliance (FCC Part 15, CE, etc.)
+- Documenting legal jurisdiction restrictions
+- Respecting local frequency band regulations
+- Obtaining required licenses or certifications
+
+NetShaper's role is to gate plugin execution with authorization checks.
+
 ## Responsible Disclosure
 
 If you discover a security vulnerability in NetShaper:

@@ -139,3 +139,20 @@ class AuthorizationPolicy:
                 raise AuthorizationError(
                     f"refusing network/broadcast target address: {parsed}"
                 )
+
+    def assert_cidr_authorized(self, raw_cidr: str) -> None:
+        """Validate that a CIDR scope is within the authorized allowlist."""
+        try:
+            requested = ip_network(raw_cidr, strict=False)
+        except ValueError as exc:
+            raise AuthorizationError(f"invalid CIDR scope {raw_cidr!r}") from exc
+
+        # Reject unsupported versions if no matching authorized CIDR exists.
+        if not any(
+            requested.version == network.version
+            and requested.subnet_of(network)
+            for network in self._authorized_cidrs
+        ):
+            raise AuthorizationError(
+                f"CIDR scope {requested} is outside authorized allowlist"
+            )

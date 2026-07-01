@@ -24,6 +24,7 @@ import psutil
 from netshaper import config
 
 from netshaper.config import VERSION
+from netshaper.core.plugin_loader import PluginLoadError, PluginLoader
 from netshaper.models import Device
 from netshaper.network.shaper import ShapingProfile
 from netshaper.network.spoofers import validate_spoof_timing
@@ -191,6 +192,23 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Required with --emergency-restore-state; acknowledges that full "
             "firewall snapshot replay can overwrite unrelated live changes."
+        ),
+    )
+    parser.add_argument(
+        "--plugin",
+        action="append",
+        default=[],
+        help=(
+            "Load a registered plugin by ID (e.g. wifi-recon). "
+            "May be repeated. Plugins must be discoverable via entry points."
+        ),
+    )
+    parser.add_argument(
+        "--plugin-config",
+        metavar="FILE",
+        help=(
+            "JSON configuration file for plugins. Passed to all loaded plugins. "
+            "Ignored if no plugins are specified."
         ),
     )
     args = parser.parse_args()
@@ -675,6 +693,31 @@ def main() -> None:
                 raise RuntimeError(
                     "A stale NetShaper session could not be fully recovered."
                 )
+
+        # Load and discover plugins
+        if args.plugin:
+            try:
+                plugin_config = PluginLoader.parse_plugin_config(args.plugin_config)
+                PluginLoader.load_and_register(
+                    discover_entry_points=True, discover_filesystem=False
+                )
+                for plugin_id in args.plugin:
+                    try:
+                        instance_id = ns.register_plugin(
+                            plugin_id,
+                            {"type": "cidr", "cidrs": authorized_cidrs},
+                            config=plugin_config,
+                        )
+                        if ns.start_plugin(instance_id):
+                            print_flush(f"  [+] Plugin {plugin_id} started ({instance_id})")
+                        else:
+                            print_flush(f"  [!] Plugin {plugin_id} failed to start")
+                    except Exception as exc:
+                        print_flush(f"  [!] Failed to load plugin {plugin_id}: {exc}")
+                        if not config.DRY_RUN:
+                            raise
+            except PluginLoadError as exc:
+                sys.exit(f"[NetShaper] Plugin loading failed: {exc}")
 
         if not ns.own_ip:
             sys.exit("[NetShaper] Could not determine own IP.")

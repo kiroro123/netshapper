@@ -31,6 +31,7 @@ from netshaper.core.firewall_manager import FirewallManager
 from netshaper.core.mitm_manager import MitmProxyManager, MitmProxyError
 from netshaper.core.recovery_manager import RecoveryManager
 from netshaper.core.session import TargetSession
+from netshaper.core.plugin import PluginInterface, PluginManager
 from netshaper.core.state_manager import NetworkStateSnapshot, StateSnapshotManager
 from netshaper.models import Device, MarkIDPool
 from netshaper.network.discovery import NetworkDiscovery
@@ -71,6 +72,7 @@ class NetShaper:
         self.mitm_manager = MitmProxyManager(getattr(self, 'own_ip', None))
         self.recovery_manager = RecoveryManager(interface)
         self.sessions:   Dict[str, TargetSession] = {}
+        self.plugins: Dict[str, PluginInterface] = {}
         # RLock so remove_target() can be called re-entrantly from cleanup()
         self._lifecycle_lock   = threading.RLock()
         self.is_shutting_down  = False
@@ -291,6 +293,14 @@ class NetShaper:
             mitm_state = mitm_mgr.get_state_for_persistence() or {}
             if mitm_state.get("mitm_log_path"):
                 lines.append(f"mitmproxy log: {mitm_state.get('mitm_log_path')}")
+        if self.plugins:
+            lines.append(
+                "Plugins: "
+                + ", ".join(
+                    f"{plugin.instance_id}({type(plugin).__name__})"
+                    for plugin in self.plugins.values()
+                )
+            )
 
         errors = getattr(self, "_runtime_errors", [])
         lines.append("Runtime errors: " + ("; ".join(errors) if errors else "none"))
@@ -597,6 +607,7 @@ class NetShaper:
                 lambda: getattr(self, "mitm_manager", None) and self.mitm_manager.terminate(),
             )
             cleanup_step("fake server", self._terminate_fake_server)
+            cleanup_step("plugins", self._cleanup_plugins)
             cleanup_step("ARP amplification", self._stop_arp_amplification)
             cleanup_step("global rules", self._remove_global_rules)
             cleanup_step(
@@ -635,6 +646,56 @@ class NetShaper:
     # Backward-compatible alias (older CLI expects stop())
     def stop(self) -> None:
         self.cleanup()
+
+    def register_plugin(
+        self,
+        plugin_id: str,
+        scope: dict[str, Any],
+        config: dict[str, Any] | None = None,
+    ) -> str:
+        plugin_cls = PluginManager.get(plugin_id)
+        config = config or {}
+        plugin_cls.validate_scope(scope, self._auth_policy)
+        plugin = plugin_cls.new_instance(scope, config, self._auth_policy)
+        self.plugins[plugin.instance_id] = plugin
+        return plugin.instance_id
+
+    def start_plugin(self, instance_id: str) -> bool:
+        plugin = self.plugins.get(instance_id)
+        if plugin is None:
+            raise ValueError(f"unknown plugin instance {instance_id}")
+        if config.DRY_RUN:
+            print_flush(f"[DRY-RUN] Would start plugin {instance_id}")
+            return True
+        result = plugin.start()
+        if result:
+            plugin.active = True
+            self.save_state()
+        return result
+
+    def stop_plugin(self, instance_id: str) -> bool:
+        plugin = self.plugins.get(instance_id)
+        if plugin is None:
+            return True
+        result = plugin.stop()
+        if result:
+            self.plugins.pop(instance_id, None)
+            self.save_state()
+        return result
+
+    def _cleanup_plugins(self) -> bool:
+        ok = True
+        for instance_id in list(self.plugins):
+            plugin = self.plugins[instance_id]
+            try:
+                if not plugin.stop():
+                    ok = False
+            except Exception as exc:
+                log.error("Plugin cleanup failed (%s): %s", instance_id, exc)
+                ok = False
+            finally:
+                self.plugins.pop(instance_id, None)
+        return ok
 
     @staticmethod
     def _remove_state_file(state_path: str) -> None:
@@ -955,6 +1016,17 @@ class NetShaper:
                 getattr(self, "shaper", None), "_root_qdisc_pending", False),
             "owner": getattr(self, "_owner_metadata", {}),
             "snapshot": self._snapshot_to_dict(self.state_snapshot),
+            "plugins": [
+                {
+                    "instance_id": plugin.instance_id,
+                    "plugin_id": type(plugin).PLUGIN_ID,
+                    "scope": plugin.scope,
+                    "config": plugin.config,
+                    "active": plugin.active,
+                    "state": plugin.get_state_for_persistence(),
+                }
+                for plugin in self.plugins.values()
+            ],
         }
         if config.DRY_RUN:
             self._dry_run_state = data
