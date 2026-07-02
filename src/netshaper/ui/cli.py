@@ -1,6 +1,7 @@
 """
 NetShaper — Command Line Interface.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -24,6 +25,7 @@ import psutil
 from netshaper import config
 
 from netshaper.config import VERSION
+from netshaper.core.plugin_loader import PluginLoadError, PluginLoader
 from netshaper.models import Device
 from netshaper.network.shaper import ShapingProfile
 from netshaper.network.spoofers import validate_spoof_timing
@@ -62,13 +64,15 @@ class ExploitOptions:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=f"NetShaper v{VERSION}")
     parser.add_argument(
-        "--version", action="store_true",
+        "--version",
+        action="store_true",
         help="Show NetShaper version and exit.",
     )
     parser.add_argument(
-        "-i", "--interface",
+        "-i",
+        "--interface",
         help="Network interface to bind (e.g. eth0, wlan0). "
-             "If omitted, NetShaper prompts when multiple interfaces exist.",
+        "If omitted, NetShaper prompts when multiple interfaces exist.",
     )
     parser.add_argument(
         "--dry-run",
@@ -193,6 +197,23 @@ def parse_args() -> argparse.Namespace:
             "firewall snapshot replay can overwrite unrelated live changes."
         ),
     )
+    parser.add_argument(
+        "--plugin",
+        action="append",
+        default=[],
+        help=(
+            "Load a built-in or installed plugin by ID (e.g. wifi-recon). "
+            "May be repeated."
+        ),
+    )
+    parser.add_argument(
+        "--plugin-config",
+        metavar="FILE",
+        help=(
+            "JSON file containing per-plugin scope and configuration. "
+            "Ignored if no plugins are specified."
+        ),
+    )
     args = parser.parse_args()
     if args.targets:
         args.targets = [
@@ -244,7 +265,9 @@ def _net_if_stats_or_empty() -> dict:
         return {}
 
 
-def _usable_interface_ipv4s(name: str, addrs_by_name: Optional[dict] = None) -> list[str]:
+def _usable_interface_ipv4s(
+    name: str, addrs_by_name: Optional[dict] = None
+) -> list[str]:
     addrs = (addrs_by_name or _net_if_addrs_or_exit()).get(name, [])
     result = []
     for addr in addrs:
@@ -313,15 +336,11 @@ def pick_targets_ui(devices: List[Device]) -> List[Device]:
     print_flush("-" * 90)
     for idx, dev in enumerate(devices, 1):
         hostname = (dev.hostname or "-")[:28]
-        print_flush(
-            f"  {idx:<4} {dev.ip:<16} {hostname:<28} {dev.mac}"
-        )
+        print_flush(f"  {idx:<4} {dev.ip:<16} {hostname:<28} {dev.mac}")
     print_flush("=" * 90)
 
     while True:
-        choice = safe_input(
-            "\n  Select devices (e.g. 1,2,5  1-3  all): "
-        ).lower()
+        choice = safe_input("\n  Select devices (e.g. 1,2,5  1-3  all): ").lower()
         if not choice:
             continue
         if choice == "all":
@@ -335,7 +354,7 @@ def pick_targets_ui(devices: List[Device]) -> List[Device]:
                     start, end = part.split("-", 1)
                     first, last = int(start), int(end)
                     if 1 <= first <= last <= len(devices):
-                        selected.extend(devices[first - 1:last])
+                        selected.extend(devices[first - 1 : last])
                     else:
                         print_flush(f"  [!] Range {start}-{end} out of bounds.")
                         break
@@ -375,7 +394,9 @@ def normalize_feature_choices(raw: str) -> tuple[set[int], list[str]]:
     return features, invalid
 
 
-def resolve_exploit_options(args: argparse.Namespace, features: set[int]) -> ExploitOptions:
+def resolve_exploit_options(
+    args: argparse.Namespace, features: set[int]
+) -> ExploitOptions:
     """Merge interactive feature picks with explicit CLI exploit flags."""
     arp_amplify = args.arp_amplify
     if 7 in features and arp_amplify == 0:
@@ -417,7 +438,9 @@ def fake_server_launch_hint(
 def pick_limit_ui() -> float:
     presets = {"1": 1.0, "2": 2.0, "3": 3.0, "4": 5.0, "5": 10.0}
     print_flush("\n  Bandwidth presets:")
-    print_flush("  [1] 1 Mbps  [2] 2 Mbps  [3] 3 Mbps  [4] 5 Mbps  [5] 10 Mbps  [6] Custom")
+    print_flush(
+        "  [1] 1 Mbps  [2] 2 Mbps  [3] 3 Mbps  [4] 5 Mbps  [5] 10 Mbps  [6] Custom"
+    )
     while True:
         choice = safe_input("  Select (1-6): ")
         if choice in presets:
@@ -470,25 +493,28 @@ def _reserved_in_authorized_network(ip_obj, networks: list) -> bool:
         if ip_obj.version != network.version or ip_obj not in network:
             continue
         if ip_obj == network.network_address and network.prefixlen < (
-                31 if ip_obj.version == 4 else 127):
+            31 if ip_obj.version == 4 else 127
+        ):
             return True
         if (
-                ip_obj.version == 4
-                and ip_obj == network.broadcast_address
-                and network.prefixlen < 31):
+            ip_obj.version == 4
+            and ip_obj == network.broadcast_address
+            and network.prefixlen < 31
+        ):
             return True
     return False
 
 
 def validate_targets(
-        targets: List[Union[Device, str]],
-        authorized_cidrs: list,
-        *,
-        interface: str,
-        own_ip: Optional[str],
-        own_ipv6: Optional[str],
-        gateway_ip: Optional[str],
-        gateway_ipv6: Optional[str]) -> List[Union[Device, str]]:
+    targets: List[Union[Device, str]],
+    authorized_cidrs: list,
+    *,
+    interface: str,
+    own_ip: Optional[str],
+    own_ipv6: Optional[str],
+    gateway_ip: Optional[str],
+    gateway_ipv6: Optional[str],
+) -> List[Union[Device, str]]:
     local_addresses = {
         ip_address(value)
         for value in (own_ip, own_ipv6, gateway_ip, gateway_ipv6)
@@ -511,11 +537,10 @@ def validate_targets(
         if parsed in broadcasts:
             raise ValueError(f"refusing broadcast target address: {parsed}")
         if not any(
-                parsed.version == network.version and parsed in network
-                for network in authorized_cidrs):
-            raise ValueError(
-                f"target {parsed} is outside authorized CIDR allowlist"
-            )
+            parsed.version == network.version and parsed in network
+            for network in authorized_cidrs
+        ):
+            raise ValueError(f"target {parsed} is outside authorized CIDR allowlist")
         if _reserved_in_authorized_network(parsed, authorized_cidrs):
             raise ValueError(f"refusing network/broadcast target address: {parsed}")
 
@@ -564,7 +589,9 @@ def run_active_session(
                 target_options["shaping_profile"] = shaping_profile
             ns.add_target(target, **target_options)
             if not ns.save_state():
-                raise RuntimeError("Could not update recovery state after target setup.")
+                raise RuntimeError(
+                    "Could not update recovery state after target setup."
+                )
 
         if sniff_on:
             ns.launch_sniffer(
@@ -594,16 +621,12 @@ def run_active_session(
             expected_udp_ports=expected_udp_ports,
         )
         if issues:
-            raise RuntimeError(
-                "Startup verification failed: " + "; ".join(issues)
-            )
+            raise RuntimeError("Startup verification failed: " + "; ".join(issues))
 
         print_flush(green("[+] Startup verified. Evidence:"))
         for line in ns.runtime_evidence_lines(
-                target_ips,
-                expect_sniffer=sniff_on,
-                save_pcap=save_pcap,
-                rolling=rolling):
+            target_ips, expect_sniffer=sniff_on, save_pcap=save_pcap, rolling=rolling
+        ):
             print_flush(f"    {line}")
         print_flush(green("[*] Monitoring.") + " Press " + bold("Ctrl+C") + " to stop.")
         while not ns.stop_event.wait(1):
@@ -614,9 +637,7 @@ def run_active_session(
                 expected_udp_ports=expected_udp_ports,
             )
             if issues:
-                raise RuntimeError(
-                    "Runtime health check failed: " + "; ".join(issues)
-                )
+                raise RuntimeError("Runtime health check failed: " + "; ".join(issues))
     finally:
         ns.cleanup()
         if getattr(ns, "_cleanup_complete", True):
@@ -644,8 +665,8 @@ def main() -> None:
         from netshaper.core.state_manager import StateSnapshotManager
 
         if not StateSnapshotManager.restore_from_state_file(
-                args.emergency_restore_state,
-                restore_firewall=True):
+            args.emergency_restore_state, restore_firewall=True
+        ):
             sys.exit("[NetShaper] Emergency snapshot restore failed.")
         print_flush("[+] Emergency snapshot restore complete.")
         return
@@ -675,6 +696,42 @@ def main() -> None:
                 raise RuntimeError(
                     "A stale NetShaper session could not be fully recovered."
                 )
+
+        # Load and discover plugins
+        if args.plugin:
+            try:
+                plugin_config = PluginLoader.parse_plugin_config(args.plugin_config)
+                PluginLoader.load_and_register(
+                    discover_builtins=True,
+                    discover_entry_points=True,
+                    discover_filesystem=False,
+                )
+                for plugin_id in args.plugin:
+                    try:
+                        scope, specific_config = PluginLoader.settings_for_plugin(
+                            plugin_id,
+                            plugin_config,
+                            {"type": "cidr", "cidrs": authorized_cidrs},
+                        )
+                        if plugin_id == "wifi-recon":
+                            specific_config.setdefault("interface", interface)
+                        instance_id = ns.register_plugin(
+                            plugin_id,
+                            scope,
+                            config=specific_config,
+                        )
+                        if ns.start_plugin(instance_id):
+                            print_flush(
+                                f"  [+] Plugin {plugin_id} started ({instance_id})"
+                            )
+                        else:
+                            print_flush(f"  [!] Plugin {plugin_id} failed to start")
+                    except Exception as exc:
+                        print_flush(f"  [!] Failed to load plugin {plugin_id}: {exc}")
+                        if not config.DRY_RUN:
+                            raise
+            except PluginLoadError as exc:
+                sys.exit(f"[NetShaper] Plugin loading failed: {exc}")
 
         if not ns.own_ip:
             sys.exit("[NetShaper] Could not determine own IP.")
@@ -775,9 +832,17 @@ def main() -> None:
 
         if http_redirect_port:
             print_flush("  [!] HTTP redirect captures plain HTTP only.")
-            print_flush("      For HTTPS, install the mitmproxy CA on the target device.")
+            print_flush(
+                "      For HTTPS, install the mitmproxy CA on the target device."
+            )
 
-        limit = args.limit if throttle_on and args.limit is not None else pick_limit_ui() if throttle_on else None
+        limit = (
+            args.limit
+            if throttle_on and args.limit is not None
+            else pick_limit_ui()
+            if throttle_on
+            else None
+        )
         shaping_profile = (
             ShapingProfile(
                 bandwidth_mbps=limit,
@@ -796,12 +861,17 @@ def main() -> None:
         if sniff_on:
             save_pcap = safe_input("  Save to .pcap? (y/n): ").lower() == "y"
             if save_pcap:
-                rolling = safe_input("  Use rolling 50 MB files? (y/n): ").lower() == "y"
+                rolling = (
+                    safe_input("  Use rolling 50 MB files? (y/n): ").lower() == "y"
+                )
 
         if dns_spoof_on and not check_local_port(ns.own_ip, 53, socket.SOCK_DGRAM):
             print_flush("  [!] Fake DNS (port 53) not reachable.")
             print_flush(f"      {fake_server_launch_hint(exploit, host_ip=ns.own_ip)}")
-            if safe_input("  Auto-launch netshaper-fake-server? (y/n): ").lower() == "y":
+            if (
+                safe_input("  Auto-launch netshaper-fake-server? (y/n): ").lower()
+                == "y"
+            ):
                 if not ns.launch_fake_server(
                     suppress_dnssec=exploit.fake_server_suppress_dnssec,
                     web_security_demo=exploit.fake_server_web_security_demo,
@@ -814,7 +884,10 @@ def main() -> None:
         if http_redirect_port == 80 and not check_local_port(ns.own_ip, 80):
             print_flush("  [!] Fake HTTP (port 80) not reachable.")
             print_flush(f"      {fake_server_launch_hint(exploit, host_ip=ns.own_ip)}")
-            if safe_input("  Auto-launch netshaper-fake-server? (y/n): ").lower() == "y":
+            if (
+                safe_input("  Auto-launch netshaper-fake-server? (y/n): ").lower()
+                == "y"
+            ):
                 if not ns.launch_fake_server(
                     suppress_dnssec=exploit.fake_server_suppress_dnssec,
                     web_security_demo=exploit.fake_server_web_security_demo,
@@ -823,10 +896,15 @@ def main() -> None:
                     sys.exit("[NetShaper] Captive portal requires reachable fake HTTP.")
             else:
                 sys.exit("[NetShaper] Captive portal requires reachable fake HTTP.")
-        elif exploit.fake_server_web_security_demo and not check_local_port(ns.own_ip, 80):
+        elif exploit.fake_server_web_security_demo and not check_local_port(
+            ns.own_ip, 80
+        ):
             print_flush("  [!] HSTS demo HTTP service (port 80) not reachable.")
             print_flush(f"      {fake_server_launch_hint(exploit, host_ip=ns.own_ip)}")
-            if safe_input("  Auto-launch netshaper-fake-server? (y/n): ").lower() == "y":
+            if (
+                safe_input("  Auto-launch netshaper-fake-server? (y/n): ").lower()
+                == "y"
+            ):
                 if not ns.launch_fake_server(
                     suppress_dnssec=exploit.fake_server_suppress_dnssec,
                     web_security_demo=True,
@@ -849,12 +927,13 @@ def main() -> None:
                 sys.exit("[NetShaper] mitmproxy is required for HTTPS inspection.")
 
         W = 58
+
         def _yn(flag: bool) -> str:
             return green("Yes") if flag else "No"
 
         print_flush(f"\n{cyan('=' * W)}")
         print_flush(bold(f"  {'Session Summary'}"))
-        print_flush(cyan('-' * W))
+        print_flush(cyan("-" * W))
         print_flush(f"  Targets       : {cyan(', '.join(target_ips))}")
         print_flush(f"  ARP spoof     : {_yn(arp_on)}")
         if arp_on:
@@ -866,11 +945,12 @@ def main() -> None:
         print_flush(f"  Captive portal: {_yn(captive_portal)}")
         if captive_portal:
             print_flush(f"    HTTP -> port: {http_redirect_port}")
-        print_flush(f"  Throttle      : {green(f'{limit} Mbps') if throttle_on else 'No'}")
+        print_flush(
+            f"  Throttle      : {green(f'{limit} Mbps') if throttle_on else 'No'}"
+        )
         if shaping_profile and shaping_profile.has_impairments:
             print_flush(
-                "    Netem       : "
-                + " ".join(shaping_profile.netem_arguments())
+                "    Netem       : " + " ".join(shaping_profile.netem_arguments())
             )
         print_flush(f"  mitmproxy     : {_yn(mitm_on)}")
         print_flush(f"  Sniffer       : {_yn(sniff_on)}")

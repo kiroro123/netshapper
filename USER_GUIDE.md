@@ -252,6 +252,47 @@ normal cleanup, and exits with an error instead of continuing to show a healthy
 status. Auto-launched mitmproxy stdout/stderr is saved under
 `/run/netshaper/<session-id>/mitmproxy.log`.
 
+## Wireless Plugins
+
+Wireless plugins require an explicit JSON scope. Preview the complete setup
+before enabling any active Wi-Fi action:
+
+```bash
+sudo env PYTHONPATH="$PWD/src" python -m netshaper \
+  -i wlan0 \
+  --allow-cidr 192.0.2.0/24 \
+  --plugin wifi-recon \
+  --plugin-config wireless-lab.json \
+  --dry-run
+```
+
+`wifi-recon` changes the selected interface to monitor mode for the session and
+restores managed mode during shutdown. Authorized frames are saved under
+`/run/netshaper/captures/` by default with mode `0600`. Channel hopping defaults
+to channels 1, 6, and 11; configure only channels permitted for the adapter and
+local regulatory domain.
+
+Active probe requests require `allow_active_scan` and an ESSID allowlist.
+Unicast disconnect tests additionally require `allow_deauth_test`, exact BSSID
+and client MAC allowlists, and configured `deauth_tests`. Marked lab-beacon
+tests require `allow_beacon_test` and `NETSHAPER-LAB-` ESSIDs. Each action is
+capped at five frames and all actions share `max_tx_frames` (maximum 100).
+
+Install BLE support with:
+
+```bash
+python -m pip install -e ".[ble]"
+```
+
+`ble-recon` requests passive scanning. Optional service enumeration is
+read-only and uses `pair=False`. `audit_unpaired_access` reports services
+available without pairing; it neither bypasses pairing nor writes to GATT
+characteristics. BlueZ monitor patterns are derived from service UUIDs.
+Address-only scopes must configure a narrow, non-empty advertisement
+`passive_patterns` signature. See the full JSON example in
+[README.md](README.md). Linux passive mode requires BlueZ 5.56 or newer with
+experimental advertisement monitoring enabled and kernel 5.10 or newer.
+
 ## Port Conflicts
 
 If the fake server cannot bind its ports:

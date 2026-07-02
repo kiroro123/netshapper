@@ -2,6 +2,18 @@
 
 All notable changes to this project are documented in this file.
 
+## [Unreleased]
+
+### Wireless plugins
+
+- Added built-in discovery for `wifi-recon` and `ble-recon`.
+- Completed authorized Wi-Fi PCAP/EAPOL capture, channel hopping, bounded
+  directed probes, unicast disconnect tests, and marked lab-beacon tests.
+- Added passive BLE discovery, scoped read-only GATT enumeration, and
+  unpaired-service exposure auditing.
+- Added per-plugin JSON authorization scopes, hard Wi-Fi transmission budgets,
+  restricted capture permissions, dry-run handling, and cleanup tests.
+
 ## [1.0] - 2026-06-15
 
 ### Release

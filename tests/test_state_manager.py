@@ -20,6 +20,7 @@ class StateSnapshotTests(unittest.TestCase):
             ns.session_id = "NS-TEST"
             ns._global_rules_applied = False
             ns._global_rules_created = []
+            ns.plugins = {}
             ns.state_snapshot = NetworkStateSnapshot(
                 session_id="NS-TEST",
                 interface="eth0",
@@ -102,6 +103,7 @@ class StateSnapshotTests(unittest.TestCase):
                 "delete": ["iptables", "-D", "FORWARD", "-j", "ACCEPT"],
                 "check": ["iptables", "-C", "FORWARD", "-j", "ACCEPT"],
             }]
+            ns.plugins = {}
             ns.state_snapshot = NetworkStateSnapshot(
                 session_id="NS-TEST",
                 interface="eth0",
@@ -141,6 +143,7 @@ class StateSnapshotTests(unittest.TestCase):
             ns.session_id = "NS-TEST"
             ns._global_rules_applied = False
             ns._global_rules_created = []
+            ns.plugins = {}
             ns.state_snapshot = NetworkStateSnapshot(
                 session_id="NS-TEST",
                 interface="eth0",

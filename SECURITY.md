@@ -137,6 +137,60 @@ Before running in a new environment:
 - Preloaded or established HSTS is not bypassed. Only the first-visit,
   no-policy downgrade condition is demonstrated.
 
+### 5. Plugin Code Execution — Third-Party Module Loading
+
+**Risk Level:** High (Intentional for extensibility)
+
+**Description:**
+NetShaper supports loading third-party plugins via setuptools entry points. Plugins are
+arbitrary Python code that runs in the same process as NetShaper and have access to:
+- The immutable `AuthorizationPolicy` (read-only)
+- Session state and persistence (via `get_state_for_persistence()`)
+- Network configuration and firewall state
+- All NetShaper APIs
+
+**Why This Exists:**
+Plugins enable extensibility (e.g., WifiRecon, BLEScan) without requiring core changes.
+Future modules are completely isolated and independently auditable.
+
+**Risk Scenarios:**
+- A malicious or compromised plugin could exfiltrate target information
+- A plugin bug could crash NetShaper or leave stale state uncleaned
+- A plugin could log sensitive data to accessible files
+- RF compliance violations by wireless/BLE plugins (plugin vendor responsibility)
+
+**Mitigation:**
+- **Source audit:** Only load plugins from trusted sources (entry-point packages with known provenance)
+- **Filesystem security:** Check `/opt/netshaper-plugins/` (phase 1b) for world-writable permissions
+- **Privilege:** Plugins run as the user who invokes NetShaper (typically root in production)
+- **State isolation:** Plugin state is saved but not restored across crashes unless plugin re-registers
+- **Cleanup:** Plugins are stopped cleanly on shutdown; unresponsive plugins are logged
+- **Review:** Audit plugin code before loading, especially custom modules
+
+**RF Compliance (Wireless/BLE Plugins):**
+The Wi-Fi plugin can transmit explicitly enabled, bounded test frames. Operators
+are responsible for:
+- Regulatory compliance (FCC Part 15, CE, etc.)
+- Documenting legal jurisdiction restrictions
+- Respecting local frequency band regulations
+- Obtaining required licenses or certifications
+
+NetShaper enforces the following additional boundaries:
+
+- Wi-Fi active scanning requires an ESSID allowlist.
+- Disconnect tests require exact unicast BSSID and client MAC allowlists.
+- No broadcast deauthentication is supported.
+- Each active Wi-Fi action is capped at five frames and all actions share a
+  maximum 100-frame attempt budget.
+- Generated beacon tests only use ESSIDs beginning with
+  `NETSHAPER-LAB-`.
+- Captured Wi-Fi frames are filtered against scope before being written and
+  capture files are mode `0600`.
+- BLE scanning requests passive mode and fails closed if the backend cannot
+  provide it.
+- BLE service enumeration is read-only, sets `pair=False`, and does not write
+  GATT characteristics or attempt to defeat pairing.
+
 ## Responsible Disclosure
 
 If you discover a security vulnerability in NetShaper:

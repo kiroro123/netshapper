@@ -21,10 +21,14 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+ble = [
+  "bleak>=0.22",
+]
 dev = [
   "bandit>=1.7.10",
   "build>=1.2",
   "coverage>=7.6",
+  "msgpack>=1.2.1",
   "pytest-cov>=4.0",
   "mypy>=1.13",
   "pip-audit>=2.7",
@@ -36,6 +40,10 @@ dev = [
 netshaper = "netshaper.ui.cli:main"
 netshaper-fake-server = "netshaper.fake_server3:main"
 netshaper-captive-portal = "netshaper.captive_portal:main"
+
+[project.entry-points."netshaper.plugins"]
+wifi-recon = "netshaper.plugins.wifi_recon:WifiReconPlugin"
+ble-recon = "netshaper.plugins.ble_recon:BleReconPlugin"
 
 [tool.setuptools]
 include-package-data = true

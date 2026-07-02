@@ -59,6 +59,7 @@ NetShaper is organized into independently auditable components:
 | **TrafficShaper** | Linux `tc`-based bandwidth throttling via HTB qdisc | Qdisc lifecycle, rate limiting |
 | **PacketSniffer** | Captures packets to .pcap using libpcap | Packet capture, rolling files |
 | **NetworkDiscovery** | ARP sweep and hostname resolution | Network scanning, host enumeration |
+| **PluginLoader** | Discovers and loads third-party extension modules | Plugin registry, entry point discovery |
 
 ## Workflow: DNS Redirect + Captive Portal + HTTPS Inspection
 
@@ -124,6 +125,7 @@ A typical flow for testing a target device:
 - Atomic state persistence and automatic stale-session recovery
 - Full `--dry-run` mode — prints commands without touching the system
 - Modular, independently auditable components
+- **Plugin system:** Built-in Wi-Fi/BLE reconnaissance plus entry-point extensions
 
 ## Requirements
 
@@ -182,6 +184,115 @@ The web lesson is available at `/training/web-security`. IDN examples are
 restricted to reserved `.test`, `.example`, `.invalid`, and `.localhost`
 domains. Established or preloaded HSTS is not bypassed; the lesson demonstrates
 the first-visit downgrade boundary and browser IDN display behavior.
+
+## Wireless Plugins
+
+NetShaper ships two built-in, independently scoped plugins:
+
+- `wifi-recon`: authorized 802.11 discovery, channel hopping, PCAP/EAPOL
+  capture, active probe requests, and bounded radio-test frames.
+- `ble-recon`: passive BLE discovery, read-only GATT service enumeration, and
+  an audit of services exposed without pairing.
+
+Install the optional BLE backend when BLE support is needed:
+
+```bash
+python -m pip install -e ".[ble]"
+```
+
+Third-party plugins remain supported through the `netshaper.plugins` entry
+point group.
+
+### Using a Plugin
+
+Pass `--plugin` to the CLI:
+
+```bash
+sudo env PYTHONPATH="$PWD/src" python -m netshaper -i <interface> \
+  --allow-cidr <authorized-cidr> \
+  --plugin wifi-recon \
+  --plugin-config config.json
+```
+
+Plugins are started before target discovery and stopped on session shutdown. Plugin state
+is persisted alongside the main NetShaper session state.
+
+### Plugin Configuration
+
+Each plugin receives its own authorization scope and runtime configuration:
+[`examples/wireless-lab.json`](examples/wireless-lab.json) is a passive-by-default
+template.
+
+```json
+{
+  "plugins": {
+    "wifi-recon": {
+      "scope": {
+        "type": "mixed",
+        "bssids": ["aa:bb:cc:dd:ee:ff"],
+        "essids": ["AuthorizedLabAP"],
+        "channels": [1, 6, 11],
+        "allow_active_scan": true,
+        "client_macs": ["02:11:22:33:44:55"],
+        "allow_deauth_test": false,
+        "test_essids": ["NETSHAPER-LAB-DEMO"],
+        "allow_beacon_test": false
+      },
+      "config": {
+        "channel_interval": 1.0,
+        "probe_burst": 1,
+        "probe_interval": 2.0,
+        "max_tx_frames": 25,
+        "deauth_tests": [],
+        "beacon_test_frames": 0
+      }
+    },
+    "ble-recon": {
+      "scope": {
+        "type": "mixed",
+        "addresses": ["aa:bb:cc:dd:ee:ff"],
+        "service_uuids": ["180d"],
+        "allow_service_enumeration": true,
+        "audit_unpaired_access": true
+      },
+      "config": {
+        "scan_timeout": 15,
+        "connection_timeout": 10,
+        "passive_patterns": []
+      }
+    }
+  }
+}
+```
+
+Active Wi-Fi flags default to false. Deauthentication tests are unicast-only,
+require both BSSID and client allowlists, and are capped at five frames per
+action. Probe, deauthentication, and lab-beacon actions share a hard session
+budget of at most 100 attempted frames. Test beacon ESSIDs must start with
+`NETSHAPER-LAB-`.
+
+BLE enumeration is read-only and never requests pairing. The unpaired-access
+audit reports whether a device exposes services without pairing; it does not
+bypass authentication or write characteristics.
+
+On Linux, passive scanning uses BlueZ advertisement-monitor patterns derived
+from the authorized service UUIDs. An address-only scope must provide one or
+more narrow `passive_patterns` entries containing `start_position`,
+`ad_data_type`, and a non-empty hexadecimal `content_hex`; broad match-all
+patterns are rejected. The backend requires BlueZ 5.56 or newer with
+experimental advertisement monitoring enabled and Linux kernel 5.10 or newer.
+
+### Dry-Run with Plugins
+
+Plugins see the `--dry-run` flag and should print commands instead of executing them:
+
+```bash
+sudo env PYTHONPATH="$PWD/src" python -m netshaper -i <interface> \
+  --allow-cidr <authorized-cidr> \
+  --plugin wifi-recon \
+  --plugin-config config.json \
+  --dry-run
+```
 
 ## User Guide
 

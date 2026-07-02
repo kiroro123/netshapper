@@ -5,6 +5,7 @@ Owns the session lifecycle (_lifecycle_lock guards add/remove),
 global iptables forwarding rules, atomic state persistence,
 sniffer management, and the bandwidth monitor thread.
 """
+
 from __future__ import annotations
 
 import fcntl
@@ -20,7 +21,7 @@ import threading
 import time
 import uuid
 from dataclasses import asdict
-from typing import Dict, List, Optional, Sequence, Union
+from typing import Any, Dict, List, Optional, Sequence, Union
 
 import psutil
 
@@ -31,6 +32,7 @@ from netshaper.core.firewall_manager import FirewallManager
 from netshaper.core.mitm_manager import MitmProxyManager, MitmProxyError
 from netshaper.core.recovery_manager import RecoveryManager
 from netshaper.core.session import TargetSession
+from netshaper.core.plugin import PluginInterface, PluginManager
 from netshaper.core.state_manager import NetworkStateSnapshot, StateSnapshotManager
 from netshaper.models import Device, MarkIDPool
 from netshaper.network.discovery import NetworkDiscovery
@@ -49,33 +51,37 @@ class NetShaper:
         normalized = self._normalize_authorized_cidrs(authorized_cidrs)
         self._auth_policy = AuthorizationPolicy(normalized)
         SystemChecker.check()
-        self.interface   = interface
-        self.session_id  = f"NS-{uuid.uuid4().hex[:6].upper()}"
-        self.disc        = NetworkDiscovery(interface)
-        self.own_ip      = self.disc.get_own_ip()
-        self.own_mac     = self.disc.get_own_mac()
-        self.own_ipv6    = self.disc.get_own_ipv6()
-        self.gw          = self.disc.get_default_gateway()
-        self.gw_mac      = (
-            None if config.DRY_RUN
-            else self.disc.resolve_mac(self.gw) if self.gw else None
+        self.interface = interface
+        self.session_id = f"NS-{uuid.uuid4().hex[:6].upper()}"
+        self.disc = NetworkDiscovery(interface)
+        self.own_ip = self.disc.get_own_ip()
+        self.own_mac = self.disc.get_own_mac()
+        self.own_ipv6 = self.disc.get_own_ipv6()
+        self.gw = self.disc.get_default_gateway()
+        self.gw_mac = (
+            None
+            if config.DRY_RUN
+            else self.disc.resolve_mac(self.gw)
+            if self.gw
+            else None
         )
-        self.gw_ipv6     = self.disc.get_default_gateway_ipv6()
-        self.shaper      = TrafficShaper(interface)
-        self.mark_pool   = MarkIDPool()
+        self.gw_ipv6 = self.disc.get_default_gateway_ipv6()
+        self.shaper = TrafficShaper(interface)
+        self.mark_pool = MarkIDPool()
         self.firewall_manager = FirewallManager(
             interface,
             self.session_id,
             journal=self._sync_firewall_state,
         )
-        self.mitm_manager = MitmProxyManager(getattr(self, 'own_ip', None))
+        self.mitm_manager = MitmProxyManager(getattr(self, "own_ip", None))
         self.recovery_manager = RecoveryManager(interface)
-        self.sessions:   Dict[str, TargetSession] = {}
+        self.sessions: Dict[str, TargetSession] = {}
+        self.plugins: Dict[str, PluginInterface] = {}
         # RLock so remove_target() can be called re-entrantly from cleanup()
-        self._lifecycle_lock   = threading.RLock()
-        self.is_shutting_down  = False
+        self._lifecycle_lock = threading.RLock()
+        self.is_shutting_down = False
         self.sniffer: Optional[Union[PacketSniffer, RollingPacketSniffer]] = None
-        self.stop_event  = threading.Event()
+        self.stop_event = threading.Event()
         self._mitm_log_path: Optional[str] = None
         self._fake_server_proc: Optional[subprocess.Popen] = None
         self._arp_amplifier = None
@@ -113,17 +119,14 @@ class NetShaper:
                 else:
                     # Accept ipaddress network objects from the CLI parser.
                     if not (
-                            hasattr(item, "version")
-                            and hasattr(item, "network_address")
-                            and hasattr(item, "prefixlen")):
-                        raise ValueError(
-                            f"invalid authorized CIDR object: {item!r}"
-                        )
+                        hasattr(item, "version")
+                        and hasattr(item, "network_address")
+                        and hasattr(item, "prefixlen")
+                    ):
+                        raise ValueError(f"invalid authorized CIDR object: {item!r}")
                     networks.append(item)
         if not networks:
-            raise ValueError(
-                "authorized_cidrs is required before creating NetShaper"
-            )
+            raise ValueError("authorized_cidrs is required before creating NetShaper")
         return networks
 
     def _assert_authorized_target(self, raw_ip: str) -> None:
@@ -147,8 +150,7 @@ class NetShaper:
             return None
 
     @classmethod
-    def _process_is_live(cls, pid: Optional[int],
-                         start_time: Optional[str]) -> bool:
+    def _process_is_live(cls, pid: Optional[int], start_time: Optional[str]) -> bool:
         if not pid or not start_time:
             return False
         current_start = cls._process_start_time(pid)
@@ -175,8 +177,7 @@ class NetShaper:
             self._lock_file.close()
             self._lock_file = None
             raise RuntimeError(
-                "Another NetShaper instance is already running: "
-                f"{owner}"
+                f"Another NetShaper instance is already running: {owner}"
             ) from None
         self._lock_file.seek(0)
         self._lock_file.truncate()
@@ -240,12 +241,13 @@ class NetShaper:
         return list(getattr(sniffer, "output_files", []) or [])
 
     def runtime_evidence_lines(
-            self,
-            target_ips: Optional[List[str]] = None,
-            *,
-            expect_sniffer: bool = False,
-            save_pcap: bool = False,
-            rolling: bool = False) -> List[str]:
+        self,
+        target_ips: Optional[List[str]] = None,
+        *,
+        expect_sniffer: bool = False,
+        save_pcap: bool = False,
+        rolling: bool = False,
+    ) -> List[str]:
         started_at = self._started_at or time.time()
         lines = [
             f"Session ID: {self.session_id}",
@@ -254,23 +256,23 @@ class NetShaper:
             f"Targets: {', '.join(target_ips or []) or '-'}",
             "State file: "
             + ("dry-run memory only" if config.DRY_RUN else self._state_path()),
-            "Log file: "
-            + ("console only" if config.DRY_RUN else config.LOG_FILE),
+            "Log file: " + ("console only" if config.DRY_RUN else config.LOG_FILE),
         ]
 
         monitor_thread = getattr(self, "_monitor_thread", None)
         lines.append(
             "Monitor thread: "
-            + ("running" if monitor_thread and monitor_thread.is_alive()
-               else "not running")
+            + (
+                "running"
+                if monitor_thread and monitor_thread.is_alive()
+                else "not running"
+            )
         )
 
         sniffer = getattr(self, "sniffer", None)
         if sniffer:
             if hasattr(sniffer, "is_running"):
-                sniffer_status = (
-                    "running" if sniffer.is_running() else "not running"
-                )
+                sniffer_status = "running" if sniffer.is_running() else "not running"
             else:
                 sniffer_status = "unknown"
             lines.append(f"Packet sniffer: {sniffer_status}")
@@ -291,18 +293,27 @@ class NetShaper:
             mitm_state = mitm_mgr.get_state_for_persistence() or {}
             if mitm_state.get("mitm_log_path"):
                 lines.append(f"mitmproxy log: {mitm_state.get('mitm_log_path')}")
+        if self.plugins:
+            lines.append(
+                "Plugins: "
+                + ", ".join(
+                    f"{plugin.instance_id}({type(plugin).__name__})"
+                    for plugin in self.plugins.values()
+                )
+            )
 
         errors = getattr(self, "_runtime_errors", [])
         lines.append("Runtime errors: " + ("; ".join(errors) if errors else "none"))
         return lines
 
     def runtime_health_issues(
-            self,
-            *,
-            expect_sniffer: bool = False,
-            expect_monitor: bool = False,
-            expected_tcp_ports: Optional[List[int]] = None,
-            expected_udp_ports: Optional[List[int]] = None) -> List[str]:
+        self,
+        *,
+        expect_sniffer: bool = False,
+        expect_monitor: bool = False,
+        expected_tcp_ports: Optional[List[int]] = None,
+        expected_udp_ports: Optional[List[int]] = None,
+    ) -> List[str]:
         issues = list(getattr(self, "_runtime_errors", []))
         if self.stop_event.is_set():
             return issues
@@ -419,6 +430,7 @@ class NetShaper:
     # ── Discovery ─────────────────────────────────────────────────────────────
     def discover(self) -> List[Device]:
         from netshaper.exceptions import DiscoveryError
+
         # Ensure the immutable policy is present and use its CIDRs.
         if not getattr(self, "_auth_policy", None):
             raise ValueError("authorized_cidrs is empty; refusing discovery")
@@ -436,7 +448,6 @@ class NetShaper:
     # Backward-compatible alias (older CLI expects discover_devices())
     def discover_devices(self) -> List[Device]:
         return self.discover()
-
 
     # ── Session lifecycle ─────────────────────────────────────────────────────
     def add_target(
@@ -466,8 +477,11 @@ class NetShaper:
         if isinstance(target, str):
             ip = target
             mac = (
-                "00:00:00:00:00:00" if config.DRY_RUN
-                else self.disc.resolve_mac(ip) if ip else None
+                "00:00:00:00:00:00"
+                if config.DRY_RUN
+                else self.disc.resolve_mac(ip)
+                if ip
+                else None
             )
             if not mac:
                 raise ValueError(
@@ -514,9 +528,7 @@ class NetShaper:
             try:
                 cleanup_ok = session.cleanup()
             except Exception as cleanup_exc:
-                log.error(
-                    f"Rollback cleanup for {target.ip} failed: {cleanup_exc}"
-                )
+                log.error(f"Rollback cleanup for {target.ip} failed: {cleanup_exc}")
             if cleanup_ok:
                 with self._lifecycle_lock:
                     if self.sessions.get(target.ip) is session:
@@ -537,13 +549,12 @@ class NetShaper:
             f"ARP-burst={arp_burst}@{arp_interval:.2f}s)"
         )
 
-
     def remove_target(self, ip: str) -> bool:
         with self._lifecycle_lock:
             session = self.sessions.get(ip)
             if not session:
                 return True
-            session.active           = False
+            session.active = False
             session.is_shutting_down = True
         # Cleanup outside lock — spoof threads exit naturally via flag check
         ok = session.cleanup()
@@ -582,21 +593,28 @@ class NetShaper:
             self.stop_event.set()
             with self._lifecycle_lock:
                 for s in self.sessions.values():
-                    s.active           = False
+                    s.active = False
                     s.is_shutting_down = True
 
             for ip in list(self.sessions.keys()):
                 cleanup_step(f"target {ip}", lambda ip=ip: self.remove_target(ip))
             cleanup_step(
                 "sniffer",
-                lambda: self.sniffer.stop()
-                if self.sniffer and hasattr(self.sniffer, "stop") else None,
+                lambda: (
+                    self.sniffer.stop()
+                    if self.sniffer and hasattr(self.sniffer, "stop")
+                    else None
+                ),
             )
             cleanup_step(
                 "mitmproxy",
-                lambda: getattr(self, "mitm_manager", None) and self.mitm_manager.terminate(),
+                lambda: (
+                    getattr(self, "mitm_manager", None)
+                    and self.mitm_manager.terminate()
+                ),
             )
             cleanup_step("fake server", self._terminate_fake_server)
+            cleanup_step("plugins", self._cleanup_plugins)
             cleanup_step("ARP amplification", self._stop_arp_amplification)
             cleanup_step("global rules", self._remove_global_rules)
             cleanup_step(
@@ -606,7 +624,9 @@ class NetShaper:
                         self.state_snapshot,
                         restore_firewall=False,
                     )
-                    or (_ for _ in ()).throw(RuntimeError("state snapshot restore failed"))
+                    or (_ for _ in ()).throw(
+                        RuntimeError("state snapshot restore failed")
+                    )
                 ),
             )
             cleanup_step("traffic shaper", self.shaper.cleanup)
@@ -635,6 +655,56 @@ class NetShaper:
     # Backward-compatible alias (older CLI expects stop())
     def stop(self) -> None:
         self.cleanup()
+
+    def register_plugin(
+        self,
+        plugin_id: str,
+        scope: dict[str, Any],
+        config: dict[str, Any] | None = None,
+    ) -> str:
+        plugin_cls = PluginManager.get(plugin_id)
+        config = config or {}
+        plugin_cls.validate_scope(scope, self._auth_policy)
+        plugin = plugin_cls.new_instance(scope, config, self._auth_policy)
+        self.plugins[plugin.instance_id] = plugin
+        return plugin.instance_id
+
+    def start_plugin(self, instance_id: str) -> bool:
+        plugin = self.plugins.get(instance_id)
+        if plugin is None:
+            raise ValueError(f"unknown plugin instance {instance_id}")
+        if config.DRY_RUN:
+            print_flush(f"[DRY-RUN] Would start plugin {instance_id}")
+            return True
+        result = plugin.start()
+        if result:
+            plugin.active = True
+            self.save_state()
+        return result
+
+    def stop_plugin(self, instance_id: str) -> bool:
+        plugin = self.plugins.get(instance_id)
+        if plugin is None:
+            return True
+        result = plugin.stop()
+        if result:
+            self.plugins.pop(instance_id, None)
+            self.save_state()
+        return result
+
+    def _cleanup_plugins(self) -> bool:
+        ok = True
+        for instance_id in list(self.plugins):
+            plugin = self.plugins[instance_id]
+            try:
+                if not plugin.stop():
+                    ok = False
+            except Exception as exc:
+                log.error("Plugin cleanup failed (%s): %s", instance_id, exc)
+                ok = False
+            finally:
+                self.plugins.pop(instance_id, None)
+        return ok
 
     @staticmethod
     def _remove_state_file(state_path: str) -> None:
@@ -715,8 +785,7 @@ class NetShaper:
 
         self._arp_amplifier = amplifier
         log.info(
-            "ARP amplification started "
-            f"(phantoms={phantom_count}, cam={cam_exhaust})"
+            f"ARP amplification started (phantoms={phantom_count}, cam={cam_exhaust})"
         )
 
     def launch_fake_server(
@@ -823,19 +892,23 @@ class NetShaper:
         finally:
             self._arp_amplifier = None
 
-    def launch_sniffer(self, target_ips: Optional[List[str]] = None,
-                       save_pcap: bool = False, rolling: bool = False) -> None:
+    def launch_sniffer(
+        self,
+        target_ips: Optional[List[str]] = None,
+        save_pcap: bool = False,
+        rolling: bool = False,
+    ) -> None:
         if config.DRY_RUN:
             print_flush("[DRY-RUN] Would launch packet sniffer")
             return
         if self.sniffer:
             self.sniffer.stop()
         if rolling:
-            self.sniffer = RollingPacketSniffer(
-                self.interface, target_ips=target_ips)
+            self.sniffer = RollingPacketSniffer(self.interface, target_ips=target_ips)
         else:
             self.sniffer = PacketSniffer(
-                self.interface, target_ips=target_ips, save_pcap=save_pcap)
+                self.interface, target_ips=target_ips, save_pcap=save_pcap
+            )
         self.sniffer.start()
 
     # ── mitmproxy ─────────────────────────────────────────────────────────────
@@ -897,14 +970,8 @@ class NetShaper:
         firewall = session.firewall
         return (
             session.dns_on
-            or bool(
-                getattr(firewall, "_dns_input_rules", set())
-                if firewall else False
-            )
-            or bool(
-                getattr(firewall, "_dns_added", False)
-                if firewall else False
-            )
+            or bool(getattr(firewall, "_dns_input_rules", set()) if firewall else False)
+            or bool(getattr(firewall, "_dns_added", False) if firewall else False)
         )
 
     def save_state(self) -> bool:
@@ -920,27 +987,21 @@ class NetShaper:
                 ),
                 "http_redirect_port": (
                     getattr(s.firewall, "_http_redirect_port", None)
-                    if s.firewall else None
+                    if s.firewall
+                    else None
                 ),
                 "firewall_rule_comment": (
-                    getattr(s.firewall, "_rule_comment", None)
-                    if s.firewall else None
+                    getattr(s.firewall, "_rule_comment", None) if s.firewall else None
                 ),
                 "mangle_chain": (
-                    getattr(s.firewall, "MANGLE", None)
-                    if s.firewall else None
+                    getattr(s.firewall, "MANGLE", None) if s.firewall else None
                 ),
-                "nat_chain": (
-                    getattr(s.firewall, "NAT", None)
-                    if s.firewall else None
-                ),
+                "nat_chain": (getattr(s.firewall, "NAT", None) if s.firewall else None),
             }
             for s in self.sessions.values()
         ]
 
-        firewall_state = (
-            self._get_firewall_manager().get_state_for_persistence() or {}
-        )
+        firewall_state = self._get_firewall_manager().get_state_for_persistence() or {}
 
         data = {
             "session_id": self.session_id,
@@ -950,11 +1011,24 @@ class NetShaper:
             "own_ip": self.own_ip,
             **firewall_state,
             "shaper_base_initialized": getattr(
-                getattr(self, "shaper", None), "_base_initialized", False),
+                getattr(self, "shaper", None), "_base_initialized", False
+            ),
             "shaper_root_qdisc_pending": getattr(
-                getattr(self, "shaper", None), "_root_qdisc_pending", False),
+                getattr(self, "shaper", None), "_root_qdisc_pending", False
+            ),
             "owner": getattr(self, "_owner_metadata", {}),
             "snapshot": self._snapshot_to_dict(self.state_snapshot),
+            "plugins": [
+                {
+                    "instance_id": plugin.instance_id,
+                    "plugin_id": type(plugin).PLUGIN_ID,
+                    "scope": plugin.scope,
+                    "config": plugin.config,
+                    "active": plugin.active,
+                    "state": plugin.get_state_for_persistence(),
+                }
+                for plugin in self.plugins.values()
+            ],
         }
         if config.DRY_RUN:
             self._dry_run_state = data
@@ -962,11 +1036,10 @@ class NetShaper:
         try:
             state_dir = self._session_state_dir()
             os.makedirs(state_dir, mode=0o700, exist_ok=True)
-            with tempfile.NamedTemporaryFile(
-                    'w', dir=state_dir, delete=False) as tf:
+            with tempfile.NamedTemporaryFile("w", dir=state_dir, delete=False) as tf:
                 json.dump(data, tf)
                 tmp = tf.name
-            os.replace(tmp, os.path.join(state_dir, "state.json"))   # Atomic write
+            os.replace(tmp, os.path.join(state_dir, "state.json"))  # Atomic write
             return True
         except Exception as e:
             log.error(f"State save failed: {e}")
@@ -1000,11 +1073,12 @@ class NetShaper:
                     tx = new.bytes_sent - old.bytes_sent
                     rx = new.bytes_recv - old.bytes_recv
                     print_flush(
-                        f"\r  TX:{self.scale_bytes(tx)}"
-                        f"  RX:{self.scale_bytes(rx)}   ",
-                        end='', flush=True)
+                        f"\r  TX:{self.scale_bytes(tx)}  RX:{self.scale_bytes(rx)}   ",
+                        end="",
+                        flush=True,
+                    )
                 old = new
             except Exception as e:
                 log.debug(f"[Monitor] Counter read error: {e}")
         # Erase the \r line so shutdown messages start on a clean line
-        print_flush("\r" + " " * 40 + "\r", end='')
+        print_flush("\r" + " " * 40 + "\r", end="")
