@@ -13,6 +13,8 @@ prune state
 prune tmp
 prune reference
 
+recursive-include examples *.json
+
 global-exclude *.py[cod] __pycache__/*
 global-exclude *.log *.pcap *.pcapng *.cap *.har *.zip
 global-exclude .coverage *.sqlite *.db *.state *.pid

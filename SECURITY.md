@@ -168,13 +168,28 @@ Future modules are completely isolated and independently auditable.
 - **Review:** Audit plugin code before loading, especially custom modules
 
 **RF Compliance (Wireless/BLE Plugins):**
-NetShaper does not perform RF transmission itself. Wireless/BLE plugins are responsible for:
+The Wi-Fi plugin can transmit explicitly enabled, bounded test frames. Operators
+are responsible for:
 - Regulatory compliance (FCC Part 15, CE, etc.)
 - Documenting legal jurisdiction restrictions
 - Respecting local frequency band regulations
 - Obtaining required licenses or certifications
 
-NetShaper's role is to gate plugin execution with authorization checks.
+NetShaper enforces the following additional boundaries:
+
+- Wi-Fi active scanning requires an ESSID allowlist.
+- Disconnect tests require exact unicast BSSID and client MAC allowlists.
+- No broadcast deauthentication is supported.
+- Each active Wi-Fi action is capped at five frames and all actions share a
+  maximum 100-frame attempt budget.
+- Generated beacon tests only use ESSIDs beginning with
+  `NETSHAPER-LAB-`.
+- Captured Wi-Fi frames are filtered against scope before being written and
+  capture files are mode `0600`.
+- BLE scanning requests passive mode and fails closed if the backend cannot
+  provide it.
+- BLE service enumeration is read-only, sets `pair=False`, and does not write
+  GATT characteristics or attempt to defeat pairing.
 
 ## Responsible Disclosure
 

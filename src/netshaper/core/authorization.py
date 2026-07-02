@@ -4,6 +4,7 @@ NetShaper — Authorization policy enforcement.
 Validates that target IPs fall within the authorized CIDR allowlist.
 Raises typed exceptions on authorization violations.
 """
+
 from __future__ import annotations
 
 from collections.abc import Sequence
@@ -18,6 +19,7 @@ Network = IPv4Network | IPv6Network
 
 class AuthorizationError(NetShaperError):
     """Raised when a target IP violates authorization policy."""
+
     pass
 
 
@@ -149,8 +151,7 @@ class AuthorizationPolicy:
 
         # Reject unsupported versions if no matching authorized CIDR exists.
         if not any(
-            requested.version == network.version
-            and requested.subnet_of(network)
+            self._network_is_subnet_of(requested, network)
             for network in self._authorized_cidrs
         ):
             raise AuthorizationError(
@@ -158,11 +159,20 @@ class AuthorizationPolicy:
             )
 
     @staticmethod
+    def _network_is_subnet_of(requested: Network, allowed: Network) -> bool:
+        if isinstance(requested, IPv4Network):
+            return isinstance(allowed, IPv4Network) and requested.subnet_of(allowed)
+        return isinstance(allowed, IPv6Network) and requested.subnet_of(allowed)
+
+    @staticmethod
     def _validate_bssid_format(raw_bssid: str) -> None:
         """Validate BSSID (MAC address) format: aa:bb:cc:dd:ee:ff"""
         if not isinstance(raw_bssid, str):
-            raise AuthorizationError(f"BSSID must be a string, got {type(raw_bssid).__name__}")
+            raise AuthorizationError(
+                f"BSSID must be a string, got {type(raw_bssid).__name__}"
+            )
         import re
+
         if not re.match(r"^[0-9a-fA-F]{2}(:[0-9a-fA-F]{2}){5}$", raw_bssid):
             raise AuthorizationError(
                 f"invalid BSSID format {raw_bssid!r}; expected aa:bb:cc:dd:ee:ff"
@@ -172,7 +182,9 @@ class AuthorizationPolicy:
     def _validate_essid_format(raw_essid: str) -> None:
         """Validate ESSID format: UTF-8 string, 0-32 bytes"""
         if not isinstance(raw_essid, str):
-            raise AuthorizationError(f"ESSID must be a string, got {type(raw_essid).__name__}")
+            raise AuthorizationError(
+                f"ESSID must be a string, got {type(raw_essid).__name__}"
+            )
         essid_bytes = raw_essid.encode("utf-8")
         if len(essid_bytes) > 32:
             raise AuthorizationError(

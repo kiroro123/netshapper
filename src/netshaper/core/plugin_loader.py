@@ -4,9 +4,11 @@ NetShaper — Plugin loading and discovery.
 Handles discovery of plugins via setuptools entry points and filesystem,
 validation, and registration with the PluginManager.
 """
+
 from __future__ import annotations
 
 import importlib.util
+import importlib
 import json
 import logging
 import os
@@ -19,7 +21,7 @@ try:
 except ImportError:
     from importlib_metadata import entry_points  # type: ignore
 
-from netshaper.core.plugin import PluginError, PluginInterface, PluginManager
+from netshaper.core.plugin import PluginInterface, PluginManager
 from netshaper.exceptions import NetShaperError
 
 log = logging.getLogger("netshaper")
@@ -39,6 +41,34 @@ class PluginLoader:
 
     PLUGIN_ENTRY_POINT = "netshaper.plugins"
     DEFAULT_PLUGIN_DIR = "/opt/netshaper-plugins"
+    BUILTIN_PLUGINS = {
+        "wifi-recon": "netshaper.plugins.wifi_recon:WifiReconPlugin",
+        "ble-recon": "netshaper.plugins.ble_recon:BleReconPlugin",
+    }
+
+    @staticmethod
+    def discover_builtins() -> List[tuple[str, type[PluginInterface]]]:
+        """Load the plugins shipped in the NetShaper distribution."""
+        discovered: List[tuple[str, type[PluginInterface]]] = []
+        for expected_id, target in PluginLoader.BUILTIN_PLUGINS.items():
+            module_name, class_name = target.split(":", 1)
+            try:
+                module = importlib.import_module(module_name)
+                plugin_cls = getattr(module, class_name)
+                if not isinstance(plugin_cls, type) or not issubclass(
+                    plugin_cls, PluginInterface
+                ):
+                    raise TypeError(f"{target} is not a PluginInterface class")
+                plugin_id = getattr(plugin_cls, "PLUGIN_ID", None)
+                if plugin_id != expected_id:
+                    raise ValueError(
+                        f"{target} declares plugin id {plugin_id!r}, "
+                        f"expected {expected_id!r}"
+                    )
+                discovered.append((plugin_id, plugin_cls))
+            except Exception as exc:
+                log.warning("Failed to load built-in plugin %s: %s", expected_id, exc)
+        return discovered
 
     @staticmethod
     def discover_entry_points() -> List[tuple[str, type[PluginInterface]]]:
@@ -140,9 +170,7 @@ class PluginLoader:
                 continue
 
             try:
-                spec = importlib.util.spec_from_file_location(
-                    module_name, module_path
-                )
+                spec = importlib.util.spec_from_file_location(module_name, module_path)
                 if spec is None or spec.loader is None:
                     log.warning("Cannot load plugin %s: invalid spec", filename)
                     continue
@@ -183,6 +211,7 @@ class PluginLoader:
 
     @staticmethod
     def load_and_register(
+        discover_builtins: bool = False,
         discover_entry_points: bool = True,
         discover_filesystem: bool = False,
         plugin_dir: str = DEFAULT_PLUGIN_DIR,
@@ -202,6 +231,14 @@ class PluginLoader:
             PluginLoadError: If discovery fails critically
         """
         registered: Dict[str, type[PluginInterface]] = {}
+
+        if discover_builtins:
+            for plugin_id, plugin_cls in PluginLoader.discover_builtins():
+                try:
+                    PluginManager.register(plugin_cls)
+                    registered[plugin_id] = plugin_cls
+                except ValueError as exc:
+                    log.debug("Failed to register plugin %s: %s", plugin_id, exc)
 
         if discover_entry_points:
             try:
@@ -234,6 +271,40 @@ class PluginLoader:
         return registered
 
     @staticmethod
+    def settings_for_plugin(
+        plugin_id: str,
+        raw_config: Dict[str, Any],
+        default_scope: Dict[str, Any],
+    ) -> tuple[Dict[str, Any], Dict[str, Any]]:
+        """Return ``(scope, config)`` for one plugin.
+
+        The preferred file shape is::
+
+            {"plugins": {"wifi-recon": {"scope": {...}, "config": {...}}}}
+
+        A flat object remains supported as shared plugin configuration.
+        """
+        plugins = raw_config.get("plugins")
+        if plugins is None:
+            return dict(default_scope), dict(raw_config)
+        if not isinstance(plugins, dict):
+            raise PluginLoadError("'plugins' must be a JSON object")
+
+        settings = plugins.get(plugin_id)
+        if settings is None:
+            return dict(default_scope), {}
+        if not isinstance(settings, dict):
+            raise PluginLoadError(f"configuration for {plugin_id!r} must be an object")
+
+        scope = settings.get("scope", default_scope)
+        plugin_config = settings.get("config", {})
+        if not isinstance(scope, dict):
+            raise PluginLoadError(f"scope for {plugin_id!r} must be an object")
+        if not isinstance(plugin_config, dict):
+            raise PluginLoadError(f"config for {plugin_id!r} must be an object")
+        return dict(scope), dict(plugin_config)
+
+    @staticmethod
     def parse_plugin_config(
         config_file: Optional[str],
     ) -> Dict[str, Any]:
@@ -264,6 +335,4 @@ class PluginLoader:
                 )
             return config_dict
         except json.JSONDecodeError as exc:
-            raise PluginLoadError(
-                f"plugin config file is invalid JSON: {exc}"
-            ) from exc
+            raise PluginLoadError(f"plugin config file is invalid JSON: {exc}") from exc

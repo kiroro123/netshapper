@@ -125,7 +125,7 @@ A typical flow for testing a target device:
 - Atomic state persistence and automatic stale-session recovery
 - Full `--dry-run` mode — prints commands without touching the system
 - Modular, independently auditable components
-- **Plugin system:** Load third-party extension modules (WiFi recon, BLE scanning, etc.)
+- **Plugin system:** Built-in Wi-Fi/BLE reconnaissance plus entry-point extensions
 
 ## Requirements
 
@@ -185,25 +185,23 @@ restricted to reserved `.test`, `.example`, `.invalid`, and `.localhost`
 domains. Established or preloaded HSTS is not bypassed; the lesson demonstrates
 the first-visit downgrade boundary and browser IDN display behavior.
 
-## Plugin System
+## Wireless Plugins
 
-NetShaper supports third-party extension modules (plugins) for specialized capabilities
-like wireless reconnaissance or Bluetooth scanning.
+NetShaper ships two built-in, independently scoped plugins:
 
-### Installing a Plugin
+- `wifi-recon`: authorized 802.11 discovery, channel hopping, PCAP/EAPOL
+  capture, active probe requests, and bounded radio-test frames.
+- `ble-recon`: passive BLE discovery, read-only GATT service enumeration, and
+  an audit of services exposed without pairing.
 
-Plugins are installed as Python packages with an entry point:
+Install the optional BLE backend when BLE support is needed:
 
 ```bash
-pip install netshaper-wifi-recon  # example plugin package
+python -m pip install -e ".[ble]"
 ```
 
-The plugin must declare itself in its `pyproject.toml`:
-
-```toml
-[project.entry-points."netshaper.plugins"]
-wifi-recon = "netshaper_wifi_recon:WifiReconPlugin"
-```
+Third-party plugins remain supported through the `netshaper.plugins` entry
+point group.
 
 ### Using a Plugin
 
@@ -221,14 +219,68 @@ is persisted alongside the main NetShaper session state.
 
 ### Plugin Configuration
 
-A JSON config file can be passed to all loaded plugins:
+Each plugin receives its own authorization scope and runtime configuration:
+[`examples/wireless-lab.json`](examples/wireless-lab.json) is a passive-by-default
+template.
 
 ```json
 {
-  "wifi_scan_timeout": 10,
-  "verbose": true
+  "plugins": {
+    "wifi-recon": {
+      "scope": {
+        "type": "mixed",
+        "bssids": ["aa:bb:cc:dd:ee:ff"],
+        "essids": ["AuthorizedLabAP"],
+        "channels": [1, 6, 11],
+        "allow_active_scan": true,
+        "client_macs": ["02:11:22:33:44:55"],
+        "allow_deauth_test": false,
+        "test_essids": ["NETSHAPER-LAB-DEMO"],
+        "allow_beacon_test": false
+      },
+      "config": {
+        "channel_interval": 1.0,
+        "probe_burst": 1,
+        "probe_interval": 2.0,
+        "max_tx_frames": 25,
+        "deauth_tests": [],
+        "beacon_test_frames": 0
+      }
+    },
+    "ble-recon": {
+      "scope": {
+        "type": "mixed",
+        "addresses": ["aa:bb:cc:dd:ee:ff"],
+        "service_uuids": ["180d"],
+        "allow_service_enumeration": true,
+        "audit_unpaired_access": true
+      },
+      "config": {
+        "scan_timeout": 15,
+        "connection_timeout": 10,
+        "passive_patterns": []
+      }
+    }
+  }
 }
 ```
+
+Active Wi-Fi flags default to false. Deauthentication tests are unicast-only,
+require both BSSID and client allowlists, and are capped at five frames per
+action. Probe, deauthentication, and lab-beacon actions share a hard session
+budget of at most 100 attempted frames. Test beacon ESSIDs must start with
+`NETSHAPER-LAB-`.
+
+BLE enumeration is read-only and never requests pairing. The unpaired-access
+audit reports whether a device exposes services without pairing; it does not
+bypass authentication or write characteristics.
+
+On Linux, passive scanning uses BlueZ advertisement-monitor patterns derived
+from the authorized service UUIDs. An address-only scope must provide one or
+more narrow `passive_patterns` entries containing `start_position`,
+`ad_data_type`, and a non-empty hexadecimal `content_hex`; broad match-all
+patterns are rejected. The backend requires BlueZ 5.56 or newer with
+experimental advertisement monitoring enabled and Linux kernel 5.10 or newer.
 
 ### Dry-Run with Plugins
 
@@ -238,6 +290,7 @@ Plugins see the `--dry-run` flag and should print commands instead of executing 
 sudo env PYTHONPATH="$PWD/src" python -m netshaper -i <interface> \
   --allow-cidr <authorized-cidr> \
   --plugin wifi-recon \
+  --plugin-config config.json \
   --dry-run
 ```
 

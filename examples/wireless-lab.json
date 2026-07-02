@@ -1,0 +1,55 @@
+{
+  "plugins": {
+    "wifi-recon": {
+      "scope": {
+        "type": "mixed",
+        "bssids": [
+          "aa:bb:cc:dd:ee:ff"
+        ],
+        "essids": [
+          "AuthorizedLabAP"
+        ],
+        "channels": [
+          1,
+          6,
+          11
+        ],
+        "allow_active_scan": false,
+        "client_macs": [
+          "02:11:22:33:44:55"
+        ],
+        "allow_deauth_test": false,
+        "test_essids": [
+          "NETSHAPER-LAB-DEMO"
+        ],
+        "allow_beacon_test": false
+      },
+      "config": {
+        "channel_interval": 1.0,
+        "probe_burst": 1,
+        "probe_interval": 2.0,
+        "max_tx_frames": 25,
+        "deauth_tests": [],
+        "beacon_test_frames": 0
+      }
+    },
+    "ble-recon": {
+      "scope": {
+        "type": "mixed",
+        "addresses": [
+          "aa:bb:cc:dd:ee:ff"
+        ],
+        "service_uuids": [
+          "180d"
+        ],
+        "allow_service_enumeration": false,
+        "audit_unpaired_access": false
+      },
+      "config": {
+        "scan_timeout": 15,
+        "connection_timeout": 10,
+        "passive_patterns": []
+      }
+    }
+  }
+}

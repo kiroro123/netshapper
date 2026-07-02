@@ -1,15 +1,13 @@
 """Tests for plugin discovery and loading."""
+
 import json
 import os
-import stat
-import sys
 import tempfile
 import unittest
-from pathlib import Path
 from unittest import mock
 
 from netshaper.core.authorization import AuthorizationPolicy
-from netshaper.core.plugin import PluginError, PluginInterface, PluginManager
+from netshaper.core.plugin import PluginInterface, PluginManager
 from netshaper.core.plugin_loader import PluginLoadError, PluginLoader
 
 
@@ -33,6 +31,12 @@ class DummyPlugin(PluginInterface):
 
 class PluginLoaderDiscoveryTests(unittest.TestCase):
     """Tests for plugin discovery from entry points and filesystem."""
+
+    def test_discover_builtins_loads_shipped_plugins_without_optional_deps(self):
+        result = dict(PluginLoader.discover_builtins())
+
+        self.assertIn("wifi-recon", result)
+        self.assertIn("ble-recon", result)
 
     def test_discover_entry_points_empty(self):
         """Empty entry points list returns empty discovery."""
@@ -151,10 +155,10 @@ from netshaper.core.plugin import PluginInterface
 class TestPlugin(PluginInterface):
     PLUGIN_ID = "fs-test"
     PLUGIN_NAME = "Filesystem Test"
-    
+
     def start(self):
         return True
-    
+
     def stop(self):
         return True
 """
@@ -178,10 +182,10 @@ from netshaper.core.plugin import PluginInterface
 class TestPlugin(PluginInterface):
     PLUGIN_ID = "fs-bad"
     PLUGIN_NAME = "Filesystem Bad"
-    
+
     def start(self):
         return True
-    
+
     def stop(self):
         return True
 """
@@ -203,10 +207,10 @@ from netshaper.core.plugin import PluginInterface
 
 class TestPlugin(PluginInterface):
     PLUGIN_NAME = "No ID"
-    
+
     def start(self):
         return True
-    
+
     def stop(self):
         return True
 """
@@ -276,6 +280,17 @@ class PluginLoaderRegistrationTests(unittest.TestCase):
         self.assertIs(result["test-dummy"], DummyPlugin)
         self.assertIn("test-dummy", PluginManager.available())
 
+    def test_load_and_register_builtins(self):
+        result = PluginLoader.load_and_register(
+            discover_builtins=True,
+            discover_entry_points=False,
+            discover_filesystem=False,
+        )
+
+        self.assertIn("wifi-recon", result)
+        self.assertIn("ble-recon", result)
+        self.assertIn("wifi-recon", PluginManager.available())
+
     def test_load_and_register_skips_disabled_discovery(self):
         """Disabled discovery methods are not called."""
         result = PluginLoader.load_and_register(
@@ -327,9 +342,7 @@ class PluginLoaderConfigTests(unittest.TestCase):
 
     def test_parse_plugin_config_valid_json(self):
         """Valid JSON config is parsed."""
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".json", delete=False
-        ) as f:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
             config = {"scan_timeout": 10, "verbose": True}
             json.dump(config, f)
             config_file = f.name
@@ -349,9 +362,7 @@ class PluginLoaderConfigTests(unittest.TestCase):
 
     def test_parse_plugin_config_invalid_json_raises(self):
         """Invalid JSON raises PluginLoadError."""
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".json", delete=False
-        ) as f:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
             f.write("not valid json {{{")
             config_file = f.name
 
@@ -365,9 +376,7 @@ class PluginLoaderConfigTests(unittest.TestCase):
 
     def test_parse_plugin_config_non_dict_raises(self):
         """Non-dict JSON raises PluginLoadError."""
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".json", delete=False
-        ) as f:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
             json.dump([1, 2, 3], f)  # array instead of object
             config_file = f.name
 
@@ -378,6 +387,38 @@ class PluginLoaderConfigTests(unittest.TestCase):
             self.assertIn("must be a JSON object", str(ctx.exception))
         finally:
             os.unlink(config_file)
+
+    def test_plugin_specific_settings_split_scope_and_config(self):
+        raw = {
+            "plugins": {
+                "wifi-recon": {
+                    "scope": {
+                        "type": "bssid",
+                        "bssids": ["aa:bb:cc:dd:ee:ff"],
+                    },
+                    "config": {"interface": "wlan0"},
+                }
+            }
+        }
+
+        scope, config = PluginLoader.settings_for_plugin(
+            "wifi-recon",
+            raw,
+            {"type": "cidr", "cidrs": ["192.0.2.0/24"]},
+        )
+
+        self.assertEqual(scope["type"], "bssid")
+        self.assertEqual(config, {"interface": "wlan0"})
+
+    def test_flat_config_remains_backward_compatible(self):
+        scope, config = PluginLoader.settings_for_plugin(
+            "test-dummy",
+            {"timeout": 5},
+            {"type": "cidr", "cidrs": ["192.0.2.0/24"]},
+        )
+
+        self.assertEqual(scope["type"], "cidr")
+        self.assertEqual(config, {"timeout": 5})
 
 
 class PluginLoaderIntegrationTests(unittest.TestCase):
