@@ -23,7 +23,9 @@ In captive portal scenarios, the target device must be able to retrieve and trus
 **Mitigation:**
 - **Network isolation:** Run NetShaper only on isolated lab networks with controlled device access
 - **Time-limited sessions:** Use NetShaper for discrete testing windows, not continuous operation
-- **Restrict to authorized CIDRs:** The `--allow-cidr` flag limits target scope; ensure all test networks are listed
+- **Restrict to authorized CIDRs:** The main CLI limits target scope, and the
+  DNS helper independently defaults to loopback-only clients unless
+  `--allow-cidr` is provided
 - **Firewall boundaries:** Run on a separate VLAN or air-gapped network segment
 - **Clear audit trail:** Monitor `/var/log/netshaper.log` for unexpected access
 
@@ -163,8 +165,8 @@ Future modules are completely isolated and independently auditable.
 - **Source audit:** Only load plugins from trusted sources (entry-point packages with known provenance)
 - **Filesystem security:** Check `/opt/netshaper-plugins/` (phase 1b) for world-writable permissions
 - **Privilege:** Plugins run as the user who invokes NetShaper (typically root in production)
-- **State isolation:** Plugin state is saved but not restored across crashes unless plugin re-registers
-- **Cleanup:** Plugins are stopped cleanly on shutdown; unresponsive plugins are logged
+- **State isolation:** Built-in persistent plugin state is recovered after crashes; unknown active plugin records fail closed and remain for operator action
+- **Cleanup:** Plugins start only after final confirmation, are stopped on every exit path, and failed stops remain retryable
 - **Review:** Audit plugin code before loading, especially custom modules
 
 **RF Compliance (Wireless/BLE Plugins):**
@@ -185,7 +187,7 @@ NetShaper enforces the following additional boundaries:
 - Generated beacon tests only use ESSIDs beginning with
   `NETSHAPER-LAB-`.
 - Captured Wi-Fi frames are filtered against scope before being written and
-  capture files are mode `0600`.
+  capture files are mode `0600` inside an operator-owned mode-`0700` directory.
 - BLE scanning requests passive mode and fails closed if the backend cannot
   provide it.
 - BLE service enumeration is read-only, sets `pair=False`, and does not write

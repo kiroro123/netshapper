@@ -1,5 +1,6 @@
 import io
 import unittest
+from ipaddress import ip_network
 from types import SimpleNamespace
 from unittest import mock
 
@@ -272,6 +273,19 @@ class DnsForwardingTests(unittest.TestCase):
 
 
 class DnssecSuppressionTests(unittest.TestCase):
+    def setUp(self):
+        self.original_allowed = fake_server3.DNS_ALLOWED_NETWORKS
+        self.original_mode = fake_server3.DNSSEC_MODE
+        self.original_suppression = fake_server3.DNS_SUPPRESS_DNSSEC
+        fake_server3.DNS_ALLOWED_NETWORKS = (ip_network("192.0.2.0/24"),)
+        fake_server3.DNSSEC_MODE = "off"
+        fake_server3.DNS_SUPPRESS_DNSSEC = False
+
+    def tearDown(self):
+        fake_server3.DNS_ALLOWED_NETWORKS = self.original_allowed
+        fake_server3.DNSSEC_MODE = self.original_mode
+        fake_server3.DNS_SUPPRESS_DNSSEC = self.original_suppression
+
     def _make_query_with_opt(self, *, do: bool = True, cd: bool = True) -> bytes:
         flags = 0x0110 if cd else 0x0100
         header = (
@@ -313,24 +327,58 @@ class DnssecSuppressionTests(unittest.TestCase):
             "signed.example.test", qtype=48
         )
         sock = mock.Mock()
-        original = fake_server3.DNS_SUPPRESS_DNSSEC
         fake_server3.DNS_SUPPRESS_DNSSEC = True
-        try:
-            with mock.patch(
-                "netshaper.fake_server3.forward_dns_query"
-            ) as forward_mock, mock.patch("netshaper.fake_server3.print_flush"):
-                fake_server3.handle_dns_query(
-                    sock, query, ("192.0.2.5", 5353)
-                )
-        finally:
-            fake_server3.DNS_SUPPRESS_DNSSEC = original
+        with mock.patch(
+            "netshaper.fake_server3.forward_dns_query"
+        ) as forward_mock, mock.patch("netshaper.fake_server3.print_flush"):
+            fake_server3.handle_dns_query(
+                sock, query, ("192.0.2.5", 5353)
+            )
 
         forward_mock.assert_not_called()
         response = sock.sendto.call_args.args[0]
         self.assertEqual(response[6:8], b"\x00\x00")
 
+    def test_dnssec_modes_produce_distinct_results(self):
+        query = self._make_query_with_opt()
+        expected_rcodes = {
+            "fail-closed": 2,
+            "nxdomain": 3,
+        }
+        for mode, expected_rcode in expected_rcodes.items():
+            with self.subTest(mode=mode):
+                fake_server3.DNSSEC_MODE = mode
+                sock = mock.Mock()
+                with mock.patch(
+                    "netshaper.fake_server3.forward_dns_query"
+                ) as forward_mock, mock.patch(
+                    "netshaper.fake_server3.print_flush"
+                ):
+                    fake_server3.handle_dns_query(
+                        sock, query, ("192.0.2.5", 5353)
+                    )
+                forward_mock.assert_not_called()
+                response = sock.sendto.call_args.args[0]
+                self.assertEqual(response[3] & 0x0F, expected_rcode)
+
+        fake_server3.DNSSEC_MODE = "timeout"
+        sock = mock.Mock()
+        with mock.patch(
+            "netshaper.fake_server3.forward_dns_query"
+        ) as forward_mock, mock.patch("netshaper.fake_server3.print_flush"):
+            fake_server3.handle_dns_query(sock, query, ("192.0.2.5", 5353))
+        forward_mock.assert_not_called()
+        sock.sendto.assert_not_called()
+
 
 class ServeDnsTests(unittest.TestCase):
+    def setUp(self):
+        self.original_allowed = fake_server3.DNS_ALLOWED_NETWORKS
+        fake_server3.DNS_ALLOWED_NETWORKS = (ip_network("192.0.2.0/24"),)
+
+    def tearDown(self):
+        fake_server3.DNS_ALLOWED_NETWORKS = self.original_allowed
+
     def test_serve_dns_logs_and_stops_on_socket_receive_error(self):
         sock = mock.Mock()
         sock.recvfrom.side_effect = OSError("closed")
@@ -353,6 +401,16 @@ class ServeDnsTests(unittest.TestCase):
 
         sock.sendto.assert_not_called()
         self.assertIn("QDCOUNT=2", print_flush_mock.call_args.args[0])
+
+    def test_handle_dns_query_rejects_client_outside_allowlist(self):
+        data = ParseDnsQuestionTests()._make_query("example.test")
+        sock = mock.Mock()
+
+        with mock.patch("netshaper.fake_server3.print_flush") as output:
+            fake_server3.handle_dns_query(sock, data, ("198.51.100.8", 5353))
+
+        sock.sendto.assert_not_called()
+        self.assertIn("unauthorized client", output.call_args.args[0])
 
 
 class ParseDnsQuestionTests(unittest.TestCase):

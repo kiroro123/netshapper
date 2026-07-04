@@ -1,4 +1,5 @@
 import unittest
+from ipaddress import ip_network
 from unittest import mock
 
 from netshaper.core.authorization import AuthorizationPolicy
@@ -40,6 +41,7 @@ class NetShaperPluginTests(unittest.TestCase):
         self.ns._lifecycle_lock = mock.Mock()
         self.ns.sessions = {}
         self.ns.plugins = {}
+        self.ns._active_cleanup_attempted = False
         self.ns.session_id = "NS-TEST"
         self.ns.interface = "eth0"
         self.ns._owner_metadata = {}
@@ -85,6 +87,37 @@ class NetShaperPluginTests(unittest.TestCase):
 
         self.ns.save_state.assert_not_called()
         self.ns.plugins[plugin_id].get_state_for_persistence()
+
+    def test_start_plugin_rolls_back_when_final_state_save_fails(self):
+        plugin_id = self.ns.register_plugin(
+            "dummy",
+            {"type": "cidr", "cidr": "192.0.2.0/24"},
+        )
+        self.ns.save_state.side_effect = [True, False, True]
+
+        self.assertFalse(self.ns.start_plugin(plugin_id))
+        self.assertFalse(self.ns.plugins[plugin_id].active)
+
+    def test_failed_plugin_cleanup_is_retained_for_retry(self):
+        plugin_id = self.ns.register_plugin(
+            "dummy",
+            {"type": "cidr", "cidr": "192.0.2.0/24"},
+        )
+        self.ns.plugins[plugin_id].stop = mock.Mock(return_value=False)
+
+        self.assertFalse(self.ns._cleanup_plugins())
+        self.assertIn(plugin_id, self.ns.plugins)
+
+    def test_json_safe_serializes_default_network_scope(self):
+        scope = {
+            "type": "cidr",
+            "cidrs": [ip_network("192.0.2.0/24")],
+        }
+
+        self.assertEqual(
+            self.ns._json_safe(scope),
+            {"type": "cidr", "cidrs": ["192.0.2.0/24"]},
+        )
 
 
 if __name__ == "__main__":

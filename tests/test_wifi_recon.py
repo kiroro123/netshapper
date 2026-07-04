@@ -169,6 +169,33 @@ class WifiReconLifecycleTests(unittest.TestCase):
         plugin._close_writers.assert_called_once()
         plugin._restore_managed_mode.assert_called_once()
 
+    def test_failed_managed_mode_restore_remains_retryable(self):
+        plugin = WifiReconPlugin(
+            "wifi-restore",
+            self.scope,
+            {"interface": "wlan0"},
+            self.auth,
+        )
+        plugin._monitor_enabled = True
+        plugin._binary = mock.Mock(side_effect=lambda value: f"/sbin/{value}")
+        plugin._run = mock.Mock(side_effect=[True, False, True])
+
+        self.assertFalse(plugin._restore_managed_mode())
+        self.assertTrue(plugin._monitor_enabled)
+
+    def test_capture_directory_cannot_be_a_system_directory(self):
+        plugin = WifiReconPlugin(
+            "wifi-system-path",
+            self.scope,
+            {"capture_dir": "/"},
+            self.auth,
+        )
+        plugin._scapy = {"PcapWriter": mock.Mock()}
+
+        with self.assertRaisesRegex(WifiError, "mode 0700"):
+            plugin._open_capture()
+        plugin._scapy["PcapWriter"].assert_not_called()
+
     def test_state_contains_capture_and_transmission_audit(self):
         plugin = WifiReconPlugin("wifi-state", self.scope, {}, self.auth)
         plugin._discovered_networks["aa:bb:cc:dd:ee:ff"] = DiscoveredNetwork(

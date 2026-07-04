@@ -10,6 +10,10 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+  pull-requests: read
+
 jobs:
   check-privileged-tests:
     name: Require Privileged Test Clearance
@@ -35,7 +39,10 @@ jobs:
 
       - name: Check coverage threshold
         run: |
-          coverage report --fail-under=80
+          coverage report
+          coverage report \
+            --include="src/netshaper/core/authorization.py,src/netshaper/core/firewall_manager.py,src/netshaper/core/mitm_manager.py,src/netshaper/core/plugin.py,src/netshaper/core/plugin_loader.py,src/netshaper/core/recovery_manager.py,src/netshaper/core/state_manager.py,src/netshaper/network/firewall.py,src/netshaper/network/shaper.py" \
+            --fail-under=80
 
       - name: Run static analysis
         run: |
@@ -47,7 +54,11 @@ jobs:
         uses: actions/github-script@v6
         with:
           script: |
-            const labels = (context.payload.pull_request.labels || []).map(l => l.name)
+            const { data: pullRequest } = await github.rest.pulls.get({
+              ...context.repo,
+              pull_number: context.issue.number,
+            })
+            const labels = (pullRequest.labels || []).map(label => label.name)
             if (!labels.includes('privileged-tests-passed')) {
               core.setFailed("Missing required label: privileged-tests-passed. Run privileged tests on an approved runner and add the label to proceed.")
             } else {

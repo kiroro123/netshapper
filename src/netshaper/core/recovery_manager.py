@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shutil
 from typing import Any, List, Optional
 
@@ -18,6 +19,7 @@ from netshaper.system import InspectionStatus, SubprocessRunner, inspect_resourc
 from netshaper.exceptions import NetShaperError
 
 log = logging.getLogger("netshaper")
+_INTERFACE_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,15}$")
 
 
 class RecoveryError(NetShaperError):
@@ -254,6 +256,9 @@ class RecoveryManager:
             # Clean traffic shaper
             cleanup_ok = self._cleanup_traffic_shaper(data, iface) and cleanup_ok
 
+            # Restore persistent resources owned by crashed plugins.
+            cleanup_ok = self._cleanup_plugins(data) and cleanup_ok
+
             # Restore sysctl settings
             cleanup_ok = self._restore_sysctl_settings(data) and cleanup_ok
 
@@ -306,9 +311,11 @@ class RecoveryManager:
         for record in rule_records:
             binary = record.get("binary")
             if not binary or not shutil.which(binary):
-                if binary and binary not in binaries:
-                    log.error(f"[Recovery] {binary} unavailable for global rules")
-                    cleanup_ok = False
+                log.error(
+                    "[Recovery] %s unavailable for global rules",
+                    binary or "recorded firewall binary",
+                )
+                cleanup_ok = False
                 continue
 
             status = self._inspect_stale_resource(record["check"])
@@ -367,6 +374,12 @@ class RecoveryManager:
                                 log.info(
                                     f"[Recovery] Removed {binary} DNS INPUT {ip}/{proto}"
                                 )
+                            else:
+                                cleanup_ok = False
+                                log.error(
+                                    f"[Recovery] Failed to remove {binary} "
+                                    f"DNS INPUT {ip}/{proto}"
+                                )
                         elif rule_status is InspectionStatus.ERROR:
                             cleanup_ok = False
                             log.error(
@@ -385,6 +398,11 @@ class RecoveryManager:
                             rule_spec["delete"], check=False, silent=True
                         ):
                             log.info(f"[Recovery] Removed {binary} HTTP INPUT {ip}")
+                        else:
+                            cleanup_ok = False
+                            log.error(
+                                f"[Recovery] Failed to remove {binary} HTTP INPUT {ip}"
+                            )
                     elif http_status is InspectionStatus.ERROR:
                         cleanup_ok = False
                         log.error(
@@ -396,6 +414,71 @@ class RecoveryManager:
                     cleanup_ok = self._cleanup_target_chain(
                         binary, table, hook, chain_name
                     ) and cleanup_ok
+
+        return cleanup_ok
+
+    @staticmethod
+    def _cleanup_plugins(data: dict[str, Any]) -> bool:
+        """Restore persistent state left by crashed built-in plugins.
+
+        BLE has no persistent host-side state. Unknown active plugins fail
+        closed so their recovery manifest is retained for operator action.
+        """
+        cleanup_ok = True
+        for record in data.get("plugins") or []:
+            if not isinstance(record, dict):
+                log.error("[Recovery] Invalid plugin recovery record")
+                cleanup_ok = False
+                continue
+            if not (record.get("active") or record.get("start_pending")):
+                continue
+
+            plugin_id = record.get("plugin_id")
+            if plugin_id == "ble-recon":
+                continue
+            if plugin_id != "wifi-recon":
+                log.error(
+                    "[Recovery] No stale-state recovery handler for active plugin %r",
+                    plugin_id,
+                )
+                cleanup_ok = False
+                continue
+
+            plugin_config = record.get("config") or {}
+            plugin_state = record.get("state") or {}
+            iface = plugin_config.get("interface") or plugin_state.get("monitor_iface")
+            if not isinstance(iface, str) or not _INTERFACE_RE.fullmatch(iface):
+                log.error("[Recovery] Invalid Wi-Fi plugin interface %r", iface)
+                cleanup_ok = False
+                continue
+
+            ip_binary = shutil.which("ip")
+            iw_binary = shutil.which("iw")
+            if not ip_binary or not iw_binary:
+                log.error("[Recovery] ip/iw unavailable for Wi-Fi plugin recovery")
+                cleanup_ok = False
+                continue
+
+            down_ok = SubprocessRunner.run(
+                [ip_binary, "link", "set", iface, "down"],
+                check=False,
+                silent=True,
+            )
+            managed_ok = SubprocessRunner.run(
+                [iw_binary, "dev", iface, "set", "type", "managed"],
+                check=False,
+                silent=True,
+            )
+            up_ok = SubprocessRunner.run(
+                [ip_binary, "link", "set", iface, "up"],
+                check=False,
+                silent=True,
+            )
+            if down_ok and managed_ok and up_ok:
+                log.info("[Recovery] Restored managed mode on %s", iface)
+            else:
+                log.error("[Recovery] Failed to restore managed mode on %s", iface)
+                cleanup_ok = False
 
         return cleanup_ok
 

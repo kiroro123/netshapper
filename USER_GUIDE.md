@@ -57,7 +57,8 @@ The fake server binds ports `53` (DNS) and `80` (HTTP), so it requires `sudo`.
 **Terminal 1** — fake server:
 
 ```bash
-sfakeserver --smart-spoof-all --host-ip <your-ip> --verbose-dns
+sfakeserver --smart-spoof-all --host-ip <your-ip> \
+  --allow-cidr <authorized-cidr> --verbose-dns
 ```
 
 **Terminal 2** — NetShaper:
@@ -153,14 +154,17 @@ IPv6 information.
 | `--verbose-dns` | Log every DNS query and response |
 | `--host-ip <ip>` | Override the IP returned in spoofed A records |
 | `--dns-workers 16` | Set maximum concurrent DNS forwarding workers |
+| `--allow-cidr 192.0.2.0/24` | Allow DNS clients from this CIDR; repeat as needed |
 | `--serve-ca-cert` | Explicitly enable serving the mitmproxy CA at `/cert` |
-| `--suppress-dnssec` | Clear CD/DO upstream, clear AD downstream, and return NODATA for DNSSEC record queries |
+| `--dnssec-mode <mode>` | Select `fail-closed`, `fail-open`, `nxdomain`, or `timeout` behavior |
+| `--suppress-dnssec` | Compatibility alias for `--dnssec-mode fail-open` |
 | `--web-security-demo` | Enable the static lesson at `/training/web-security` |
 | `--idn-demo-domain арр.test` | Add a Unicode/Punycode example using a reserved training domain |
 
-DNSSEC suppression mode models a non-validating intermediary. It does not
-defeat validation on the endpoint: a correctly validating client should reject
-the unsigned result.
+DNS defaults to loopback-only clients unless at least one `--allow-cidr` is
+provided. DNSSEC `fail-open` models a non-validating intermediary; the other
+modes return SERVFAIL, NXDOMAIN, or no response for DNSSEC-aware queries.
+None of these modes defeats validation on the endpoint.
 
 The web security lesson contains no sign-in form and captures no credentials.
 It explains that preloaded or previously learned HSTS upgrades the request

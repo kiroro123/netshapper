@@ -16,6 +16,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import stat
 import subprocess  # nosec B404
 import threading
 from typing import Any, ClassVar
@@ -422,7 +423,8 @@ class WifiReconPlugin(PluginInterface):
         if not self._restore_managed_mode():
             ok = False
         self.scan_end = datetime.now(timezone.utc).isoformat()
-        self.active = False
+        if ok:
+            self.active = False
         return ok
 
     @staticmethod
@@ -432,13 +434,46 @@ class WifiReconPlugin(PluginInterface):
         return thread
 
     def _open_capture(self) -> None:
-        capture_path = Path(self.capture_dir)
-        if capture_path.is_symlink():
-            raise WifiError("capture_dir must not be a symlink")
-        capture_path.mkdir(mode=0o700, parents=True, exist_ok=True)
-        if capture_path.is_symlink() or not capture_path.is_dir():
-            raise WifiError("capture_dir must be a real directory")
-        os.chmod(capture_path, 0o700)
+        capture_path = Path(
+            os.path.abspath(os.path.expanduser(self.capture_dir))
+        )
+        parent = capture_path.parent
+        if not parent.exists():
+            raise WifiError(
+                "capture_dir parent must already exist and be trusted"
+            )
+
+        # Reject symlink traversal and writable non-sticky parents. This keeps
+        # the subsequent writer open inside an operator-owned directory.
+        for component in (capture_path, *capture_path.parents):
+            if not component.exists() and component == capture_path:
+                continue
+            try:
+                metadata = os.lstat(component)
+            except OSError as exc:
+                raise WifiError(f"cannot inspect capture path {component}: {exc}") from exc
+            if stat.S_ISLNK(metadata.st_mode):
+                raise WifiError("capture_dir and its parents must not be symlinks")
+            if (
+                component != capture_path
+                and metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+                and not metadata.st_mode & stat.S_ISVTX
+            ):
+                raise WifiError(
+                    f"capture_dir parent is writable by other users: {component}"
+                )
+
+        if capture_path.exists():
+            metadata = os.stat(capture_path, follow_symlinks=False)
+            if not stat.S_ISDIR(metadata.st_mode):
+                raise WifiError("capture_dir must be a real directory")
+            if metadata.st_uid != os.geteuid() or metadata.st_mode & 0o077:
+                raise WifiError(
+                    "existing capture_dir must be owned by the current user "
+                    "and have mode 0700"
+                )
+        else:
+            capture_path.mkdir(mode=0o700)
 
         self.pcap_file = str(capture_path / f"{self.instance_id}.pcap")
         self._main_writer = self._scapy["PcapWriter"](
@@ -496,7 +531,8 @@ class WifiReconPlugin(PluginInterface):
         except Exception as exc:
             log.error("Could not restore managed mode on %s: %s", self.interface, exc)
             ok = False
-        self._monitor_enabled = False
+        if ok:
+            self._monitor_enabled = False
         return bool(ok)
 
     def _set_channel(self, channel: int, *, check: bool = False) -> bool:

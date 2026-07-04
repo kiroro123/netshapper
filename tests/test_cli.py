@@ -552,6 +552,49 @@ class CliTests(unittest.TestCase):
         run_mock.assert_not_called()
         ns.close.assert_called_once()
 
+    def test_main_does_not_start_plugin_before_final_confirmation(self):
+        ns = mock.Mock()
+        ns.load_state_and_cleanup.return_value = True
+        ns.own_ip = "192.0.2.10"
+        ns.own_ipv6 = None
+        ns.gw = "192.0.2.1"
+        ns.gw_ipv6 = None
+        ns.register_plugin.return_value = "dummy-1234"
+        target = Device(ip="192.0.2.20", mac="00:11:22:33:44:55")
+        ns.discover.return_value = [target]
+
+        with mock.patch("sys.argv", [
+                "netshaper",
+                "-i", "eth0",
+                "--allow-cidr", "192.0.2.0/24",
+                "--plugin", "dummy",
+             ]), \
+             mock.patch("netshaper.ui.cli.SystemChecker.check"), \
+             mock.patch("netshaper.ui.cli.choose_interface", return_value="eth0"), \
+             mock.patch("netshaper.ui.cli.config.configure_logging"), \
+             mock.patch("netshaper.ui.cli.print_flush"), \
+             mock.patch("netshaper.core.orchestrator.NetShaper",
+                        return_value=ns), \
+             mock.patch("netshaper.ui.cli.PluginLoader.parse_plugin_config",
+                        return_value={}), \
+             mock.patch("netshaper.ui.cli.PluginLoader.load_and_register"), \
+             mock.patch("netshaper.ui.cli.PluginLoader.settings_for_plugin",
+                        return_value=(
+                            {"type": "cidr", "cidrs": ["192.0.2.0/24"]},
+                            {},
+                        )), \
+             mock.patch("netshaper.ui.cli.pick_targets_ui",
+                        return_value=[target]), \
+             mock.patch("netshaper.ui.cli.safe_input",
+                        side_effect=["1", "n"]), \
+             mock.patch("netshaper.ui.cli.psutil.net_if_addrs",
+                        return_value={"eth0": []}), \
+             self.assertRaises(SystemExit):
+            cli.main()
+
+        ns.start_plugin.assert_not_called()
+        ns.close.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
