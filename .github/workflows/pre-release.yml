@@ -10,6 +10,10 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+  pull-requests: read
+
 jobs:
   check-privileged-tests:
     name: Require Privileged Test Clearance
@@ -50,7 +54,11 @@ jobs:
         uses: actions/github-script@v6
         with:
           script: |
-            const labels = (context.payload.pull_request.labels || []).map(l => l.name)
+            const { data: pullRequest } = await github.rest.pulls.get({
+              ...context.repo,
+              pull_number: context.issue.number,
+            })
+            const labels = (pullRequest.labels || []).map(label => label.name)
             if (!labels.includes('privileged-tests-passed')) {
               core.setFailed("Missing required label: privileged-tests-passed. Run privileged tests on an approved runner and add the label to proceed.")
             } else {
