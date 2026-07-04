@@ -424,10 +424,17 @@ def fake_server_launch_hint(
     exploit: ExploitOptions,
     *,
     host_ip: str,
+    authorized_cidrs: Optional[list] = None,
+    smart_spoof_all: bool = False,
 ) -> str:
     flags = [f"--host-ip {host_ip}"]
+    if smart_spoof_all:
+        flags.append("--smart-spoof-all")
+    for network in authorized_cidrs or []:
+        flags.append(f"--allow-cidr {network}")
+    flags.append(f"--allow-cidr {host_ip}/32")
     if exploit.fake_server_suppress_dnssec:
-        flags.append("--suppress-dnssec")
+        flags.append(f"--dnssec-mode {exploit.dnssec_mode}")
     if exploit.fake_server_web_security_demo:
         flags.append("--web-security-demo")
     if exploit.dnssec_enabled:
@@ -690,6 +697,7 @@ def main() -> None:
     except (RuntimeError, ValueError) as exc:
         sys.exit(f"[NetShaper] {exc}")
 
+    registered_plugins: list[tuple[str, str]] = []
     try:
         if not config.DRY_RUN:
             if not ns.load_state_and_cleanup():
@@ -711,7 +719,10 @@ def main() -> None:
                         scope, specific_config = PluginLoader.settings_for_plugin(
                             plugin_id,
                             plugin_config,
-                            {"type": "cidr", "cidrs": authorized_cidrs},
+                            {
+                                "type": "cidr",
+                                "cidrs": [str(network) for network in authorized_cidrs],
+                            },
                         )
                         if plugin_id == "wifi-recon":
                             specific_config.setdefault("interface", interface)
@@ -720,12 +731,10 @@ def main() -> None:
                             scope,
                             config=specific_config,
                         )
-                        if ns.start_plugin(instance_id):
-                            print_flush(
-                                f"  [+] Plugin {plugin_id} started ({instance_id})"
-                            )
-                        else:
-                            print_flush(f"  [!] Plugin {plugin_id} failed to start")
+                        registered_plugins.append((plugin_id, instance_id))
+                        print_flush(
+                            f"  [+] Plugin {plugin_id} ready ({instance_id})"
+                        )
                     except Exception as exc:
                         print_flush(f"  [!] Failed to load plugin {plugin_id}: {exc}")
                         if not config.DRY_RUN:
@@ -867,15 +876,24 @@ def main() -> None:
 
         if dns_spoof_on and not check_local_port(ns.own_ip, 53, socket.SOCK_DGRAM):
             print_flush("  [!] Fake DNS (port 53) not reachable.")
-            print_flush(f"      {fake_server_launch_hint(exploit, host_ip=ns.own_ip)}")
+            print_flush(
+                "      "
+                + fake_server_launch_hint(
+                    exploit,
+                    host_ip=ns.own_ip,
+                    authorized_cidrs=authorized_cidrs,
+                    smart_spoof_all=True,
+                )
+            )
             if (
                 safe_input("  Auto-launch netshaper-fake-server? (y/n): ").lower()
                 == "y"
             ):
                 if not ns.launch_fake_server(
-                    suppress_dnssec=exploit.fake_server_suppress_dnssec,
+                    dnssec_mode=exploit.dnssec_mode,
                     web_security_demo=exploit.fake_server_web_security_demo,
                     dns_upstream=exploit.dnssec_upstream,
+                    smart_spoof_all=True,
                 ):
                     sys.exit("[NetShaper] Fake DNS server did not become reachable.")
             else:
@@ -883,15 +901,24 @@ def main() -> None:
 
         if http_redirect_port == 80 and not check_local_port(ns.own_ip, 80):
             print_flush("  [!] Fake HTTP (port 80) not reachable.")
-            print_flush(f"      {fake_server_launch_hint(exploit, host_ip=ns.own_ip)}")
+            print_flush(
+                "      "
+                + fake_server_launch_hint(
+                    exploit,
+                    host_ip=ns.own_ip,
+                    authorized_cidrs=authorized_cidrs,
+                    smart_spoof_all=dns_spoof_on,
+                )
+            )
             if (
                 safe_input("  Auto-launch netshaper-fake-server? (y/n): ").lower()
                 == "y"
             ):
                 if not ns.launch_fake_server(
-                    suppress_dnssec=exploit.fake_server_suppress_dnssec,
+                    dnssec_mode=exploit.dnssec_mode,
                     web_security_demo=exploit.fake_server_web_security_demo,
                     dns_upstream=exploit.dnssec_upstream,
+                    smart_spoof_all=dns_spoof_on,
                 ):
                     sys.exit("[NetShaper] Captive portal requires reachable fake HTTP.")
             else:
@@ -900,15 +927,24 @@ def main() -> None:
             ns.own_ip, 80
         ):
             print_flush("  [!] HSTS demo HTTP service (port 80) not reachable.")
-            print_flush(f"      {fake_server_launch_hint(exploit, host_ip=ns.own_ip)}")
+            print_flush(
+                "      "
+                + fake_server_launch_hint(
+                    exploit,
+                    host_ip=ns.own_ip,
+                    authorized_cidrs=authorized_cidrs,
+                    smart_spoof_all=dns_spoof_on,
+                )
+            )
             if (
                 safe_input("  Auto-launch netshaper-fake-server? (y/n): ").lower()
                 == "y"
             ):
                 if not ns.launch_fake_server(
-                    suppress_dnssec=exploit.fake_server_suppress_dnssec,
+                    dnssec_mode=exploit.dnssec_mode,
                     web_security_demo=True,
                     dns_upstream=exploit.dnssec_upstream,
+                    smart_spoof_all=dns_spoof_on,
                 ):
                     sys.exit("[NetShaper] HSTS demo requires reachable fake HTTP.")
             else:
@@ -983,6 +1019,13 @@ def main() -> None:
         signal.signal(signal.SIGTERM, sig_handler)
 
         try:
+            for plugin_id, instance_id in registered_plugins:
+                if ns.start_plugin(instance_id):
+                    print_flush(
+                        f"  [+] Plugin {plugin_id} started ({instance_id})"
+                    )
+                else:
+                    raise RuntimeError(f"Plugin {plugin_id} failed to start")
             run_active_session(
                 ns,
                 targets,

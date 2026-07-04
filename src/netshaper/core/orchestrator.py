@@ -9,7 +9,14 @@ sniffer management, and the bandwidth monitor thread.
 from __future__ import annotations
 
 import fcntl
-from ipaddress import ip_address, ip_network
+from ipaddress import (
+    IPv4Address,
+    IPv4Network,
+    IPv6Address,
+    IPv6Network,
+    ip_address,
+    ip_network,
+)
 import json
 import logging
 import os
@@ -90,6 +97,7 @@ class NetShaper:
         self._started_at: Optional[float] = None
         self._cleanup_running = False
         self._cleanup_complete = False
+        self._active_cleanup_attempted = False
         self._dry_run_state = None
         self._lock_file = None
         self._owner_metadata = self._current_owner_metadata()
@@ -575,6 +583,7 @@ class NetShaper:
             if getattr(self, "_cleanup_running", False):
                 return
             self._cleanup_running = True
+            self._active_cleanup_attempted = True
             self.is_shutting_down = True
 
         errors = []
@@ -676,11 +685,56 @@ class NetShaper:
         if config.DRY_RUN:
             print_flush(f"[DRY-RUN] Would start plugin {instance_id}")
             return True
-        result = plugin.start()
-        if result:
-            plugin.active = True
+
+        # Persist a pending marker before a plugin can mutate host state. Crash
+        # recovery treats this marker like an active plugin.
+        plugin._start_pending = True
+        if not self.save_state():
+            plugin._start_pending = False
+            log.error("Refusing to start plugin %s without recovery state", instance_id)
+            return False
+
+        try:
+            result = plugin.start()
+        except Exception:
+            try:
+                stopped = plugin.stop()
+            except Exception as exc:
+                log.error("Plugin rollback failed (%s): %s", instance_id, exc)
+                stopped = False
+            plugin._start_pending = not stopped
+            if stopped:
+                plugin.active = False
             self.save_state()
-        return result
+            raise
+
+        if not result:
+            try:
+                stopped = plugin.stop()
+            except Exception as exc:
+                log.error("Plugin rollback failed (%s): %s", instance_id, exc)
+                stopped = False
+            plugin._start_pending = not stopped
+            if stopped:
+                plugin.active = False
+            self.save_state()
+            return False
+
+        plugin._start_pending = False
+        plugin.active = True
+        if self.save_state():
+            return True
+
+        log.error("Plugin %s started but final state persistence failed", instance_id)
+        try:
+            stopped = plugin.stop()
+        except Exception as exc:
+            log.error("Plugin rollback failed (%s): %s", instance_id, exc)
+            stopped = False
+        if stopped:
+            plugin.active = False
+            self.save_state()
+        return False
 
     def stop_plugin(self, instance_id: str) -> bool:
         plugin = self.plugins.get(instance_id)
@@ -694,16 +748,21 @@ class NetShaper:
 
     def _cleanup_plugins(self) -> bool:
         ok = True
+        removed_any = False
         for instance_id in list(self.plugins):
             plugin = self.plugins[instance_id]
             try:
-                if not plugin.stop():
+                if plugin.stop():
+                    self.plugins.pop(instance_id, None)
+                    removed_any = True
+                else:
                     ok = False
             except Exception as exc:
                 log.error("Plugin cleanup failed (%s): %s", instance_id, exc)
                 ok = False
-            finally:
-                self.plugins.pop(instance_id, None)
+        if removed_any and not self.save_state():
+            log.error("Could not persist plugin cleanup state")
+            ok = False
         return ok
 
     @staticmethod
@@ -792,14 +851,27 @@ class NetShaper:
         self,
         *,
         suppress_dnssec: bool = False,
+        dnssec_mode: str = "off",
         web_security_demo: bool = False,
         dns_upstream: str = "8.8.8.8",
+        smart_spoof_all: bool = False,
     ) -> bool:
         """Launch netshaper-fake-server when DNS/HTTP services are required."""
+        if dnssec_mode not in {
+            "off",
+            "fail-closed",
+            "fail-open",
+            "nxdomain",
+            "timeout",
+        }:
+            raise ValueError(f"invalid DNSSEC mode: {dnssec_mode}")
+        if suppress_dnssec and dnssec_mode == "off":
+            dnssec_mode = "fail-open"
         if config.DRY_RUN:
             print_flush(
                 "[DRY-RUN] Would launch netshaper-fake-server "
-                f"(dnssec={suppress_dnssec}, hsts={web_security_demo})"
+                f"(dnssec={dnssec_mode}, hsts={web_security_demo}, "
+                f"smart-spoof-all={smart_spoof_all})"
             )
             return True
 
@@ -821,8 +893,16 @@ class NetShaper:
             "--upstream",
             dns_upstream,
         ]
-        if suppress_dnssec:
-            cmd.append("--suppress-dnssec")
+        if smart_spoof_all:
+            cmd.append("--smart-spoof-all")
+        if dnssec_mode != "off":
+            cmd.extend(["--dnssec-mode", dnssec_mode])
+        allowed_cidrs = {
+            str(network) for network in self.authorized_cidrs
+        }
+        allowed_cidrs.add(f"{self.own_ip}/32")
+        for allowed_cidr in sorted(allowed_cidrs):
+            cmd.extend(["--allow-cidr", allowed_cidr])
         if web_security_demo:
             cmd.append("--web-security-demo")
 
@@ -942,10 +1022,25 @@ class NetShaper:
 
     def close(self) -> None:
         """Release non-network resources when a session never started."""
-        self._terminate_mitmproxy()
-        self._terminate_fake_server()
-        self._stop_arp_amplification()
-        self._release_instance_lock()
+        try:
+            self._terminate_mitmproxy()
+            self._terminate_fake_server()
+            self._stop_arp_amplification()
+            had_plugins = bool(getattr(self, "plugins", {}))
+            plugins_ok = self._cleanup_plugins()
+            if (
+                had_plugins
+                and plugins_ok
+                and not getattr(self, "_active_cleanup_attempted", False)
+            ):
+                # A plugin may have created a pre-session recovery manifest.
+                # Once it is stopped successfully there are no network
+                # resources to recover, so remove that manifest.
+                state_path = self._state_path()
+                if not config.DRY_RUN and os.path.exists(state_path):
+                    self._remove_state_file(state_path)
+        finally:
+            self._release_instance_lock()
 
     # ── State persistence ─────────────────────────────────────────────────────
     @staticmethod
@@ -964,6 +1059,17 @@ class NetShaper:
     @staticmethod
     def _snapshot_from_state(data: dict) -> NetworkStateSnapshot:
         return StateSnapshotManager.snapshot_from_state(data)
+
+    @staticmethod
+    def _json_safe(value):
+        """Convert supported structured values to JSON-safe equivalents."""
+        if isinstance(value, (IPv4Address, IPv6Address, IPv4Network, IPv6Network)):
+            return str(value)
+        if isinstance(value, dict):
+            return {str(key): NetShaper._json_safe(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple, set)):
+            return [NetShaper._json_safe(item) for item in value]
+        return value
 
     @staticmethod
     def _session_dns_recorded(session: TargetSession) -> bool:
@@ -1022,10 +1128,13 @@ class NetShaper:
                 {
                     "instance_id": plugin.instance_id,
                     "plugin_id": type(plugin).PLUGIN_ID,
-                    "scope": plugin.scope,
-                    "config": plugin.config,
+                    "scope": self._json_safe(plugin.scope),
+                    "config": self._json_safe(plugin.config),
                     "active": plugin.active,
-                    "state": plugin.get_state_for_persistence(),
+                    "start_pending": bool(
+                        getattr(plugin, "_start_pending", False)
+                    ),
+                    "state": self._json_safe(plugin.get_state_for_persistence()),
                 }
                 for plugin in self.plugins.values()
             ],

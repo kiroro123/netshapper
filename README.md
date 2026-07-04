@@ -163,7 +163,9 @@ sudo env PYTHONPATH="$PWD/src" python -m netshaper -i <interface> \
 Optional DNS/HTTP captive-portal helper (separate terminal):
 
 ```bash
-sudo env PYTHONPATH="$PWD/src" python -m netshaper.fake_server3 --smart-spoof-all --host-ip <your-ip>
+sudo env PYTHONPATH="$PWD/src" python -m netshaper.fake_server3 \
+  --smart-spoof-all --host-ip <your-ip> \
+  --allow-cidr <authorized-cidr>
 ```
 
 Lab behavior examples:
@@ -176,7 +178,8 @@ sudo env PYTHONPATH="$PWD/src" python -m netshaper -i <interface> \
 
 # Model DNSSEC suppression and serve the static HSTS/IDN lesson.
 sudo env PYTHONPATH="$PWD/src" python -m netshaper.fake_server3 \
-  --host-ip <your-ip> --suppress-dnssec --web-security-demo \
+  --host-ip <your-ip> --allow-cidr <authorized-cidr> \
+  --dnssec-mode fail-closed --web-security-demo \
   --idn-demo-domain арр.test
 ```
 

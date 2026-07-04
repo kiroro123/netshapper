@@ -25,7 +25,7 @@ import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from ipaddress import ip_address
+from ipaddress import IPv6Address, ip_address, ip_network
 from socketserver import ThreadingMixIn
 
 import psutil
@@ -97,6 +97,14 @@ DNS_SUPPRESS_DNSSEC = os.environ.get("DNS_SUPPRESS_DNSSEC", "").lower() in (
     "1",
     "true",
     "yes",
+)
+DNSSEC_MODE = os.environ.get("DNSSEC_MODE", "off").strip().lower()
+if DNSSEC_MODE not in {"off", "fail-closed", "fail-open", "nxdomain", "timeout"}:
+    DNSSEC_MODE = "off"
+DNS_SUPPRESS_DNSSEC = DNS_SUPPRESS_DNSSEC or DNSSEC_MODE != "off"
+DNS_ALLOWED_NETWORKS = (
+    ip_network("127.0.0.0/8"),
+    ip_network("::1/128"),
 )
 WEB_SECURITY_DEMO = os.environ.get("WEB_SECURITY_DEMO", "").lower() in (
     "1",
@@ -457,6 +465,37 @@ def suppress_dnssec_response(data: bytes) -> bytes:
     return bytes(altered)
 
 
+def dns_client_authorized(raw_address: str) -> bool:
+    """Return whether a DNS client belongs to the explicit source allowlist."""
+    try:
+        parsed = ip_address(raw_address.split("%", 1)[0])
+    except ValueError:
+        return False
+    if isinstance(parsed, IPv6Address) and parsed.ipv4_mapped is not None:
+        parsed = parsed.ipv4_mapped
+    return any(
+        parsed.version == network.version and parsed in network
+        for network in DNS_ALLOWED_NETWORKS
+    )
+
+
+def _effective_dnssec_mode() -> str:
+    if DNSSEC_MODE != "off":
+        return DNSSEC_MODE
+    return "fail-open" if DNS_SUPPRESS_DNSSEC else "off"
+
+
+def _query_requests_dnssec(data: bytes, qtype: int) -> bool:
+    if qtype in DNSSEC_QTYPES:
+        return True
+    ttl_offset = _find_opt_ttl_offset(data)
+    return bool(
+        ttl_offset is not None
+        and ttl_offset + 4 <= len(data)
+        and data[ttl_offset + 2] & 0x80
+    )
+
+
 def domain_matches(domain: str, patterns: set[str]) -> bool:
     if not domain:
         return False
@@ -548,6 +587,18 @@ def build_nxdomain_response(data: bytes, question_end: int) -> bytes:
         txid
         + b"\x81\x83"
         + qdcount
+        + b"\x00\x00\x00\x00\x00\x00"
+        + question_section
+    )
+
+
+def build_servfail_response(data: bytes, question_end: int) -> bytes:
+    txid = data[0:2]
+    question_section = data[12:question_end]
+    return (
+        txid
+        + b"\x81\x82"
+        + b"\x00\x01"
         + b"\x00\x00\x00\x00\x00\x00"
         + question_section
     )
@@ -668,9 +719,21 @@ def parse_args():
     parser.add_argument(
         "--suppress-dnssec",
         action="store_true",
+        help="Compatibility alias for --dnssec-mode fail-open.",
+    )
+    parser.add_argument(
+        "--dnssec-mode",
+        choices=["off", "fail-closed", "fail-open", "nxdomain", "timeout"],
+        default="off",
+        help="Behavior for DNSSEC-aware queries (default: off).",
+    )
+    parser.add_argument(
+        "--allow-cidr",
+        action="append",
+        default=[],
         help=(
-            "Lab model: clear CD/DO on forwarded queries, clear AD on replies, "
-            "and return NODATA for DNSSEC record types."
+            "Client CIDR allowed to use DNS. May be repeated or comma-separated; "
+            "defaults to loopback only."
         ),
     )
     parser.add_argument(
@@ -698,16 +761,29 @@ def configure_dns(args) -> None:
     global DNS_SPOOF_ALL, DNS_SMART_SPOOF_ALL, DNS_SPOOF_DOMAINS
     global DNS_FORWARD_DOMAINS, DNS_BLOCK_DOMAINS, DNS_FORWARD_CATEGORIES
     global DNS_UPSTREAM, DNS_VERBOSE, DNS_MAX_WORKERS, SERVE_CA_CERT
-    global DNS_SUPPRESS_DNSSEC
+    global DNS_SUPPRESS_DNSSEC, DNSSEC_MODE, DNS_ALLOWED_NETWORKS
     global WEB_SECURITY_DEMO, IDN_DEMO_DOMAINS
     DNS_SPOOF_ALL = DNS_SPOOF_ALL or args.spoof_all
     DNS_SMART_SPOOF_ALL = DNS_SMART_SPOOF_ALL or args.smart_spoof_all
     DNS_VERBOSE = DNS_VERBOSE or args.verbose_dns
     DNS_UPSTREAM = args.upstream
-    DNS_MAX_WORKERS = max(1, args.dns_workers)
+    DNS_MAX_WORKERS = max(1, min(args.dns_workers, 128))
     SERVE_CA_CERT = SERVE_CA_CERT or args.serve_ca_cert
-    DNS_SUPPRESS_DNSSEC = DNS_SUPPRESS_DNSSEC or getattr(
-        args, "suppress_dnssec", False
+    requested_dnssec_mode = getattr(args, "dnssec_mode", "off")
+    if requested_dnssec_mode != "off":
+        DNSSEC_MODE = requested_dnssec_mode
+    elif getattr(args, "suppress_dnssec", False):
+        DNSSEC_MODE = "fail-open"
+    DNS_SUPPRESS_DNSSEC = DNSSEC_MODE != "off"
+    allowed_networks = []
+    for token in getattr(args, "allow_cidr", []) or []:
+        for raw_cidr in token.split(","):
+            raw_cidr = raw_cidr.strip()
+            if raw_cidr:
+                allowed_networks.append(ip_network(raw_cidr, strict=False))
+    DNS_ALLOWED_NETWORKS = tuple(allowed_networks) or (
+        ip_network("127.0.0.0/8"),
+        ip_network("::1/128"),
     )
     WEB_SECURITY_DEMO = WEB_SECURITY_DEMO or getattr(
         args, "web_security_demo", False
@@ -786,10 +862,13 @@ def print_dns_startup(port: int) -> None:
         f"{cyan('[DNS]')} Forward={forwarded}  Block={blocked}  "
         f"SmartCategories={categories}"
     )
+    print_flush(
+        f"{cyan('[DNS]')} Allowed clients="
+        + ", ".join(str(network) for network in DNS_ALLOWED_NETWORKS)
+    )
     if DNS_SUPPRESS_DNSSEC:
         print_flush(
-            f"{yellow('[DNS]')} DNSSEC suppression model enabled "
-            "(validating clients should fail closed)"
+            f"{yellow('[DNS]')} DNSSEC mode={_effective_dnssec_mode()}"
         )
     if WEB_SECURITY_DEMO:
         print_flush(
@@ -799,6 +878,11 @@ def print_dns_startup(port: int) -> None:
 
 def handle_dns_query(sock: socket.socket, data: bytes, addr) -> None:
     try:
+        if not dns_client_authorized(str(addr[0])):
+            print_flush(
+                f"{yellow('[DNS]')} Rejecting unauthorized client {addr[0]}"
+            )
+            return
         if len(data) < 12:
             return
 
@@ -814,9 +898,25 @@ def handle_dns_query(sock: socket.socket, data: bytes, addr) -> None:
         if domain is None:
             return
 
+        dnssec_mode = _effective_dnssec_mode()
+        dnssec_requested = _query_requests_dnssec(data, qtype)
+        if dnssec_requested and dnssec_mode == "timeout":
+            print_flush(f"{yellow('[DNS]')} DNSSEC-TIMEOUT {domain} qtype={qtype}")
+            return
+        if dnssec_requested and dnssec_mode == "fail-closed":
+            response = build_servfail_response(data, question_end)
+            print_flush(f"{yellow('[DNS]')} DNSSEC-SERVFAIL {domain} qtype={qtype}")
+            sock.sendto(response, addr)
+            return
+        if dnssec_requested and dnssec_mode == "nxdomain":
+            response = build_nxdomain_response(data, question_end)
+            print_flush(f"{yellow('[DNS]')} DNSSEC-NXDOMAIN {domain} qtype={qtype}")
+            sock.sendto(response, addr)
+            return
+
         action, reason = decide_dns_policy(domain, qtype)
 
-        if DNS_SUPPRESS_DNSSEC and qtype in DNSSEC_QTYPES:
+        if dnssec_mode == "fail-open" and qtype in DNSSEC_QTYPES:
             response = build_dns_response(data, question_end, qtype)
             print_flush(
                 f"{yellow('[DNS]')} DNSSEC-NODATA {domain} qtype={qtype}"
@@ -840,12 +940,12 @@ def handle_dns_query(sock: socket.socket, data: bytes, addr) -> None:
                 )
             forwarded_query = data
             dnssec_changed = False
-            if DNS_SUPPRESS_DNSSEC:
+            if dnssec_mode != "off":
                 forwarded_query, dnssec_changed = suppress_dnssec_query(data)
             response = forward_dns_query(forwarded_query)
             if response is None:
                 return
-            if DNS_SUPPRESS_DNSSEC:
+            if dnssec_mode != "off":
                 response = suppress_dnssec_response(response)
                 if DNS_VERBOSE and dnssec_changed:
                     print_flush(

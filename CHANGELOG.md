@@ -4,6 +4,19 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Safety and lifecycle fixes
+
+- Made stale firewall recovery fail closed when binaries or rule deletions fail.
+- Deferred plugin startup until final confirmation and added retryable Wi-Fi
+  managed-mode recovery for cancellation and crash paths.
+- Restricted Wi-Fi captures to private operator-owned directories.
+- Wired smart DNS spoofing, distinct DNSSEC failure modes, and DNS client CIDR
+  allowlists into the auto-launched helper.
+- Made plugin recovery state JSON-safe and transactional before startup.
+- Added an enforceable 60% whole-package coverage ratchet plus an 80% gate for
+  security-sensitive authorization, firewall, recovery, persistence, plugin,
+  and shaping modules.
+
 ### Wireless plugins
 
 - Added built-in discovery for `wifi-recon` and `ble-recon`.

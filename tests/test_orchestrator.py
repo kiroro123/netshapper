@@ -194,6 +194,34 @@ class NetShaperCleanupTests(unittest.TestCase):
         self.assertTrue(result)
         popen_mock.assert_not_called()
 
+    def test_fake_server_launch_wires_spoof_mode_dnssec_and_allowlist(self):
+        ns = NetShaper.__new__(NetShaper)
+        self._set_authorized(ns)
+        ns.own_ip = "192.0.2.1"
+        ns._fake_server_proc = None
+        process = mock.Mock()
+        process.poll.return_value = None
+
+        with mock.patch(
+            "netshaper.core.orchestrator.check_local_port",
+            side_effect=[False, False, True, False],
+        ), mock.patch(
+            "netshaper.core.orchestrator.subprocess.Popen",
+            return_value=process,
+        ) as popen:
+            self.assertTrue(
+                ns.launch_fake_server(
+                    dnssec_mode="nxdomain",
+                    smart_spoof_all=True,
+                )
+            )
+
+        command = popen.call_args.args[0]
+        self.assertIn("--smart-spoof-all", command)
+        self.assertIn("nxdomain", command)
+        self.assertIn("192.0.2.0/24", command)
+        self.assertIn("192.0.2.1/32", command)
+
     def test_dry_run_discover_does_not_touch_network(self):
         ns = NetShaper.__new__(NetShaper)
         self._set_authorized(ns)
