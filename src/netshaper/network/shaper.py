@@ -98,6 +98,15 @@ class TrafficShaper:
         return journal()
 
     @staticmethod
+    def _filter_preference(mark: int, proto: str) -> int:
+        """Return a stable, protocol-unique priority for an owned filter."""
+        if proto == "ip":
+            return mark
+        if proto == "ipv6":
+            return mark + 1
+        raise ValueError(f"unsupported filter protocol: {proto}")
+
+    @staticmethod
     def _is_implicit_root_qdisc(root_qdisc: str) -> bool:
         return root_qdisc.strip().startswith("qdisc noqueue ")
 
@@ -256,9 +265,14 @@ class TrafficShaper:
                         message += "; rollback incomplete"
                     raise RuntimeError(message)
             for proto in ["ip", "ipv6"]:
+                # The root qdisc is exclusively owned by NetShaper. A stable
+                # preference makes this filter individually deletable across
+                # iproute2 versions; deleting by handle without a preference
+                # is rejected as an unsafe filter flush by modern tc.
                 if not SubprocessRunner.run(
                     ["tc", "filter", "add", "dev", self.interface,
                      "parent", "1:", "protocol", proto,
+                     "pref", str(self._filter_preference(mark, proto)),
                      "handle", str(mark), "fw", "flowid", classid],
                     silent=True):
                     rollback_ok = self._rollback_failed_target(
@@ -365,6 +379,7 @@ class TrafficShaper:
         if SubprocessRunner.run(
                 ["tc", "filter", "del", "dev", self.interface,
                  "parent", "1:", "protocol", proto,
+                 "pref", str(self._filter_preference(mark, proto)),
                  "handle", str(mark), "fw"],
                 check=False, silent=True):
             return InspectionStatus.PRESENT

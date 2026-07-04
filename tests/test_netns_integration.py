@@ -175,6 +175,9 @@ import subprocess
 import sys
 
 from netshaper import config
+from netshaper.core.firewall_manager import (
+    FirewallManager as GlobalFirewallManager,
+)
 from netshaper.core.orchestrator import NetShaper
 from netshaper.core.state_manager import StateSnapshotManager
 from netshaper.network.firewall import FirewallManager
@@ -212,7 +215,9 @@ for binary in ["iptables", "ip6tables"]:
     if not shutil.which(binary):
         continue
     global_binaries.append(binary)
-    for spec in NetShaper._global_firewall_rule_specs(binary, iface, comment):
+    for spec in GlobalFirewallManager._global_firewall_rule_specs(
+        binary, iface, comment
+    ):
         result = run(spec["apply"])
         if result.returncode != 0:
             print("global rule unsupported: " + (result.stderr.strip() or result.stdout.strip()))

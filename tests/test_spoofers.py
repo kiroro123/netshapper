@@ -38,7 +38,7 @@ class NDPSpooferShutdownTests(unittest.TestCase):
              mock.patch.object(spoofers, "Ether",                _FakeLayer), \
              mock.patch.object(spoofers, "IPv6",                 _FakeLayer), \
              mock.patch.object(spoofers, "ICMPv6ND_NA",          _FakeLayer), \
-             mock.patch.object(spoofers, "ICMPv6NDOptSrcLLAddr", _FakeLayer), \
+             mock.patch.object(spoofers, "ICMPv6NDOptDstLLAddr", _FakeLayer), \
              mock.patch("netshaper.network.spoofers.time.sleep"):
             ndp = self._make_spoofer(backend)
             ndp.shutdown()
@@ -46,10 +46,12 @@ class NDPSpooferShutdownTests(unittest.TestCase):
         self.assertEqual(backend.send.call_count, 6,
                          "Expected 3 iterations x 2 packets = 6 send() calls")
 
-    def test_shutdown_restores_router_mac_on_target(self):
-        """Each corrective iteration must use router_mac then target_mac as Ether src."""
+    def test_shutdown_keeps_peer_macs_out_of_ethernet_source(self):
+        """Repair ND options without moving peer MACs in switch forwarding tables."""
         backend = mock.Mock()
         sent_src_macs = []
+        advertised_macs = []
+        hop_limits = []
         from netshaper.network import spoofers
 
         class TrackingSrcLayer(_FakeLayer):
@@ -58,22 +60,33 @@ class NDPSpooferShutdownTests(unittest.TestCase):
                 if "src" in kw:
                     sent_src_macs.append(kw["src"])
 
+        class TrackingOptionLayer(_FakeLayer):
+            def __init__(self, **kw):
+                super().__init__(**kw)
+                if "lladdr" in kw:
+                    advertised_macs.append(kw["lladdr"])
+
+        class TrackingIPv6Layer(_FakeLayer):
+            def __init__(self, **kw):
+                super().__init__(**kw)
+                hop_limits.append(kw["hlim"])
+
         with mock.patch.object(spoofers, "_ensure_scapy_layers"), \
              mock.patch.object(spoofers, "Ether",                TrackingSrcLayer), \
-             mock.patch.object(spoofers, "IPv6",                 _FakeLayer), \
+             mock.patch.object(spoofers, "IPv6",                 TrackingIPv6Layer), \
              mock.patch.object(spoofers, "ICMPv6ND_NA",          _FakeLayer), \
-             mock.patch.object(spoofers, "ICMPv6NDOptSrcLLAddr", _FakeLayer), \
+             mock.patch.object(
+                 spoofers, "ICMPv6NDOptDstLLAddr", TrackingOptionLayer
+             ), \
              mock.patch("netshaper.network.spoofers.time.sleep"):
             ndp = self._make_spoofer(backend)
             ndp.shutdown()
 
-        # 3 iterations x 2 Ether() calls each = 6 src values
-        self.assertEqual(len(sent_src_macs), 6)
+        self.assertEqual(sent_src_macs, ["de:ad:be:ef:00:01"] * 6)
+        self.assertEqual(hop_limits, [255] * 6)
         for i in range(3):
-            self.assertEqual(sent_src_macs[i * 2],     "aa:bb:cc:dd:ee:ff",
-                             "target-restore Ether src must be router_mac")
-            self.assertEqual(sent_src_macs[i * 2 + 1], "00:11:22:33:44:55",
-                             "router-restore Ether src must be target_mac")
+            self.assertEqual(advertised_macs[i * 2], "aa:bb:cc:dd:ee:ff")
+            self.assertEqual(advertised_macs[i * 2 + 1], "00:11:22:33:44:55")
 
 
 class ARPSpooferShutdownTests(unittest.TestCase):
@@ -83,6 +96,8 @@ class ARPSpooferShutdownTests(unittest.TestCase):
         from netshaper.network import spoofers
 
         backend = mock.Mock()
+        sent_src_macs = []
+        advertised_macs = []
         spoofer = spoofers.ARPSpoofer.__new__(spoofers.ARPSpoofer)
         spoofer.interface    = "eth0"
         spoofer.target_ip    = "192.0.2.10"
@@ -94,13 +109,27 @@ class ARPSpooferShutdownTests(unittest.TestCase):
         spoofer._stop  = threading.Event()
         spoofer.threads = []
 
+        class TrackingEtherLayer(_FakeLayer):
+            def __init__(self, **kw):
+                super().__init__(**kw)
+                sent_src_macs.append(kw["src"])
+
+        class TrackingArpLayer(_FakeLayer):
+            def __init__(self, **kw):
+                super().__init__(**kw)
+                advertised_macs.append(kw["hwsrc"])
+
         with mock.patch.object(spoofers, "_ensure_scapy_layers"), \
-             mock.patch.object(spoofers, "Ether", _FakeLayer), \
-             mock.patch.object(spoofers, "ARP",   _FakeLayer), \
+             mock.patch.object(spoofers, "Ether", TrackingEtherLayer), \
+             mock.patch.object(spoofers, "ARP",   TrackingArpLayer), \
              mock.patch("netshaper.network.spoofers.time.sleep"):
             spoofer.shutdown()
 
         self.assertEqual(backend.send.call_count, 6)
+        self.assertEqual(sent_src_macs, ["de:ad:be:ef:00:01"] * 6)
+        for i in range(3):
+            self.assertEqual(advertised_macs[i * 2], "aa:bb:cc:dd:ee:ff")
+            self.assertEqual(advertised_macs[i * 2 + 1], "00:11:22:33:44:55")
 
 
 class SpoofTimingTests(unittest.TestCase):

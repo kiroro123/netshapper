@@ -7,6 +7,10 @@ All notable changes to this project are documented in this file.
 ### Safety and lifecycle fixes
 
 - Made stale firewall recovery fail closed when binaries or rule deletions fail.
+- Made `tc` filter ownership explicit so per-target shaping cleanup works on
+  modern iproute2 releases.
+- Prevented ARP/NDP repair packets from moving peer MAC addresses in switch
+  forwarding tables during shutdown.
 - Deferred plugin startup until final confirmation and added retryable Wi-Fi
   managed-mode recovery for cancellation and crash paths.
 - Restricted Wi-Fi captures to private operator-owned directories.

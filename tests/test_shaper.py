@@ -63,6 +63,16 @@ class TrafficShaperTests(unittest.TestCase):
                     "distribution", "normal", "loss", "1%",
                 ],
             )
+            for proto in ("ip", "ipv6"):
+                runner_mock.assert_any_call(
+                    [
+                        "tc", "filter", "add", "dev", "eth0",
+                        "parent", "1:", "protocol", proto,
+                        "pref", str(mark + (1 if proto == "ipv6" else 0)),
+                        "handle", str(mark), "fw", "flowid", f"1:{mark}",
+                    ],
+                    silent=True,
+                )
         self.assertEqual(shaper._target_qdiscs, {10, 20})
 
     @mock.patch("netshaper.network.shaper.SubprocessRunner.run")
@@ -349,6 +359,7 @@ class TrafficShaperTests(unittest.TestCase):
         runner_mock.assert_any_call(
             ["tc", "filter", "del", "dev", "eth0",
              "parent", "1:", "protocol", "ip",
+             "pref", "10",
              "handle", "10", "fw"],
             check=False,
             silent=True,
@@ -356,6 +367,7 @@ class TrafficShaperTests(unittest.TestCase):
         runner_mock.assert_any_call(
             ["tc", "filter", "del", "dev", "eth0",
              "parent", "1:", "protocol", "ipv6",
+             "pref", "21",
              "handle", "20", "fw"],
             check=False,
             silent=True,
