@@ -86,15 +86,22 @@ class PluginLoader:
             group: Any
             if isinstance(eps, dict):
                 group = eps.get(PluginLoader.PLUGIN_ENTRY_POINT, [])
+                selected = [ep for ep in group if ep.name == plugin_id]
             else:
                 group = eps.select(group=PluginLoader.PLUGIN_ENTRY_POINT)
+                try:
+                    selected = group.select(name=plugin_id)
+                except Exception:
+                    selected = [ep for ep in group if ep.name == plugin_id]
 
-            for ep in group:
+            for ep in selected:
                 try:
                     plugin_cls = ep.load()
                     actual_id = getattr(plugin_cls, "PLUGIN_ID", None)
-                    if actual_id != plugin_id and ep.name != plugin_id:
-                        continue
+                    if actual_id != plugin_id:
+                        raise PluginLoadError(
+                            f"entry point {ep.name!r} declares PLUGIN_ID={actual_id!r}"
+                        )
                     if not isinstance(actual_id, str):
                         log.warning(
                             "Skipping entry point %s: missing PLUGIN_ID",

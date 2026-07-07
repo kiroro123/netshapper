@@ -280,6 +280,9 @@ class FirewallManager:
         for b in self._binaries:
             if dns_spoof:
                 self._dns_added = True
+                if not self._journal_resource():
+                    self._dns_added = False
+                    return False
                 for proto in ["udp", "tcp"]:
                     if SubprocessRunner.run(
                             self._input_accept_rule(b, "-I", proto, 53),
@@ -300,6 +303,10 @@ class FirewallManager:
             if http_redirect_port:
                 self._http_added = True
                 self._http_redirect_port = http_redirect_port
+                if not self._journal_resource():
+                    self._http_added = False
+                    self._http_redirect_port = None
+                    return False
                 if SubprocessRunner.run(
                         self._input_accept_rule(
                             b, "-I", "tcp", http_redirect_port),
