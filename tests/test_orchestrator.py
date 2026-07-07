@@ -346,6 +346,40 @@ class NetShaperCleanupTests(unittest.TestCase):
         self.assertIn("--health-token", command)
         self.assertIn("test-health-token", command)
 
+    def test_fake_server_health_token_is_stable_for_manual_launch(self):
+        ns = NetShaper.__new__(NetShaper)
+        ns._fake_server_health_token = None
+
+        with mock.patch(
+            "netshaper.core.orchestrator.secrets.token_urlsafe",
+            return_value="manual-token",
+        ):
+            self.assertEqual(ns.fake_server_health_token(), "manual-token")
+            self.assertEqual(ns.fake_server_health_token(), "manual-token")
+
+    def test_fake_server_launch_refuses_unverified_claimed_listener(self):
+        ns = NetShaper.__new__(NetShaper)
+        ns.own_ip = "192.0.2.1"
+        ns._fake_server_proc = None
+        ns._fake_server_health_token = "test-health-token"
+
+        with mock.patch.object(
+            ns,
+            "_fake_server_health_ready",
+            return_value=False,
+        ), mock.patch(
+            "netshaper.core.orchestrator.check_local_port",
+            side_effect=[True, True],
+        ), mock.patch(
+            "netshaper.core.orchestrator.subprocess.Popen"
+        ) as popen, mock.patch(
+            "netshaper.core.orchestrator.log"
+        ) as log:
+            self.assertFalse(ns.launch_fake_server())
+
+        popen.assert_not_called()
+        self.assertIn("health token", log.error.call_args.args[0])
+
     def test_dry_run_discover_does_not_touch_network(self):
         ns = NetShaper.__new__(NetShaper)
         self._set_authorized(ns)

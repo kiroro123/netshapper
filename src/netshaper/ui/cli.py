@@ -432,8 +432,11 @@ def fake_server_launch_hint(
     host_ip: str,
     authorized_cidrs: Optional[list] = None,
     smart_spoof_all: bool = False,
+    health_token: Optional[str] = None,
 ) -> str:
     flags = [f"--host-ip {host_ip}"]
+    if health_token:
+        flags.extend(["--health-token", health_token])
     if smart_spoof_all:
         flags.append("--smart-spoof-all")
     for network in authorized_cidrs or []:
@@ -860,7 +863,9 @@ def main() -> None:
                 )
 
         if dns_spoof_on and not ns.fake_server_ready():
-            print_flush("  [!] Fake DNS (port 53) not reachable.")
+            print_flush(
+                "  [!] Fake DNS (port 53) is not verified for this session."
+            )
             print_flush(
                 "      "
                 + fake_server_launch_hint(
@@ -868,6 +873,7 @@ def main() -> None:
                     host_ip=ns.own_ip,
                     authorized_cidrs=authorized_cidrs,
                     smart_spoof_all=True,
+                    health_token=ns.fake_server_health_token(),
                 )
             )
             if (
@@ -880,12 +886,14 @@ def main() -> None:
                     dns_upstream=exploit.dnssec_upstream,
                     smart_spoof_all=True,
                 ):
-                    sys.exit("[NetShaper] Fake DNS server did not become reachable.")
+                    sys.exit("[NetShaper] Fake DNS server was not verified.")
             else:
-                sys.exit("[NetShaper] DNS spoofing requires reachable fake DNS.")
+                sys.exit("[NetShaper] DNS spoofing requires verified fake DNS.")
 
         if http_redirect_port == 80 and not ns.fake_server_ready():
-            print_flush("  [!] Fake HTTP (port 80) not reachable.")
+            print_flush(
+                "  [!] Fake HTTP (port 80) is not verified for this session."
+            )
             print_flush(
                 "      "
                 + fake_server_launch_hint(
@@ -893,6 +901,7 @@ def main() -> None:
                     host_ip=ns.own_ip,
                     authorized_cidrs=authorized_cidrs,
                     smart_spoof_all=dns_spoof_on,
+                    health_token=ns.fake_server_health_token(),
                 )
             )
             if (
@@ -905,11 +914,14 @@ def main() -> None:
                     dns_upstream=exploit.dnssec_upstream,
                     smart_spoof_all=dns_spoof_on,
                 ):
-                    sys.exit("[NetShaper] Captive portal requires reachable fake HTTP.")
+                    sys.exit("[NetShaper] Captive portal requires verified fake HTTP.")
             else:
-                sys.exit("[NetShaper] Captive portal requires reachable fake HTTP.")
+                sys.exit("[NetShaper] Captive portal requires verified fake HTTP.")
         elif exploit.fake_server_web_security_demo and not ns.fake_server_ready():
-            print_flush("  [!] HSTS demo HTTP service (port 80) not reachable.")
+            print_flush(
+                "  [!] HSTS demo HTTP service (port 80) is not verified "
+                "for this session."
+            )
             print_flush(
                 "      "
                 + fake_server_launch_hint(
@@ -917,6 +929,7 @@ def main() -> None:
                     host_ip=ns.own_ip,
                     authorized_cidrs=authorized_cidrs,
                     smart_spoof_all=dns_spoof_on,
+                    health_token=ns.fake_server_health_token(),
                 )
             )
             if (
@@ -929,9 +942,9 @@ def main() -> None:
                     dns_upstream=exploit.dnssec_upstream,
                     smart_spoof_all=dns_spoof_on,
                 ):
-                    sys.exit("[NetShaper] HSTS demo requires reachable fake HTTP.")
+                    sys.exit("[NetShaper] HSTS demo requires verified fake HTTP.")
             else:
-                sys.exit("[NetShaper] HSTS demo requires reachable fake HTTP.")
+                sys.exit("[NetShaper] HSTS demo requires verified fake HTTP.")
 
         if http_redirect_port == 8088:
             if check_local_port(ns.own_ip, 8088):
