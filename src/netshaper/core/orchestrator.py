@@ -23,7 +23,6 @@ import os
 import socket
 import subprocess  # nosec B404
 import sys
-import tempfile
 import threading
 import time
 import uuid
