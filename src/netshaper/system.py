@@ -10,6 +10,7 @@ import logging
 import os
 import socket
 import subprocess  # nosec B404
+import stat
 import sys
 from dataclasses import dataclass
 from enum import Enum
@@ -110,6 +111,18 @@ class SystemChecker:
         # BUG FIX: ensure state directory exists under /run (root-only mode 700)
         # so no unprivileged user can create a symlink there before us.
         os.makedirs(config.STATE_DIR, mode=0o700, exist_ok=True)
+        metadata = os.lstat(config.STATE_DIR)
+        if stat.S_ISLNK(metadata.st_mode):
+            raise SystemCheckError("state directory must not be a symlink")
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise SystemCheckError("state path is not a directory")
+        if metadata.st_uid != 0:
+            raise SystemCheckError("state directory is not root-owned")
+        if stat.S_IMODE(metadata.st_mode) != 0o700:
+            os.chmod(config.STATE_DIR, 0o700)
+            metadata = os.lstat(config.STATE_DIR)
+            if stat.S_IMODE(metadata.st_mode) != 0o700:
+                raise SystemCheckError("state directory mode is not 0700")
 
 
 class SubprocessRunner:

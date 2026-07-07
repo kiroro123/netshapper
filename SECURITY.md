@@ -157,7 +157,8 @@ arbitrary Python code that runs in the same process as NetShaper and have access
 
 **Why This Exists:**
 Plugins enable extensibility (e.g., WifiRecon, BLEScan) without requiring core changes.
-Future modules are completely isolated and independently auditable.
+Plugin modules are independently auditable, but they are not a sandbox: third-party
+plugin code runs in the NetShaper process and with the invoking user's privileges.
 
 **Risk Scenarios:**
 - A malicious or compromised plugin could exfiltrate target information
@@ -167,6 +168,8 @@ Future modules are completely isolated and independently auditable.
 
 **Mitigation:**
 - **Source audit:** Only load plugins from trusted sources (entry-point packages with known provenance)
+- **Loading precedence:** Built-in plugin IDs are resolved before entry points;
+  a colliding third-party entry point name is skipped without importing it
 - **Filesystem security:** Check `/opt/netshaper-plugins/` (phase 1b) for world-writable permissions
 - **Privilege:** Plugins run as the user who invokes NetShaper (typically root in production)
 - **State isolation:** Built-in persistent plugin state is recovered after crashes; unknown active plugin records fail closed and remain for operator action
@@ -202,7 +205,8 @@ NetShaper enforces the following additional boundaries:
 If you discover a security vulnerability in NetShaper:
 
 1. Do **not** open a public GitHub issue
-2. Email security details to the maintainer (see CONTRIBUTING.md)
+2. Use GitHub private vulnerability reporting if it is enabled for the repository,
+   or email the repository owner listed on the GitHub project page
 3. Include a reproduction case and proposed fix if possible
 4. Allow 30 days for response and patch before public disclosure
 

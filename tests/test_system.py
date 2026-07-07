@@ -1,7 +1,10 @@
+import os
+import stat
 import unittest
 from unittest import mock
 
 from netshaper import config
+from netshaper.exceptions import SystemCheckError
 from netshaper.system import (
     InspectionStatus,
     SubprocessRunner,
@@ -60,6 +63,31 @@ class SystemCheckerTests(unittest.TestCase):
             inspect_resource(["iptables", "-C", "FORWARD"]).status,
             InspectionStatus.ERROR,
         )
+
+    @mock.patch("netshaper.system.os.geteuid", return_value=0)
+    @mock.patch("netshaper.system.os.chmod")
+    @mock.patch("netshaper.system.os.makedirs")
+    def test_check_enforces_existing_state_dir_mode(
+        self,
+        makedirs_mock,
+        chmod_mock,
+        _geteuid_mock,
+    ):
+        initial = os.stat_result((stat.S_IFDIR | 0o755, 0, 0, 0, 0, 0, 0, 0, 0, 0))
+        fixed = os.stat_result((stat.S_IFDIR | 0o700, 0, 0, 0, 0, 0, 0, 0, 0, 0))
+        with mock.patch("netshaper.system.os.lstat", side_effect=[initial, fixed]):
+            SystemChecker.check()
+
+        makedirs_mock.assert_called_once()
+        chmod_mock.assert_called_once_with(config.STATE_DIR, 0o700)
+
+    @mock.patch("netshaper.system.os.geteuid", return_value=0)
+    @mock.patch("netshaper.system.os.makedirs")
+    def test_check_rejects_state_dir_symlink(self, _makedirs_mock, _geteuid_mock):
+        metadata = os.stat_result((stat.S_IFLNK | 0o777, 0, 0, 0, 0, 0, 0, 0, 0, 0))
+        with mock.patch("netshaper.system.os.lstat", return_value=metadata):
+            with self.assertRaisesRegex(SystemCheckError, "symlink"):
+                SystemChecker.check()
 
 
 if __name__ == "__main__":

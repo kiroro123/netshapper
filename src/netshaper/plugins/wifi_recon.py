@@ -16,12 +16,12 @@ import os
 from pathlib import Path
 import re
 import shutil
-import stat
 import subprocess  # nosec B404
 import threading
 from typing import Any, ClassVar
 
 from netshaper import config
+from netshaper.capture.secure import SecureCaptureDirectory
 from netshaper.core.authorization import AuthorizationError, AuthorizationPolicy
 from netshaper.core.plugin import PluginError, PluginInterface
 from netshaper.exceptions import NetShaperError
@@ -434,52 +434,22 @@ class WifiReconPlugin(PluginInterface):
         return thread
 
     def _open_capture(self) -> None:
-        capture_path = Path(
-            os.path.abspath(os.path.expanduser(self.capture_dir))
-        )
-        parent = capture_path.parent
-        if not parent.exists():
-            raise WifiError(
-                "capture_dir parent must already exist and be trusted"
+        try:
+            capture_file = SecureCaptureDirectory(
+                self.capture_dir
+            ).open_new_pcap(self.instance_id)
+        except Exception as exc:
+            raise WifiError(str(exc)) from exc
+        try:
+            self._main_writer = self._scapy["PcapWriter"](
+                capture_file.handle,
+                append=False,
+                sync=True,
             )
-
-        # Reject symlink traversal and writable non-sticky parents. This keeps
-        # the subsequent writer open inside an operator-owned directory.
-        for component in (capture_path, *capture_path.parents):
-            if not component.exists() and component == capture_path:
-                continue
-            try:
-                metadata = os.lstat(component)
-            except OSError as exc:
-                raise WifiError(f"cannot inspect capture path {component}: {exc}") from exc
-            if stat.S_ISLNK(metadata.st_mode):
-                raise WifiError("capture_dir and its parents must not be symlinks")
-            if (
-                component != capture_path
-                and metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
-                and not metadata.st_mode & stat.S_ISVTX
-            ):
-                raise WifiError(
-                    f"capture_dir parent is writable by other users: {component}"
-                )
-
-        if capture_path.exists():
-            metadata = os.stat(capture_path, follow_symlinks=False)
-            if not stat.S_ISDIR(metadata.st_mode):
-                raise WifiError("capture_dir must be a real directory")
-            if metadata.st_uid != os.geteuid() or metadata.st_mode & 0o077:
-                raise WifiError(
-                    "existing capture_dir must be owned by the current user "
-                    "and have mode 0700"
-                )
-        else:
-            capture_path.mkdir(mode=0o700)
-
-        self.pcap_file = str(capture_path / f"{self.instance_id}.pcap")
-        self._main_writer = self._scapy["PcapWriter"](
-            self.pcap_file, append=False, sync=True
-        )
-        os.chmod(self.pcap_file, 0o600)
+        except Exception:
+            capture_file.handle.close()
+            raise
+        self.pcap_file = capture_file.path
 
     @staticmethod
     def _binary(name: str) -> str:
@@ -880,9 +850,6 @@ class WifiReconPlugin(PluginInterface):
             network.handshake_status = status
 
     def _capture_eapol(self, packet: Any, bssid: str) -> None:
-        capture_path = Path(self.capture_dir) / (
-            f"{self.instance_id}-handshake-{bssid.replace(':', '')}.pcap"
-        )
         fingerprint = bytes(packet[self._scapy["EAPOL"]])
         fingerprints = self._eapol_fingerprints.setdefault(bssid, set())
         fingerprints.add(fingerprint)
@@ -890,12 +857,22 @@ class WifiReconPlugin(PluginInterface):
         with self._writer_lock:
             writer = self._handshake_writers.get(bssid)
             if writer is None:
-                writer = self._scapy["PcapWriter"](
-                    str(capture_path), append=False, sync=True
+                capture_file = SecureCaptureDirectory(
+                    self.capture_dir
+                ).open_new_pcap(
+                    f"{self.instance_id}-handshake-{bssid.replace(':', '')}"
                 )
-                os.chmod(capture_path, 0o600)
+                try:
+                    writer = self._scapy["PcapWriter"](
+                        capture_file.handle,
+                        append=False,
+                        sync=True,
+                    )
+                except Exception:
+                    capture_file.handle.close()
+                    raise
                 self._handshake_writers[bssid] = writer
-                self.pcap_handshake_files[bssid] = str(capture_path)
+                self.pcap_handshake_files[bssid] = capture_file.path
             writer.write(packet)
 
         self._update_handshake_status(

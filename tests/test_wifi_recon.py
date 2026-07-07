@@ -192,7 +192,7 @@ class WifiReconLifecycleTests(unittest.TestCase):
         )
         plugin._scapy = {"PcapWriter": mock.Mock()}
 
-        with self.assertRaisesRegex(WifiError, "mode 0700"):
+        with self.assertRaisesRegex(WifiError, "filesystem root"):
             plugin._open_capture()
         plugin._scapy["PcapWriter"].assert_not_called()
 
@@ -420,9 +420,8 @@ class WifiCaptureTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as capture_dir:
             writer = mock.Mock()
 
-            def writer_factory(path, **kwargs):
+            def writer_factory(_fileobj, **kwargs):
                 del kwargs
-                Path(path).touch()
                 return writer
 
             plugin = WifiReconPlugin(

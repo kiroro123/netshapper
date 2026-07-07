@@ -5,12 +5,12 @@ PacketSniffer       — bounded-queue sniffer with optional one-shot pcap save.
 RollingPacketSniffer — streaming writer with 50 MB file rotation.
 """
 import logging
-import os
 import queue
 import threading
 import time
 from typing import List, Optional
 
+from netshaper.capture.secure import SecureCaptureDirectory
 from netshaper.utils import print_flush
 
 log = logging.getLogger("netshaper")
@@ -76,10 +76,12 @@ class PacketSniffer:
     """
     def __init__(self, interface: str,
                  target_ips: Optional[List[str]] = None,
-                 save_pcap: bool = False):
+                 save_pcap: bool = False,
+                 capture_dir: Optional[str] = None):
         self.interface  = interface
         self.target_ips = target_ips or []
         self.save_pcap  = save_pcap
+        self.capture_dir = capture_dir
         self._sniffer   = None
         self._stop      = threading.Event()
         self._dropped   = 0
@@ -146,17 +148,29 @@ class PacketSniffer:
                 except queue.Empty:
                     break
             if packets:
-                fname = os.path.abspath(
-                    f"capture_{time.strftime('%Y%m%d_%H%M%S')}.pcap"
-                )
+                capture_file = SecureCaptureDirectory(
+                    self.capture_dir
+                ).open_new_pcap("capture")
+                writer = None
                 try:
-                    wrpcap(fname, packets)
+                    writer = RawPcapWriter(
+                        capture_file.handle,
+                        append=False,
+                        sync=True,
+                    )
+                    for packet in packets:
+                        writer.write(packet)
                 except Exception as exc:
                     self.last_error = f"pcap write failed: {exc}"
                     log.error(f"[Sniffer] {self.last_error}")
                     raise
-                self.output_files.append(fname)
-                log.info(f"Saved {len(packets)} packets → {fname}")
+                finally:
+                    if writer is not None:
+                        writer.close()
+                    else:
+                        capture_file.handle.close()
+                self.output_files.append(capture_file.path)
+                log.info(f"Saved {len(packets)} packets → {capture_file.path}")
 
 
 class RollingPacketSniffer:
@@ -168,10 +182,12 @@ class RollingPacketSniffer:
     def __init__(self, interface: str,
                  base_filename: str = "capture",
                  target_ips: Optional[List[str]] = None,
+                 capture_dir: Optional[str] = None,
                  max_file_size_bytes: int = 50 * 1024 * 1024):
         self.interface           = interface
         self.base_filename       = base_filename
         self.target_ips          = target_ips or []
+        self.capture_dir         = capture_dir
         self.max_file_size_bytes = max_file_size_bytes
         self._queue              = queue.Queue(maxsize=10_000)
         self._stop_event         = threading.Event()
@@ -185,9 +201,16 @@ class RollingPacketSniffer:
         self.last_error: Optional[str] = None
         self.output_files: List[str] = []
 
-    def _get_filename(self) -> str:
-        ts = time.strftime('%Y%m%d_%H%M%S')
-        return f"{self.base_filename}_{ts}_{self.file_index}.pcap"
+    def _open_writer(self):
+        capture_file = SecureCaptureDirectory(
+            self.capture_dir
+        ).open_new_pcap(f"{self.base_filename}_{self.file_index}")
+        try:
+            writer = RawPcapWriter(capture_file.handle, append=False, sync=True)
+        except Exception:
+            capture_file.handle.close()
+            raise
+        return capture_file.path, writer
 
     def _packet_callback(self, pkt) -> None:
         _ensure_packet_layers()
@@ -206,18 +229,18 @@ class RollingPacketSniffer:
             self._dropped += 1
 
     def _consumer_flush_loop(self) -> None:
-        active_pcap = self._get_filename()
+        active_pcap = ""
         writer = None
         try:
             _ensure_capture_tools()
-            writer = RawPcapWriter(active_pcap, append=True, sync=True)
+            active_pcap, writer = self._open_writer()
         except Exception as e:
             self.last_error = f"Initial file open failed: {e}"
             self._writer_ready.set()
             log.error(f"[RollingSniffer] {self.last_error}")
             return
 
-        self.output_files.append(os.path.abspath(active_pcap))
+        self.output_files.append(active_pcap)
         self._writer_ready.set()
         log.info(f"[RollingSniffer] Writing → {active_pcap}")
         try:
@@ -237,11 +260,10 @@ class RollingPacketSniffer:
                             f"[RollingSniffer] Close before rotation failed: {e}")
                     self.file_index    += 1
                     self.current_bytes  = 0
-                    active_pcap        = self._get_filename()
-                    log.info(f"[RollingSniffer] Rotating → {active_pcap}")
                     try:
-                        writer = RawPcapWriter(active_pcap, append=True, sync=True)
-                        self.output_files.append(os.path.abspath(active_pcap))
+                        active_pcap, writer = self._open_writer()
+                        log.info(f"[RollingSniffer] Rotating → {active_pcap}")
+                        self.output_files.append(active_pcap)
                     except Exception as e:
                         self.last_error = f"Rotation failed: {e}"
                         log.error(f"[RollingSniffer] {self.last_error}")

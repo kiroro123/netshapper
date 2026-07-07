@@ -218,6 +218,9 @@ class NetShaper:
     def _state_path(self) -> str:
         return os.path.join(self._session_state_dir(), "state.json")
 
+    def _capture_dir(self) -> str:
+        return os.path.join(self._session_state_dir(), "captures")
+
     def record_runtime_error(self, component: str, error) -> None:
         message = f"{self._timestamp()} {component}: {error}"
         self._runtime_errors.append(message)
@@ -1040,10 +1043,17 @@ class NetShaper:
         if self.sniffer:
             self.sniffer.stop()
         if rolling:
-            self.sniffer = RollingPacketSniffer(self.interface, target_ips=target_ips)
+            self.sniffer = RollingPacketSniffer(
+                self.interface,
+                target_ips=target_ips,
+                capture_dir=self._capture_dir(),
+            )
         else:
             self.sniffer = PacketSniffer(
-                self.interface, target_ips=target_ips, save_pcap=save_pcap
+                self.interface,
+                target_ips=target_ips,
+                save_pcap=save_pcap,
+                capture_dir=self._capture_dir(),
             )
         self.sniffer.start()
 
