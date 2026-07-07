@@ -11,7 +11,6 @@ import logging
 import os
 import re
 import shutil
-import tempfile
 from ipaddress import ip_address
 from typing import Any, Callable, List, Mapping, Optional
 

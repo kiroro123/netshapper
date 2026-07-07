@@ -43,7 +43,7 @@ NetShaper is organized into independently auditable components:
                       ▼
          ┌─────────────────────────────┐
          │  State Persistence Layer    │
-         │  /run/netshaper/state.json  │
+         │  /run/netshaper/<session-id>/state.json  │
          └─────────────────────────────┘
 ```
 
@@ -102,7 +102,7 @@ A typical flow for testing a target device:
    └─ State file cleaned up
 
 5. RECOVERY (if process crashes)
-   ├─ Next NetShaper startup detects stale /run/netshaper/state.json
+   ├─ Next NetShaper startup detects stale /run/netshaper/<session-id>/state.json
    ├─ RecoveryManager checks process ownership (PID + start time)
    ├─ Orphaned rules detected and removed
    │  ├─ Firewall rules cleaned

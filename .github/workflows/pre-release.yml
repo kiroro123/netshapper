@@ -3,7 +3,7 @@ name: Pre-Release Privileged Tests
 on:
   pull_request:
     branches: [ main ]
-    types: [ opened, synchronize, reopened ]
+    types: [ opened, synchronize, reopened, labeled ]
 
 # Prevent multiple runs of this workflow
 concurrency:
@@ -16,8 +16,9 @@ permissions:
   issues: write
 
 jobs:
-  check-privileged-tests:
-    name: Require Privileged Test Clearance
+  invalidate-clearance:
+    if: github.event.action == 'synchronize'
+    name: Invalidate stale privileged label
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -25,7 +26,6 @@ jobs:
           fetch-depth: 0
 
       - name: Invalidate stale privileged label on PR sync
-        if: github.event.action == 'synchronize'
         uses: actions/github-script@v6
         with:
           script: |
@@ -48,6 +48,15 @@ jobs:
                 }
               }
             }
+
+  check-privileged-tests:
+    if: github.event.action != 'synchronize'
+    name: Require Privileged Test Clearance
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v4
