@@ -7,7 +7,9 @@ so they always see the live value (not an import-time copy).
 """
 import logging
 import os
+import stat
 from logging.handlers import RotatingFileHandler
+from pathlib import Path
 
 from netshaper.version import __version__
 
@@ -37,18 +39,79 @@ def _configured_log_level() -> int:
     return level if isinstance(level, int) else logging.INFO
 
 
+def _nofollow_flag() -> int:
+    return getattr(os, "O_NOFOLLOW", 0)
+
+
+def _cloexec_flag() -> int:
+    return getattr(os, "O_CLOEXEC", 0)
+
+
+def _verify_log_parent(metadata: os.stat_result, path: Path) -> None:
+    if stat.S_ISLNK(metadata.st_mode):
+        raise OSError(f"log path parent must not be a symlink: {path}")
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise OSError(f"log path parent is not a directory: {path}")
+    euid = os.geteuid()
+    if euid == 0:
+        if metadata.st_uid != 0:
+            raise OSError(f"log path parent is not root-owned: {path}")
+    if (
+        metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+        and not (euid != 0 and metadata.st_mode & stat.S_ISVTX)
+    ):
+        raise OSError(f"log path parent is writable by other users: {path}")
+
+
+def _validate_log_parent_chain(parent: Path) -> None:
+    """Require every existing or created log parent to be trusted."""
+    existing = parent
+    while not existing.exists():
+        if existing.parent == existing:
+            raise OSError("log path parent does not exist")
+        existing = existing.parent
+    for component in (existing, *existing.parents):
+        _verify_log_parent(os.lstat(component), component)
+    parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    for component in (parent, *parent.parents):
+        _verify_log_parent(os.lstat(component), component)
+
+
+def _verify_log_file(fd: int, path: Path) -> None:
+    metadata = os.fstat(fd)
+    if not stat.S_ISREG(metadata.st_mode):
+        raise OSError(f"log path is not a regular file: {path}")
+    euid = os.geteuid()
+    if metadata.st_uid != euid:
+        raise OSError(f"log file is not owned by the current user: {path}")
+    if stat.S_IMODE(metadata.st_mode) != 0o600:
+        os.fchmod(fd, 0o600)
+        metadata = os.fstat(fd)
+        if stat.S_IMODE(metadata.st_mode) != 0o600:
+            raise OSError(f"log file mode is not 0600: {path}")
+
+
 def _secure_log_handler(log_file: str | None = None) -> logging.Handler | None:
     """Create a mode-0600 rotating log handler, or return None on failure."""
-    path = log_file or _configured_log_file()
+    path = Path(os.path.abspath(os.path.expanduser(
+        log_file or _configured_log_file()
+    )))
     try:
-        parent = os.path.dirname(path)
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-        fd = os.open(path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
-        os.close(fd)
-        os.chmod(path, 0o600)
+        _validate_log_parent_chain(path.parent)
+        flags = (
+            os.O_APPEND
+            | os.O_CREAT
+            | os.O_WRONLY
+            | _nofollow_flag()
+            | _cloexec_flag()
+        )
+        fd = os.open(path, flags, 0o600)
+        try:
+            _verify_log_file(fd, path)
+        finally:
+            os.close(fd)
         handler = RotatingFileHandler(
-            path,
+            str(path),
             maxBytes=LOG_MAX_BYTES,
             backupCount=LOG_BACKUP_COUNT,
         )

@@ -80,6 +80,40 @@ class NetShaperCleanupTests(unittest.TestCase):
         ns.shaper.cleanup.assert_called_once()
         self.assertFalse(ns._cleanup_complete)
 
+    def test_cleanup_retains_state_when_rolling_capture_flush_fails(self):
+        ns = NetShaper.__new__(NetShaper)
+        ns._lifecycle_lock = threading.RLock()
+        ns._cleanup_running = False
+        ns._cleanup_complete = False
+        ns.is_shutting_down = False
+        ns.stop_event = threading.Event()
+        ns.sessions = {}
+        ns.sniffer = mock.Mock()
+        ns.sniffer.stop.return_value = False
+        ns.mitm_manager = mock.Mock()
+        ns.mitm_manager.terminate.return_value = True
+        ns._terminate_fake_server = mock.Mock(return_value=True)
+        ns._cleanup_plugins = mock.Mock(return_value=True)
+        ns._stop_arp_amplification = mock.Mock(return_value=True)
+        ns._remove_global_rules = mock.Mock(return_value=True)
+        ns._remove_state_file = mock.Mock(return_value=True)
+        ns.state_snapshot = mock.Mock()
+        ns.shaper = mock.Mock()
+        ns.shaper.cleanup.return_value = True
+        ns.session_id = "NS-TEST"
+
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch("netshaper.core.orchestrator.config.STATE_DIR", tmp), \
+             mock.patch("netshaper.core.orchestrator.print_flush"), \
+             mock.patch("netshaper.core.orchestrator.log"), \
+             mock.patch("netshaper.core.orchestrator.StateSnapshotManager.restore",
+                        return_value=True):
+            ns.cleanup()
+
+        ns.sniffer.stop.assert_called_once()
+        ns._remove_state_file.assert_not_called()
+        self.assertFalse(ns._cleanup_complete)
+
     def test_add_target_rolls_back_partially_created_session(self):
         ns = NetShaper.__new__(NetShaper)
         self._set_authorized(ns)

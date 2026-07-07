@@ -157,7 +157,7 @@ class AuthorizationPolicy:
                     continue
             except ValueError:
                 continue
-            networks.append(cast(Network, network))
+            networks.append(network)
         return tuple(networks)
 
     @staticmethod

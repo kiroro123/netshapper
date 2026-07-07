@@ -3,7 +3,7 @@ name: Pre-Release Privileged Tests
 on:
   pull_request:
     branches: [ main ]
-    types: [ opened, synchronize, reopened, labeled ]
+    types: [ opened, synchronize, reopened, labeled, unlabeled ]
 
 # Prevent multiple runs of this workflow
 concurrency:
@@ -53,12 +53,8 @@ jobs:
             }
 
   check-privileged-tests:
-    if: >
-      github.event.action != 'synchronize' &&
-      (
-        github.event.action != 'labeled' ||
-        github.event.label.name == 'privileged-tests-passed'
-      )
+    needs: invalidate-clearance
+    if: ${{ always() }}
     name: Require Privileged Test Clearance
     runs-on: ubuntu-latest
     permissions:
@@ -66,6 +62,12 @@ jobs:
       pull-requests: read
       issues: read
     steps:
+      - name: Require successful stale-clearance invalidation
+        if: ${{ needs.invalidate-clearance.result == 'failure' || needs.invalidate-clearance.result == 'cancelled' }}
+        run: |
+          echo "Stale privileged-test clearance invalidation did not complete"
+          exit 1
+
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0

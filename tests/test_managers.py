@@ -54,6 +54,24 @@ class ManagerTests(unittest.TestCase):
         with mock.patch.object(config, "DRY_RUN", True):
             manager = MitmProxyManager("127.0.0.1")
             self.assertTrue(manager.launch(port=8088, web_port=8083))
+            self.assertIsNone(manager._open_log("/tmp/netshaper-test"))
+
+    def test_mitm_manager_terminate_without_process_is_clean(self):
+        manager = MitmProxyManager("127.0.0.1")
+
+        self.assertTrue(manager.terminate())
+
+    def test_mitm_manager_refuses_existing_listener(self):
+        manager = MitmProxyManager("127.0.0.1")
+
+        with mock.patch.object(config, "DRY_RUN", False), \
+             mock.patch("netshaper.core.mitm_manager.check_local_port",
+                        return_value=True), \
+             mock.patch("netshaper.core.mitm_manager.subprocess.Popen") as popen:
+            result = manager.launch(port=8088, web_port=8083)
+
+        self.assertFalse(result)
+        popen.assert_not_called()
 
     def test_recovery_manager_no_state_dir(self):
         with tempfile.TemporaryDirectory() as tmp:

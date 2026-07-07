@@ -212,6 +212,7 @@ class RollingPacketSniffer:
         self.started_at: Optional[float] = None
         self.last_error: Optional[str] = None
         self.output_files: List[str] = []
+        self.packets_shutdown_discarded = 0
 
     def _open_writer(self):
         capture_file = SecureCaptureDirectory(
@@ -287,6 +288,7 @@ class RollingPacketSniffer:
                     self.current_bytes += pkt_len
                     self._queue.task_done()
                 except Exception as e:
+                    self.packets_shutdown_discarded += 1 + self._queue.qsize()
                     self.last_error = f"Writer failed: {e}"
                     log.error(f"[RollingSniffer] {self.last_error}")
                     return
@@ -335,13 +337,25 @@ class RollingPacketSniffer:
             return False
         return _async_sniffer_running(self._sniffer)
 
-    def stop(self) -> None:
+    def stop(self) -> bool:
         self._stop_event.set()
         if self._sniffer:
-            self._sniffer.stop()
+            try:
+                self._sniffer.stop()
+            except Exception as exc:
+                self.last_error = f"sniffer stop failed: {exc}"
+                log.error(f"[RollingSniffer] {self.last_error}")
         if self._consumer:
             self._consumer.join(timeout=5.0)
+            if self._consumer.is_alive():
+                self.packets_shutdown_discarded += self._queue.qsize()
+                self.last_error = (
+                    "rolling capture did not finish flushing within 5 seconds"
+                )
+                log.error(f"[RollingSniffer] {self.last_error}")
+                return False
         if self._dropped:
             log.warning(
                 f"[RollingSniffer] {self._dropped} packets dropped "
                 f"(queue saturation)")
+        return self.last_error is None
