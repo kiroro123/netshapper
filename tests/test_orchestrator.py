@@ -213,6 +213,30 @@ class NetShaperCleanupTests(unittest.TestCase):
 
         ns.mark_pool.acquire.assert_not_called()
 
+    def test_add_target_rejects_connected_network_boundary_before_mutation(self):
+        ns = NetShaper.__new__(NetShaper)
+        self._set_authorized(ns, ("10.0.0.0/8",))
+        ns._lifecycle_lock = threading.RLock()
+        ns.sessions = {}
+        ns.own_ip = "10.1.1.10"
+        ns.own_ipv6 = None
+        ns.gw = "10.1.1.1"
+        ns.gw_ipv6 = None
+        ns.mark_pool = mock.Mock()
+        ns.disc = mock.Mock()
+        ns.disc.get_connected_networks.return_value = (
+            IPv4Network("10.1.1.0/24"),
+        )
+
+        for target_ip in ("10.1.1.0", "10.1.1.255"):
+            with self.subTest(target_ip=target_ip), \
+                 self.assertRaisesRegex(AuthorizationError, "network/broadcast"):
+                ns.add_target(
+                    Device(ip=target_ip, mac="00:11:22:33:44:55")
+                )
+
+        ns.mark_pool.acquire.assert_not_called()
+
     def test_remove_target_keeps_failed_cleanup_registered(self):
         ns = NetShaper.__new__(NetShaper)
         ns._lifecycle_lock = threading.RLock()
@@ -442,6 +466,30 @@ class NetShaperCleanupTests(unittest.TestCase):
 
         self.assertIn("bandwidth monitor thread is not running", issues)
         self.assertTrue(any("disk full" in issue for issue in issues))
+
+    def test_scale_bytes_starts_at_bytes(self):
+        self.assertEqual(NetShaper.scale_bytes(500), "500.0 B")
+        self.assertEqual(NetShaper.scale_bytes(2048), "2.0 KB")
+        self.assertEqual(NetShaper.scale_bytes(3 * 1024 * 1024), "3.0 MB")
+
+    def test_runtime_health_includes_arp_amplifier_failures(self):
+        ns = NetShaper.__new__(NetShaper)
+        ns.stop_event = threading.Event()
+        ns._runtime_errors = []
+        ns._monitor_thread = None
+        ns.sniffer = None
+        ns._arp_amplifier = mock.Mock()
+        ns._arp_amplifier.health_issues.return_value = [
+            "ARP amplification worker failed: send failed"
+        ]
+
+        with mock.patch("netshaper.core.orchestrator.config.DRY_RUN", True):
+            issues = ns.runtime_health_issues()
+
+        self.assertEqual(
+            issues,
+            ["ARP amplification worker failed: send failed"],
+        )
 
     def test_instance_lock_rejects_second_holder(self):
         first = NetShaper.__new__(NetShaper)

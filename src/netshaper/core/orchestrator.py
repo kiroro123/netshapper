@@ -36,6 +36,7 @@ from netshaper.capture.sniffer import PacketSniffer, RollingPacketSniffer
 from netshaper.core.authorization import AuthorizationPolicy
 from netshaper.core.firewall_manager import FirewallManager
 from netshaper.core.mitm_manager import MitmProxyManager, MitmProxyError
+from netshaper.core.owner import current_owner_metadata
 from netshaper.core.recovery_manager import RecoveryManager
 from netshaper.core.session import TargetSession
 from netshaper.core.plugin import PluginInterface, PluginManager
@@ -147,30 +148,20 @@ class NetShaper:
             own_ipv6=getattr(self, "own_ipv6", None),
             gateway=getattr(self, "gw", None),
             gateway_ipv6=getattr(self, "gw_ipv6", None),
+            connected_networks=self._connected_networks_for_authorization(),
         )
 
-    @staticmethod
-    def _process_start_time(pid: int) -> Optional[str]:
-        try:
-            with open(f"/proc/{pid}/stat", encoding="utf-8") as fh:
-                return fh.read().split()[21]
-        except Exception:
-            return None
-
-    @classmethod
-    def _process_is_live(cls, pid: Optional[int], start_time: Optional[str]) -> bool:
-        if not pid or not start_time:
-            return False
-        current_start = cls._process_start_time(pid)
-        return current_start == str(start_time)
+    def _connected_networks_for_authorization(self) -> tuple:
+        disc = getattr(self, "disc", None)
+        if not disc or not hasattr(disc, "get_connected_networks"):
+            return ()
+        networks = disc.get_connected_networks()
+        if not isinstance(networks, (list, tuple)):
+            return ()
+        return tuple(networks)
 
     def _current_owner_metadata(self) -> dict:
-        pid = os.getpid()
-        return {
-            "pid": pid,
-            "process_start_time": self._process_start_time(pid),
-            "created_at": time.time(),
-        }
+        return current_owner_metadata()
 
     def _acquire_instance_lock(self) -> None:
         if config.DRY_RUN:
@@ -348,6 +339,10 @@ class NetShaper:
         # mitmproxy lifecycle is managed by MitmProxyManager; rely on
         # monitor/port checks above rather than peeking at a subprocess.
 
+        amplifier = getattr(self, "_arp_amplifier", None)
+        if amplifier and hasattr(amplifier, "health_issues"):
+            issues.extend(amplifier.health_issues())
+
         if not config.DRY_RUN:
             host = getattr(self, "own_ip", None)
             if host:
@@ -364,8 +359,8 @@ class NetShaper:
 
     @staticmethod
     def scale_bytes(val: float) -> str:
-        for unit in ["KB", "MB", "GB"]:
-            if val < 1024:
+        for unit in ("B", "KB", "MB", "GB"):
+            if abs(val) < 1024:
                 return f"{val:.1f} {unit}"
             val /= 1024
         return f"{val:.1f} TB"

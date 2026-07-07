@@ -1,8 +1,10 @@
 from contextlib import contextmanager
 from ipaddress import IPv4Network
 import sys
+import time
 import types
 import unittest
+from unittest import mock
 
 from netshaper.network.exploit.arp_amplification import (
     ARPAmplificationError,
@@ -48,6 +50,11 @@ class FakePacketBackend:
 
     def send(self, packet, interface: str) -> None:
         self.calls.append((packet, interface))
+
+
+class FailingPacketBackend:
+    def send(self, _packet, _interface: str) -> None:
+        raise RuntimeError("send failed")
 
 
 def _profile(**overrides) -> ARPAmplificationProfile:
@@ -161,6 +168,35 @@ class ARPAmplificationTests(unittest.TestCase):
                 burst=51,
                 interval=0.05,
             )
+
+    def test_worker_failure_is_reported_in_health(self):
+        amplifier = ARPAmplifier(
+            "eth0",
+            ATTACKER_MAC,
+            packet_backend=FailingPacketBackend(),
+        )
+        profile = _profile(burst_size=1, cycle_interval=0.01)
+
+        with fake_scapy_all(), \
+             mock.patch(
+                 "netshaper.network.exploit.arp_amplification._ensure_scapy_layers"
+             ), \
+             mock.patch("netshaper.network.exploit.arp_amplification.log"):
+            amplifier.add_subnet_profile(profile)
+            amplifier.start()
+            try:
+                for _ in range(50):
+                    if amplifier.last_error is not None:
+                        break
+                    time.sleep(0.01)
+            finally:
+                amplifier.shutdown()
+
+        self.assertIsNotNone(amplifier.last_error)
+        self.assertEqual(
+            amplifier.health_issues(),
+            ["ARP amplification worker failed: send failed"],
+        )
 
 
 if __name__ == "__main__":

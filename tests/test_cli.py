@@ -1,3 +1,4 @@
+import socket
 import threading
 import unittest
 from unittest import mock
@@ -197,6 +198,41 @@ class CliTests(unittest.TestCase):
                     gateway_ip="192.0.2.254",
                     gateway_ipv6=None,
                 )
+
+    def test_validate_targets_rejects_connected_network_boundaries(self):
+        networks = cli.parse_authorized_cidrs(["10.0.0.0/8"])
+        iface_addr = mock.Mock(
+            family=socket.AF_INET,
+            address="10.1.1.10",
+            netmask="255.255.255.0",
+        )
+
+        with mock.patch("netshaper.ui.cli.psutil.net_if_addrs",
+                        return_value={"eth0": [iface_addr]}):
+            for target in ("10.1.1.0", "10.1.1.255"):
+                with self.subTest(target=target), \
+                     self.assertRaisesRegex(ValueError, "network/broadcast"):
+                    cli.validate_targets(
+                        [target],
+                        networks,
+                        interface="eth0",
+                        own_ip="10.1.1.10",
+                        own_ipv6=None,
+                        gateway_ip="10.1.1.1",
+                        gateway_ipv6=None,
+                    )
+
+            result = cli.validate_targets(
+                ["10.1.1.254"],
+                networks,
+                interface="eth0",
+                own_ip="10.1.1.10",
+                own_ipv6=None,
+                gateway_ip="10.1.1.1",
+                gateway_ipv6=None,
+            )
+
+        self.assertEqual(result, ["10.1.1.254"])
 
     def test_choose_interface_rejects_missing_requested_interface(self):
         with mock.patch("netshaper.ui.cli.psutil.net_if_addrs",

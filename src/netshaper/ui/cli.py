@@ -25,6 +25,7 @@ import psutil
 from netshaper import config
 
 from netshaper.config import VERSION
+from netshaper.core.authorization import AuthorizationError, AuthorizationPolicy
 from netshaper.core.plugin_loader import PluginLoadError, PluginLoader
 from netshaper.models import Device
 from netshaper.network.shaper import ShapingProfile
@@ -42,7 +43,6 @@ class ExploitOptions:
     dnssec_mode: str = "off"
     dnssec_upstream: str = "8.8.8.8"
     hsts_bypass: bool = False
-    hsts_preserve_preloaded: bool = True
 
     @property
     def arp_amplification_enabled(self) -> bool:
@@ -149,12 +149,6 @@ def parse_args() -> argparse.Namespace:
         "--hsts-bypass",
         action="store_true",
         help="Enable HSTS bypass and IDN homograph injection demo.",
-    )
-    parser.add_argument(
-        "--hsts-preserve-preloaded",
-        action="store_true",
-        default=True,
-        help="Preserve preloaded HSTS domains (default: yes).",
     )
     parser.add_argument(
         "--latency-ms",
@@ -416,7 +410,6 @@ def resolve_exploit_options(
         dnssec_mode=dnssec_mode,
         dnssec_upstream=args.dnssec_upstream,
         hsts_bypass=hsts_bypass,
-        hsts_preserve_preloaded=args.hsts_preserve_preloaded,
     )
 
 
@@ -482,34 +475,21 @@ def parse_authorized_cidrs(raw_values: list[str]) -> list:
     return networks
 
 
-def _interface_broadcasts(interface: str) -> set:
-    broadcasts = set()
+def _interface_networks(interface: str) -> tuple:
+    networks = []
     for addr in _net_if_addrs_or_exit().get(interface, []):
-        broadcast = getattr(addr, "broadcast", None)
-        if not broadcast:
+        if addr.family not in (socket.AF_INET, socket.AF_INET6):
+            continue
+        netmask = getattr(addr, "netmask", None)
+        if not netmask:
             continue
         try:
-            broadcasts.add(ip_address(broadcast.split("%", 1)[0]))
+            networks.append(
+                ip_network(f"{addr.address.split('%', 1)[0]}/{netmask}", strict=False)
+            )
         except ValueError:
             continue
-    return broadcasts
-
-
-def _reserved_in_authorized_network(ip_obj, networks: list) -> bool:
-    for network in networks:
-        if ip_obj.version != network.version or ip_obj not in network:
-            continue
-        if ip_obj == network.network_address and network.prefixlen < (
-            31 if ip_obj.version == 4 else 127
-        ):
-            return True
-        if (
-            ip_obj.version == 4
-            and ip_obj == network.broadcast_address
-            and network.prefixlen < 31
-        ):
-            return True
-    return False
+    return tuple(networks)
 
 
 def validate_targets(
@@ -522,35 +502,24 @@ def validate_targets(
     gateway_ip: Optional[str],
     gateway_ipv6: Optional[str],
 ) -> List[Union[Device, str]]:
-    local_addresses = {
-        ip_address(value)
-        for value in (own_ip, own_ipv6, gateway_ip, gateway_ipv6)
-        if value
-    }
-    broadcasts = _interface_broadcasts(interface)
+    policy = AuthorizationPolicy(authorized_cidrs)
+    connected_networks = _interface_networks(interface)
     validated: List[Union[Device, str]] = []
 
     for target in targets:
         raw_ip = target_ip(target)
         try:
+            policy.assert_target_authorized(
+                raw_ip,
+                own_ip=own_ip,
+                own_ipv6=own_ipv6,
+                gateway=gateway_ip,
+                gateway_ipv6=gateway_ipv6,
+                connected_networks=connected_networks,
+            )
             parsed = ip_address(raw_ip)
-        except ValueError as exc:
-            raise ValueError(f"invalid target IP {raw_ip!r}") from exc
-
-        if parsed.is_unspecified or parsed.is_loopback or parsed.is_multicast:
-            raise ValueError(f"refusing reserved target address: {parsed}")
-        if parsed in local_addresses:
-            raise ValueError(f"refusing own/gateway target address: {parsed}")
-        if parsed in broadcasts:
-            raise ValueError(f"refusing broadcast target address: {parsed}")
-        if not any(
-            parsed.version == network.version and parsed in network
-            for network in authorized_cidrs
-        ):
-            raise ValueError(f"target {parsed} is outside authorized CIDR allowlist")
-        if _reserved_in_authorized_network(parsed, authorized_cidrs):
-            raise ValueError(f"refusing network/broadcast target address: {parsed}")
-
+        except AuthorizationError as exc:
+            raise ValueError(str(exc)) from exc
         validated.append(str(parsed) if isinstance(target, str) else target)
 
     return validated

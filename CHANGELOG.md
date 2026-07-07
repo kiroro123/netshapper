@@ -47,7 +47,7 @@ All notable changes to this project are documented in this file.
   - `firewall_manager.py` — Firewall rule lifecycle (iptables/ip6tables management)
   - `mitm_manager.py` — mitmproxy process control and lifecycle
   - `recovery_manager.py` — Stale session detection and atomic cleanup
-  - Remaining `orchestrator.py` — Small glue layer (session lifecycle, sniffer, state)
+  - Remaining `orchestrator.py` — Session coordinator for lifecycle, sniffer, and state
 
   **Impact:** Reduces audit surface by making each subsystem independently reviewable and testable. Privilege escapes, firewall misconfigurations, and recovery logic are now isolated.
 
