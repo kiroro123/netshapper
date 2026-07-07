@@ -5,6 +5,7 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
+from netshaper.core.firewall_manager import FirewallManager
 from netshaper.core.orchestrator import NetShaper
 from netshaper.core.state_manager import NetworkStateSnapshot, StateSnapshotManager
 from netshaper.network.shaper import ShapingProfile
@@ -95,14 +96,23 @@ class StateSnapshotTests(unittest.TestCase):
             ns.gw = "192.0.2.1"
             ns.own_ip = "192.0.2.10"
             ns.session_id = "NS-TEST"
-            ns._global_rules_applied = True
-            ns._global_firewall_binaries_applied = ["iptables"]
-            ns._global_rules_created = [{
-                "binary": "iptables",
-                "description": "iptables test rule",
-                "delete": ["iptables", "-D", "FORWARD", "-j", "ACCEPT"],
-                "check": ["iptables", "-C", "FORWARD", "-j", "ACCEPT"],
-            }]
+            manager = FirewallManager(
+                "eth0",
+                "NS-TEST",
+                journal=lambda: True,
+                target_authorizer=lambda _target: None,
+            )
+            manager._global_rules_created = [
+                *manager._shared_resource_specs("iptables"),
+                *manager._target_resource_specs(
+                    "iptables",
+                    "192.0.2.20",
+                ),
+            ]
+            for record in manager._global_rules_created:
+                record["state"] = "active"
+            manager._refresh_summary()
+            ns.firewall_manager = manager
             ns.plugins = {}
             ns.state_snapshot = NetworkStateSnapshot(
                 session_id="NS-TEST",
@@ -126,12 +136,13 @@ class StateSnapshotTests(unittest.TestCase):
             self.assertTrue(data["global_rules_applied"])
             self.assertEqual(
                 data["global_rule_comment"],
-                "netshaper:NS-TEST:global",
+                "netshaper:NS-TEST:forward",
             )
+            self.assertEqual(data["global_firewall_format"], 2)
             self.assertEqual(data["global_firewall_binaries"], ["iptables"])
             self.assertEqual(
                 data["global_rules_created"],
-                ns._global_rules_created,
+                manager._global_rules_created,
             )
 
     def test_dry_run_save_state_stays_in_memory(self):

@@ -138,6 +138,74 @@ for target, binary in cases:
 """
         self._run_python_in_ns(textwrap.dedent(code))
 
+    def test_real_target_scoped_forwarding_and_nat_lifecycle(self):
+        code = f"""
+import subprocess
+import sys
+from netshaper.core.firewall_manager import FirewallManager
+
+SKIP_RC = {SKIP_RC}
+iface = {self.ns_if!r}
+
+def run(args):
+    return subprocess.run(args, capture_output=True, text=True, check=False)
+
+if run(["iptables", "-t", "nat", "-S"]).returncode != 0:
+    print("iptables nat table unavailable")
+    raise SystemExit(SKIP_RC)
+
+manager = FirewallManager(
+    iface,
+    "NS-IT-FWD",
+    journal=lambda: True,
+    target_authorizer=lambda target: (
+        None
+        if target in {{"198.51.100.10", "198.51.100.20"}}
+        else (_ for _ in ()).throw(ValueError("unauthorized"))
+    ),
+)
+chain = manager._forward_chain()
+unrelated = [
+    "iptables", "-I", "FORWARD", "1",
+    "-m", "comment", "--comment", "unrelated-firewall-owner",
+    "-j", "RETURN",
+]
+assert run(unrelated).returncode == 0
+
+manager.add_target_rules("198.51.100.10")
+first = run(["iptables-save"]).stdout
+assert f"-A FORWARD" in first and f"-j {{chain}}" in first
+assert "198.51.100.10" in first
+assert "198.51.100.20" not in first
+assert "ESTABLISHED,RELATED" in first
+assert "-s 198.51.100.10" in first and "MASQUERADE" in first
+assert f"-i {{iface}} -o {{iface}} -j ACCEPT" not in first
+a_lines = {{line for line in first.splitlines() if "198.51.100.10" in line}}
+
+manager.add_target_rules("198.51.100.20")
+second = run(["iptables-save"]).stdout
+assert a_lines == {{
+    line for line in second.splitlines() if "198.51.100.10" in line
+}}
+
+assert manager.remove_target_rules("198.51.100.10")
+after_a = run(["iptables-save"]).stdout
+assert "198.51.100.10" not in after_a
+assert "198.51.100.20" in after_a
+assert "unrelated-firewall-owner" in after_a
+
+assert manager.remove_target_rules("198.51.100.20")
+after_b = run(["iptables-save"]).stdout
+assert chain not in after_b
+assert "unrelated-firewall-owner" in after_b
+assert run([
+    "iptables", "-D", "FORWARD",
+    "-m", "comment", "--comment", "unrelated-firewall-owner",
+    "-j", "RETURN",
+]).returncode == 0
+"""
+        self._run_python_in_ns(textwrap.dedent(code))
+
     def test_real_tc_target_cleanup(self):
         code = f"""
 import subprocess
@@ -207,27 +275,19 @@ for args, reason in [
 
 old_session = "NS-OLDIT"
 snapshot = StateSnapshotManager.capture(iface, old_session)
-comment = f"netshaper:{{old_session}}:global"
-global_records = []
-global_binaries = []
-
-for binary in ["iptables", "ip6tables"]:
-    if not shutil.which(binary):
-        continue
-    global_binaries.append(binary)
-    for spec in GlobalFirewallManager._global_firewall_rule_specs(
-        binary, iface, comment
-    ):
-        result = run(spec["apply"])
-        if result.returncode != 0:
-            print("global rule unsupported: " + (result.stderr.strip() or result.stdout.strip()))
-            raise SystemExit(SKIP_RC)
-        global_records.append({{
-            "binary": binary,
-            "description": spec["description"],
-            "delete": spec["delete"],
-            "check": spec["check"],
-        }})
+global_manager = GlobalFirewallManager(
+    iface,
+    old_session,
+    journal=lambda: True,
+    target_authorizer=lambda _target: None,
+)
+try:
+    global_manager.add_target_rules("198.51.100.10")
+    global_manager.add_target_rules("2001:db8:100::10")
+except Exception as exc:
+    print("target-scoped forwarding unavailable: " + str(exc))
+    raise SystemExit(SKIP_RC)
+global_state = global_manager.get_state_for_persistence()
 
 fw4 = FirewallManager("198.51.100.10", iface, session_id=old_session)
 if not fw4.add_redirect_rules(dns_spoof=True, http_redirect_port=8080):
@@ -277,10 +337,7 @@ with open(state_path, "w", encoding="utf-8") as f:
         ],
         "gw": "198.51.100.1",
         "own_ip": "198.51.100.2",
-        "global_rules_applied": True,
-        "global_rule_comment": comment,
-        "global_firewall_binaries": global_binaries,
-        "global_rules_created": global_records,
+        **global_state,
         "shaper_base_initialized": True,
         "owner": {{"pid": 999999, "process_start_time": "0"}},
         "snapshot": NetShaper._snapshot_to_dict(snapshot),

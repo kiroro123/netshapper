@@ -319,7 +319,8 @@ Stop NetShaper with `Ctrl+C`. It will:
 
 - Send corrective ARP/NDP packets to restore real MAC tables
 - Remove all per-target iptables/ip6tables chains
-- Delete global FORWARD and MASQUERADE rules
+- Delete the session forwarding chain and each recorded target-scoped
+  forwarding/IPv4 MASQUERADE rule
 - Restore original `ip_forward` / `route_localnet` sysctl values
 - Remove the session state file from `/run/netshaper/`
 

@@ -67,6 +67,10 @@ NetShaper modifies:
 **Mitigation:**
 - Snapshots are taken at startup and restored on shutdown
 - State is persisted to `/run/netshaper/<session-id>/state.json` for recovery
+- Forwarding ACCEPT rules and IPv4 MASQUERADE are scoped to active authorized
+  target addresses in a session-owned chain. NetShaper does not add IPv6 NAT.
+- Firewall recovery intent is persisted before each forwarding mutation, and
+  cleanup deletes only the exact recorded session-owned resources.
 - Stale session detection: if a process crashes, the next `NetShaper()` call will clean up rules
 - Always run cleanup on exit (Ctrl+C or normal termination)
 - Logs are written to `/var/log/netshaper.log` with timestamps
