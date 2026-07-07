@@ -1,6 +1,8 @@
 import unittest
 from unittest import mock
 
+from netshaper.core.session import TargetSession
+from netshaper.models import Device
 from netshaper.network.firewall import FirewallManager
 from netshaper.system import InspectionStatus
 
@@ -247,6 +249,52 @@ class FirewallManagerTests(unittest.TestCase):
             fw.setup()
 
         self.assertEqual(journal.call_count, 4)
+
+    def test_setup_fails_on_preexisting_chain(self):
+        fw = FirewallManager(
+            "192.0.2.10",
+            "eth0",
+            session_id="NS-TEST",
+            auto_setup=False,
+        )
+
+        with mock.patch.object(
+                fw, "_chain_state",
+                return_value=InspectionStatus.PRESENT), \
+             mock.patch("netshaper.network.firewall.log"):
+            with self.assertRaisesRegex(RuntimeError, "Failed to create firewall chains"):
+                fw.setup()
+
+    @mock.patch("netshaper.core.session.FirewallManager.setup")
+    def test_target_session_persists_firewall_intent_before_firewall_setup(self, setup_mock):
+        events = []
+
+        def journal():
+            events.append("journal")
+            return True
+
+        def fake_setup(*args, **kwargs):
+            events.append("firewall_setup")
+            return True
+
+        setup_mock.side_effect = fake_setup
+        session = TargetSession(
+            Device(ip="192.0.2.10", mac="00:11:22:33:44:55"),
+            "eth0",
+            "aa:bb:cc:dd:ee:ff",
+            "192.0.2.1",
+            None,
+            "192.0.2.254",
+            "ff:ee:dd:cc:bb:aa",
+            None,
+            None,
+            session_id="NS-TEST",
+            journal=journal,
+        )
+
+        session.setup()
+
+        self.assertEqual(events, ["journal", "firewall_setup"])
 
     @mock.patch("netshaper.network.firewall.SubprocessRunner.run")
     def test_failed_explicit_setup_keeps_resources_tracked(self, runner_mock):

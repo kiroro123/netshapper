@@ -71,6 +71,60 @@ class PluginLoader:
         return discovered
 
     @staticmethod
+    def discover_entry_point(
+        plugin_id: str,
+    ) -> Optional[tuple[str, type[PluginInterface]]]:
+        """Discover a single setuptools entry point by name.
+
+        Returns:
+            A (plugin_id, plugin_class) tuple, or None if not found.
+        """
+        try:
+            eps = entry_points()
+
+            # Handle both dict and SelectableGroups API
+            group: Any
+            if isinstance(eps, dict):
+                group = eps.get(PluginLoader.PLUGIN_ENTRY_POINT, [])
+            else:
+                group = eps.select(group=PluginLoader.PLUGIN_ENTRY_POINT)
+
+            for ep in group:
+                try:
+                    plugin_cls = ep.load()
+                    actual_id = getattr(plugin_cls, "PLUGIN_ID", None)
+                    if actual_id != plugin_id and ep.name != plugin_id:
+                        continue
+                    if not isinstance(actual_id, str):
+                        log.warning(
+                            "Skipping entry point %s: missing PLUGIN_ID",
+                            ep.name,
+                        )
+                        continue
+                    if not issubclass(plugin_cls, PluginInterface):
+                        log.warning(
+                            "Skipping entry point %s: does not inherit from PluginInterface",
+                            ep.name,
+                        )
+                        return None
+                    log.debug(
+                        "Discovered plugin %s from entry point %s",
+                        actual_id,
+                        ep.name,
+                    )
+                    return actual_id, plugin_cls
+                except Exception as exc:
+                    log.warning(
+                        "Failed to load requested entry point %s: %s",
+                        plugin_id,
+                        exc,
+                    )
+                    return None
+        except Exception as exc:
+            log.warning("Entry point discovery failed: %s", exc)
+        return None
+
+    @staticmethod
     def discover_entry_points() -> List[tuple[str, type[PluginInterface]]]:
         """
         Discover plugins registered via setuptools entry points.
@@ -215,6 +269,7 @@ class PluginLoader:
         discover_entry_points: bool = True,
         discover_filesystem: bool = False,
         plugin_dir: str = DEFAULT_PLUGIN_DIR,
+        requested_plugin_ids: Optional[List[str]] = None,
     ) -> Dict[str, type[PluginInterface]]:
         """
         Discover and register all available plugins.
@@ -242,7 +297,15 @@ class PluginLoader:
 
         if discover_entry_points:
             try:
-                for plugin_id, plugin_cls in PluginLoader.discover_entry_points():
+                if requested_plugin_ids is None:
+                    entries = PluginLoader.discover_entry_points()
+                else:
+                    entries = []
+                    for plugin_id in requested_plugin_ids:
+                        entry = PluginLoader.discover_entry_point(plugin_id)
+                        if entry is not None:
+                            entries.append(entry)
+                for plugin_id, plugin_cls in entries:
                     try:
                         PluginManager.register(plugin_cls)
                         registered[plugin_id] = plugin_cls

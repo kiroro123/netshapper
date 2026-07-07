@@ -198,6 +198,16 @@ class StateSnapshotTests(unittest.TestCase):
         run_mock.assert_any_call(
             ["ip6tables-save"], capture_output=True, text=True, check=False)
 
+    def test_atomic_write_json_creates_file_atomically(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "state.json")
+            StateSnapshotManager.atomic_write_json(path, {"ok": True})
+
+            self.assertTrue(os.path.exists(path))
+            with open(path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            self.assertEqual(data, {"ok": True})
+
     @mock.patch("netshaper.core.state_manager.subprocess.run")
     def test_capture_keeps_failed_sysctl_reads_unknown(self, run_mock):
         run_mock.side_effect = [

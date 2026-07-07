@@ -1203,10 +1203,10 @@ class NetShaper:
         try:
             state_dir = self._session_state_dir()
             os.makedirs(state_dir, mode=0o700, exist_ok=True)
-            with tempfile.NamedTemporaryFile("w", dir=state_dir, delete=False) as tf:
-                json.dump(data, tf)
-                tmp = tf.name
-            os.replace(tmp, os.path.join(state_dir, "state.json"))  # Atomic write
+            StateSnapshotManager.atomic_write_json(
+                os.path.join(state_dir, "state.json"),
+                data,
+            )
             return True
         except Exception as e:
             log.error(f"State save failed: {e}")
