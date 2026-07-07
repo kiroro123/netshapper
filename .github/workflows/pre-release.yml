@@ -13,14 +13,20 @@ concurrency:
 permissions:
   contents: read
   pull-requests: read
+  issues: write
 
 jobs:
-  invalidate-label-on-sync:
-    if: github.event_name == 'pull_request' && github.event.action == 'synchronize'
-    name: Invalidate stale privileged label
+  check-privileged-tests:
+    name: Require Privileged Test Clearance
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/github-script@v6
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Invalidate stale privileged label on PR sync
+        if: github.event.action == 'synchronize'
+        uses: actions/github-script@v6
         with:
           script: |
             const { data: pullRequest } = await github.rest.pulls.get({
@@ -29,21 +35,19 @@ jobs:
             })
             const labels = (pullRequest.labels || []).map(label => label.name)
             if (labels.includes('privileged-tests-passed')) {
-              await github.rest.issues.removeLabel({
-                ...context.repo,
-                issue_number: context.issue.number,
-                name: 'privileged-tests-passed',
-              })
-              core.info('Removed stale privileged-tests-passed label on PR sync')
+              try {
+                await github.rest.issues.removeLabel({
+                  ...context.repo,
+                  issue_number: context.issue.number,
+                  name: 'privileged-tests-passed',
+                })
+                core.info('Removed stale privileged-tests-passed label on PR sync')
+              } catch (error) {
+                if (error.status !== 404) {
+                  throw error
+                }
+              }
             }
-
-  check-privileged-tests:
-    name: Require Privileged Test Clearance
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v4
