@@ -7,7 +7,7 @@
 **Risk Level:** Medium (Intentional for captive portal flow)
 
 **Description:**
-The `fake_server3` helper serves the mitmproxy root CA certificate over plain HTTP on port 80 at the `/cert` endpoint. This endpoint has **no authentication** — anyone with network access to the server can download the root CA.
+The `netshaper-portal` helper serves the mitmproxy root CA certificate over plain HTTP on port 80 at the `/cert` endpoint. This endpoint has **no authentication** — anyone with network access to the server can download the root CA.
 
 **Why This Exists:**
 In captive portal scenarios, the target device must be able to retrieve and trust the mitmproxy root CA without pre-configuration. Since the initial HTTP connection is also intercepted, the captive portal flow is:
@@ -144,7 +144,7 @@ Before running in a new environment:
 - DNSSEC suppression models removal of CD/DO/AD signaling and DNSSEC record
   visibility. A validating endpoint is expected to fail closed.
 - The HSTS/IDN page is static, has no credential form, and only accepts IDN
-  examples under reserved training suffixes.
+  examples under reserved demo suffixes.
 - Preloaded or established HSTS is not bypassed. Only the first-visit,
   no-policy downgrade condition is demonstrated.
 

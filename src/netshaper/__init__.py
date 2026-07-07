@@ -1,4 +1,4 @@
-"""NetShaper — modular network testing toolkit."""
+"""NetShaper — modular offensive network toolkit."""
 
 from netshaper.version import __version__
 

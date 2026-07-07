@@ -682,7 +682,7 @@ class NetShaper:
                     and self.mitm_manager.terminate()
                 ),
             )
-            cleanup_step("fake server", self._terminate_fake_server)
+            cleanup_step("portal engine", self._terminate_fake_server)
             cleanup_step("plugins", self._cleanup_plugins)
             cleanup_step("ARP amplification", self._stop_arp_amplification)
             cleanup_step("global rules", self._remove_global_rules)
@@ -949,7 +949,7 @@ class NetShaper:
         dns_upstream: str = "8.8.8.8",
         smart_spoof_all: bool = False,
     ) -> bool:
-        """Launch netshaper-fake-server when DNS/HTTP services are required."""
+        """Launch netshaper-portal when DNS/HTTP services are required."""
         if dnssec_mode not in {
             "off",
             "fail-closed",
@@ -962,7 +962,7 @@ class NetShaper:
             dnssec_mode = "fail-open"
         if config.DRY_RUN:
             print_flush(
-                "[DRY-RUN] Would launch netshaper-fake-server "
+                "[DRY-RUN] Would launch netshaper-portal "
                 f"(dnssec={dnssec_mode}, hsts={web_security_demo}, "
                 f"smart-spoof-all={smart_spoof_all})"
             )
@@ -970,17 +970,17 @@ class NetShaper:
 
         health_token = self._fake_server_token()
         if self.fake_server_ready():
-            log.info("netshaper-fake-server already ready for this session")
+            log.info("netshaper-portal already ready for this session")
             return True
 
         if self._fake_server_proc and self._fake_server_proc.poll() is None:
-            log.debug("Waiting for existing netshaper-fake-server child")
+            log.debug("Waiting for existing netshaper-portal child")
         else:
             dns_claimed = check_local_port(self.own_ip, 53, socket.SOCK_DGRAM)
             http_claimed = check_local_port(self.own_ip, 80)
             if dns_claimed or http_claimed:
                 log.error(
-                    "Refusing to adopt unverified fake-server listener "
+                    "Refusing to adopt unverified portal listener "
                     "(dns=%s, http=%s). Stop the existing listener or relaunch "
                     "it with the session health token printed by NetShaper.",
                     dns_claimed,
@@ -1010,7 +1010,7 @@ class NetShaper:
             for allowed_cidr in sorted(allowed_cidrs):
                 cmd.extend(["--allow-cidr", allowed_cidr])
             if web_security_demo:
-                cmd.append("--web-security-demo")
+                cmd.append("--hsts-idn-demo")
 
             try:
                 self._fake_server_proc = subprocess.Popen(  # nosec B603
@@ -1019,23 +1019,23 @@ class NetShaper:
                     stderr=subprocess.DEVNULL,
                 )
             except OSError as exc:
-                log.error(f"fake server launch failed: {exc}")
+                log.error(f"portal launch failed: {exc}")
                 return False
 
         for _ in range(20):
             if self.fake_server_ready():
-                log.info("netshaper-fake-server ready")
+                log.info("netshaper-portal ready")
                 return True
             if self._fake_server_proc.poll() is not None:
                 log.error(
-                    "netshaper-fake-server exited during startup "
+                    "netshaper-portal exited during startup "
                     f"with code {self._fake_server_proc.returncode}"
                 )
                 self._terminate_fake_server()
                 return False
             time.sleep(0.25)
 
-        log.error("netshaper-fake-server did not become reachable within 5s")
+        log.error("netshaper-portal did not become reachable within 5s")
         self._terminate_fake_server()
         return False
 
@@ -1047,7 +1047,7 @@ class NetShaper:
         return token
 
     def fake_server_health_token(self) -> str:
-        """Return the token required to verify a manually launched fake server."""
+        """Return the token required to verify a manually launched portal."""
         return self._fake_server_token()
 
     def fake_server_ready(self) -> bool:
@@ -1092,10 +1092,10 @@ class NetShaper:
             if proc.poll() is None:
                 ok = False
             else:
-                log.info("netshaper-fake-server terminated")
+                log.info("netshaper-portal terminated")
         except Exception as exc:
             ok = False
-            log.error(f"fake server cleanup failed: {exc}")
+            log.error(f"portal cleanup failed: {exc}")
 
         if ok:
             self._fake_server_proc = None

@@ -1,6 +1,6 @@
 """NetShaper — plugin registry and lifecycle contract.
 
-Provides a minimal, safety-first host for future extensibility.
+Provides a scoped host for offensive network capability modules.
 """
 from __future__ import annotations
 

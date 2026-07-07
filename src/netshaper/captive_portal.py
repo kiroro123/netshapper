@@ -1,18 +1,14 @@
 #!/usr/bin/env python3
-"""Compatibility shim for the historical `netshaper.captive_portal` entrypoint.
+"""Module entrypoint for the NetShaper offensive DNS + portal engine.
 
-This module intentionally delegates to the maintained `netshaper.fake_server3`
-engine. It preserves the original console entrypoint while emitting a
-deprecation-style notice so downstream callers migrate to the consolidated
-implementation.
+The packaged console command is `netshaper-portal`; this module points
+`python -m netshaper.captive_portal` at the same maintained engine.
 """
 
 import sys
-import warnings
 
 try:
-    # Import the maintained combined engine and call its main() directly.
-    from . import fake_server3 as _engine
+    from . import portal as _engine
 except Exception:
     # Allow `python -m netshaper.captive_portal` to surface the original
     # import error in development checkouts.
@@ -20,14 +16,7 @@ except Exception:
 
 
 def main() -> None:
-    """Delegate to `netshaper.fake_server3.main()` with a short warning."""
-    warnings.warn(
-        "'netshaper.captive_portal' is deprecated; delegating to 'fake_server3'.",
-        DeprecationWarning,
-        stacklevel=2,
-    )
-    # Pass through control to the consolidated implementation. This keeps the
-    # legacy console script working while centralizing maintenance.
+    """Delegate to the maintained offensive DNS + portal engine."""
     return _engine.main()
 
 
