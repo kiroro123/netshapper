@@ -1229,6 +1229,13 @@ class NetShaper:
         )
 
     def save_state(self) -> bool:
+        lifecycle_lock = getattr(self, "_lifecycle_lock", None)
+        if lifecycle_lock is None:
+            sessions = tuple(self.sessions.values())
+        else:
+            with lifecycle_lock:
+                sessions = tuple(self.sessions.values())
+
         targets = [
             {
                 "ip": s.target.ip,
@@ -1253,7 +1260,7 @@ class NetShaper:
                 ),
                 "nat_chain": (getattr(s.firewall, "NAT", None) if s.firewall else None),
             }
-            for s in self.sessions.values()
+            for s in sessions
         ]
 
         firewall_state = self._get_firewall_manager().get_state_for_persistence() or {}

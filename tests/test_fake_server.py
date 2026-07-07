@@ -114,7 +114,7 @@ class FakeServerStartupTests(unittest.TestCase):
             return dns_sock
 
         def http_server(addr, handler):
-            events.append(("http_bind", addr, handler))
+            events.append(("http_bind", addr, handler, fake_server3.HTTP_PORT))
             return httpd
 
         def drop(user):
@@ -134,6 +134,7 @@ class FakeServerStartupTests(unittest.TestCase):
              mock.patch("netshaper.fake_server3.DualStackHTTPServer", side_effect=http_server), \
              mock.patch("netshaper.fake_server3.load_ca_cert", side_effect=load_cert), \
              mock.patch("netshaper.fake_server3.drop_privileges", side_effect=drop), \
+             mock.patch("netshaper.fake_server3.HTTP_PORT", 80), \
              mock.patch("netshaper.fake_server3.SERVE_CA_CERT", False), \
              mock.patch("netshaper.fake_server3.print_dns_startup"), \
              mock.patch("netshaper.fake_server3.threading.Thread", side_effect=make_thread), \
@@ -142,6 +143,7 @@ class FakeServerStartupTests(unittest.TestCase):
 
         self.assertEqual(events[0], ("bind_dns", 5353))
         self.assertEqual(events[1][0], "http_bind")
+        self.assertEqual(events[1][3], 8080)
         self.assertNotIn(("load_cert",), events)
         self.assertEqual(events[2], ("drop", "nobody"))
         self.assertEqual(
@@ -224,6 +226,29 @@ class HealthHandlerTests(unittest.TestCase):
         self.assertTrue(response.endswith(b"\r\n\r\nsession-secret"))
 
 
+class PortalRedirectTests(unittest.TestCase):
+    def setUp(self):
+        self.original_ip = fake_server3.YOUR_IP
+        self.original_http_port = fake_server3.HTTP_PORT
+
+    def tearDown(self):
+        fake_server3.YOUR_IP = self.original_ip
+        fake_server3.HTTP_PORT = self.original_http_port
+
+    def test_unknown_path_redirect_preserves_configured_http_port(self):
+        fake_server3.YOUR_IP = "192.0.2.10"
+        fake_server3.HTTP_PORT = 8080
+
+        with mock.patch("netshaper.fake_server3.print_flush"):
+            response = handle_http_request("/unknown")
+
+        self.assertIn(b"HTTP/1.0 302 Found", response)
+        self.assertIn(
+            b"Location: http://192.0.2.10:8080/index.html",
+            response,
+        )
+
+
 class WebSecurityDemoTests(unittest.TestCase):
     def setUp(self):
         self.original_enabled = fake_server3.WEB_SECURITY_DEMO
@@ -277,6 +302,20 @@ class DnsForwardingTests(unittest.TestCase):
     def tearDown(self):
         fake_server3.DNS_UPSTREAM = self.original_upstream
 
+    @staticmethod
+    def _response_for(
+        query: bytes,
+        *,
+        txid: bytes | None = None,
+        flags: bytes = b"\x81\x80",
+    ) -> bytes:
+        return (
+            (txid or query[:2])
+            + flags
+            + b"\x00\x01\x00\x00\x00\x00\x00\x00"
+            + query[12:]
+        )
+
     @mock.patch("netshaper.fake_server3.socket.socket")
     @mock.patch("netshaper.fake_server3.socket.getaddrinfo")
     def test_forward_dns_query_uses_ipv6_upstream_family(self, getaddrinfo_mock, socket_mock):
@@ -291,19 +330,49 @@ class DnsForwardingTests(unittest.TestCase):
                 sockaddr,
             )
         ]
+        query = ParseDnsQuestionTests()._make_query("example.test")
+        upstream_response = self._response_for(query)
         upstream_sock = mock.Mock()
-        upstream_sock.recvfrom.return_value = (b"response", sockaddr)
+        upstream_sock.recv.return_value = upstream_response
         socket_mock.return_value.__enter__.return_value = upstream_sock
 
-        response = fake_server3.forward_dns_query(b"query")
+        response = fake_server3.forward_dns_query(query)
 
-        self.assertEqual(response, b"response")
+        self.assertEqual(response, upstream_response)
         socket_mock.assert_called_once_with(
             fake_server3.socket.AF_INET6,
             fake_server3.socket.SOCK_DGRAM,
             0,
         )
-        upstream_sock.sendto.assert_called_once_with(b"query", sockaddr)
+        upstream_sock.connect.assert_called_once_with(sockaddr)
+        upstream_sock.send.assert_called_once_with(query)
+
+    @mock.patch("netshaper.fake_server3.socket.socket")
+    @mock.patch("netshaper.fake_server3.socket.getaddrinfo")
+    def test_forward_dns_query_ignores_mismatched_txid(self, getaddrinfo_mock, socket_mock):
+        fake_server3.DNS_UPSTREAM = "192.0.2.53"
+        sockaddr = ("192.0.2.53", 53)
+        getaddrinfo_mock.return_value = [
+            (
+                fake_server3.socket.AF_INET,
+                fake_server3.socket.SOCK_DGRAM,
+                0,
+                "",
+                sockaddr,
+            )
+        ]
+        query = ParseDnsQuestionTests()._make_query("example.test")
+        upstream_sock = mock.Mock()
+        upstream_sock.recv.side_effect = [
+            self._response_for(query, txid=b"\x99\x99"),
+            self._response_for(query),
+        ]
+        socket_mock.return_value.__enter__.return_value = upstream_sock
+
+        response = fake_server3.forward_dns_query(query)
+
+        self.assertEqual(response, self._response_for(query))
+        self.assertEqual(upstream_sock.recv.call_count, 2)
 
 
 class DnssecSuppressionTests(unittest.TestCase):

@@ -24,6 +24,7 @@ import pwd
 import socket
 import sys
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from ipaddress import IPv6Address, ip_address, ip_network
@@ -115,6 +116,9 @@ WEB_SECURITY_DEMO = os.environ.get("WEB_SECURITY_DEMO", "").lower() in (
 )
 IDN_DEMO_DOMAINS: list[tuple[str, str]] = []
 
+# HTTP port used when rendering redirects. Set from CLI in `main()`.
+HTTP_PORT = 80
+
 RESERVED_TRAINING_SUFFIXES = (
     ".test",
     ".example",
@@ -204,6 +208,13 @@ def render_web_security_demo(domains: list[tuple[str, str]]) -> bytes:
 </html>
 """
     return document.encode("utf-8")
+
+
+def portal_base_url() -> str:
+    """Return the canonical portal base URL including port when required."""
+    if HTTP_PORT == 80:
+        return f"http://{YOUR_IP}"
+    return f"http://{YOUR_IP}:{HTTP_PORT}"
 
 
 SAFE_DOMAIN_CATEGORIES = {
@@ -606,6 +617,43 @@ def build_servfail_response(data: bytes, question_end: int) -> bytes:
     )
 
 
+def _dns_question_class(data: bytes, question_end: int | None) -> int | None:
+    if question_end is None or question_end < 2 or question_end > len(data):
+        return None
+    return int.from_bytes(data[question_end - 2 : question_end], "big")
+
+
+def _dns_response_matches_query(query: bytes, response: bytes) -> bool:
+    """Return whether an upstream DNS response belongs to the forwarded query."""
+    if len(query) < 12 or len(response) < 12:
+        return False
+    if response[:2] != query[:2]:
+        return False
+    if not response[2] & 0x80:  # QR bit: must be a response
+        return False
+    if dns_qdcount(query) != 1 or dns_qdcount(response) != 1:
+        return False
+
+    query_domain, query_qtype, query_end = parse_dns_question(query)
+    response_domain, response_qtype, response_end = parse_dns_question(response)
+    if (
+        query_domain is None
+        or query_qtype is None
+        or query_end is None
+        or response_domain is None
+        or response_qtype is None
+        or response_end is None
+    ):
+        return False
+
+    return (
+        response_domain == query_domain
+        and response_qtype == query_qtype
+        and _dns_question_class(response, response_end)
+        == _dns_question_class(query, query_end)
+    )
+
+
 def forward_dns_query(data: bytes) -> bytes | None:
     errors = []
     try:
@@ -628,9 +676,24 @@ def forward_dns_query(data: bytes) -> bytes | None:
         try:
             with socket.socket(family, socktype, proto) as upstream:
                 upstream.settimeout(2.0)
-                upstream.sendto(data, sockaddr)
-                response, _ = upstream.recvfrom(4096)
-                return response
+                upstream.connect(sockaddr)
+                upstream.send(data)
+                deadline = time.monotonic() + 2.0
+                mismatches = 0
+                while True:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise socket.timeout(
+                            f"timed out waiting for matching response "
+                            f"({mismatches} mismatched)"
+                        )
+                    upstream.settimeout(remaining)
+                    response = upstream.recv(4096)
+                    if _dns_response_matches_query(data, response):
+                        return response
+                    mismatches += 1
+        except socket.timeout as e:
+            errors.append(f"{sockaddr}: {e}")
         except OSError as e:
             errors.append(f"{sockaddr}: {e}")
 
@@ -1172,7 +1235,8 @@ class CaptivePortalHandler(BaseHTTPRequestHandler):
             f"{cyan('[Portal]')} Redirecting {client}  {path}  → /index.html"
         )
         self.send_response(302)
-        self.send_header("Location", f"http://{YOUR_IP}/index.html")
+        # Use canonical portal URL (includes configured port when non-80)
+        self.send_header("Location", f"{portal_base_url()}/index.html")
         self.send_header("Connection", "close")
         self.end_headers()
 
@@ -1210,11 +1274,12 @@ class DualStackHTTPServer(ThreadedHTTPServer):
 
 
 def main() -> None:
-    global YOUR_IP
+    global YOUR_IP, HTTP_PORT
 
     args = parse_args()
     configure_dns(args)
     YOUR_IP = args.host_ip or get_own_ip()
+    HTTP_PORT = args.http_port
 
     # Phase 1: bind privileged ports
     dns_sock = bind_dns_socket(args.dns_port)
