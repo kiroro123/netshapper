@@ -835,17 +835,50 @@ class NetShaper:
 
     # ── Sniffer ───────────────────────────────────────────────────────────────
     def _ipv4_subnet_for_amplification(self):
+        if not self.own_ip:
+            raise RuntimeError(
+                "ARP amplification requires an IPv4 address on the selected "
+                "interface."
+            )
         own = ip_address(self.own_ip)
+        if not isinstance(own, IPv4Address):
+            raise RuntimeError(
+                "ARP amplification requires an IPv4 address on the selected "
+                "interface."
+            )
+
+        connected_raw = self.disc.get_subnet_v4() if self.disc else None
+        if not connected_raw:
+            raise RuntimeError(
+                "ARP amplification requires an IPv4 network directly connected "
+                "to the selected interface."
+            )
+        connected = ip_network(connected_raw, strict=False)
+        if not isinstance(connected, IPv4Network) or own not in connected:
+            raise RuntimeError(
+                "ARP amplification requires the selected interface IPv4 address "
+                "to belong to its directly connected network."
+            )
+
+        if self.gw:
+            gateway = ip_address(self.gw)
+            if not isinstance(gateway, IPv4Address) or gateway not in connected:
+                raise RuntimeError(
+                    "ARP amplification requires a gateway directly connected to "
+                    "the selected interface."
+                )
+
         v4_networks = [
             network for network in self.authorized_cidrs if network.version == 4
         ]
         for network in v4_networks:
-            if own in network:
+            if network.subnet_of(connected):
                 return network
-        if v4_networks:
-            return v4_networks[0]
+            if connected.subnet_of(network):
+                return connected
         raise RuntimeError(
-            "ARP amplification requires at least one authorized IPv4 CIDR."
+            "ARP amplification requires an authorized IPv4 network directly "
+            "connected to the selected interface."
         )
 
     def start_arp_amplification(

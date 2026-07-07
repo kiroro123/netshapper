@@ -85,6 +85,10 @@ class PacketSniffer:
         self._sniffer   = None
         self._stop      = threading.Event()
         self._dropped   = 0
+        self.packets_seen = 0
+        self.packets_written = 0
+        self.packets_queue_dropped = 0
+        self.packets_shutdown_discarded = 0
         self.started_at: Optional[float] = None
         self.last_error: Optional[str] = None
         self.output_files: List[str] = []
@@ -93,6 +97,7 @@ class PacketSniffer:
         )
 
     def _packet_callback(self, pkt) -> None:
+        self.packets_seen += 1
         _ensure_packet_layers()
         ip_layer = pkt[IP] if pkt.haslayer(IP) else pkt[IPv6] if pkt.haslayer(IPv6) else None
         if ip_layer is not None:
@@ -108,6 +113,7 @@ class PacketSniffer:
                 self._queue.put_nowait(pkt)
             except queue.Full:
                 self._dropped += 1
+                self.packets_queue_dropped += 1
 
     def start(self) -> None:
         log.info("Packet sniffer started" +
@@ -139,28 +145,28 @@ class PacketSniffer:
             log.warning(
                 f"[Sniffer] {self._dropped} packets dropped (queue saturation)")
         if self.save_pcap and self._queue is not None:
-            # BUG FIX: bounded drain so shutdown doesn't block on a full queue
-            packets = []
-            max_drain = 5_000
-            while not self._queue.empty() and len(packets) < max_drain:
-                try:
-                    packets.append(self._queue.get_nowait())
-                except queue.Empty:
-                    break
-            if packets:
+            if not self._queue.empty():
                 capture_file = SecureCaptureDirectory(
                     self.capture_dir
                 ).open_new_pcap("capture")
                 writer = None
+                written = 0
                 try:
                     writer = RawPcapWriter(
                         capture_file.handle,
                         append=False,
                         sync=True,
                     )
-                    for packet in packets:
+                    while True:
+                        try:
+                            packet = self._queue.get_nowait()
+                        except queue.Empty:
+                            break
                         writer.write(packet)
+                        self._queue.task_done()
+                        written += 1
                 except Exception as exc:
+                    self.packets_shutdown_discarded += self._queue.qsize()
                     self.last_error = f"pcap write failed: {exc}"
                     log.error(f"[Sniffer] {self.last_error}")
                     raise
@@ -169,8 +175,9 @@ class PacketSniffer:
                         writer.close()
                     else:
                         capture_file.handle.close()
+                self.packets_written += written
                 self.output_files.append(capture_file.path)
-                log.info(f"Saved {len(packets)} packets → {capture_file.path}")
+                log.info(f"Saved {written} packets → {capture_file.path}")
 
 
 class RollingPacketSniffer:

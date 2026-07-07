@@ -3,6 +3,7 @@ import os
 import tempfile
 import threading
 import unittest
+from ipaddress import IPv4Network
 from unittest import mock
 
 from netshaper.core.authorization import AuthorizationError, AuthorizationPolicy
@@ -320,6 +321,40 @@ class NetShaperCleanupTests(unittest.TestCase):
             "192.0.2.1",
             ns.authorized_cidrs,
         )
+
+    def test_arp_amplification_fails_closed_without_connected_authorization(self):
+        ns = NetShaper.__new__(NetShaper)
+        self._set_authorized(ns, ("10.0.0.0/8",))
+        ns.own_ip = "192.168.1.10"
+        ns.gw = "192.168.1.1"
+        ns.disc = mock.Mock()
+        ns.disc.get_subnet_v4.return_value = "192.168.1.0/24"
+
+        with self.assertRaisesRegex(RuntimeError, "directly connected"):
+            ns._ipv4_subnet_for_amplification()
+
+    def test_arp_amplification_uses_connected_scope_with_broad_authorization(self):
+        ns = NetShaper.__new__(NetShaper)
+        self._set_authorized(ns, ("192.168.0.0/16",))
+        ns.own_ip = "192.168.1.10"
+        ns.gw = "192.168.1.1"
+        ns.disc = mock.Mock()
+        ns.disc.get_subnet_v4.return_value = "192.168.1.0/24"
+
+        subnet = ns._ipv4_subnet_for_amplification()
+
+        self.assertEqual(subnet, IPv4Network("192.168.1.0/24"))
+
+    def test_arp_amplification_requires_connected_gateway(self):
+        ns = NetShaper.__new__(NetShaper)
+        self._set_authorized(ns, ("192.168.1.0/24",))
+        ns.own_ip = "192.168.1.10"
+        ns.gw = "192.168.2.1"
+        ns.disc = mock.Mock()
+        ns.disc.get_subnet_v4.return_value = "192.168.1.0/24"
+
+        with self.assertRaisesRegex(RuntimeError, "gateway directly connected"):
+            ns._ipv4_subnet_for_amplification()
 
     def test_launch_mitmproxy_reaps_process_when_readiness_fails(self):
         ns = NetShaper.__new__(NetShaper)

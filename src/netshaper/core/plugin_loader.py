@@ -47,6 +47,23 @@ class PluginLoader:
     }
 
     @staticmethod
+    def _unsafe_write_permission(mode: int) -> Optional[str]:
+        if mode & stat.S_IWOTH:
+            return "world-writable"
+        if mode & stat.S_IWGRP:
+            return "group-writable"
+        return None
+
+    @staticmethod
+    def _has_trusted_owner(file_stat: os.stat_result) -> bool:
+        allowed_uids = {0}
+        if hasattr(os, "geteuid"):
+            allowed_uids.add(os.geteuid())
+        elif hasattr(os, "getuid"):
+            allowed_uids.add(os.getuid())
+        return file_stat.st_uid in allowed_uids
+
+    @staticmethod
     def discover_builtins() -> List[tuple[str, type[PluginInterface]]]:
         """Load the plugins shipped in the NetShaper distribution."""
         discovered: List[tuple[str, type[PluginInterface]]] = []
@@ -216,11 +233,18 @@ class PluginLoader:
             log.debug("Plugin directory does not exist: %s", plugin_dir)
             return discovered
 
-        # Check directory permissions: must not be world-writable
+        # Check directory permissions: only owner may write.
         dir_stat = os.stat(plugin_dir)
-        if dir_stat.st_mode & stat.S_IWOTH:
+        unsafe_permission = PluginLoader._unsafe_write_permission(dir_stat.st_mode)
+        if unsafe_permission:
             raise PluginLoadError(
-                f"plugin directory {plugin_dir} is world-writable (security risk)"
+                f"plugin directory {plugin_dir} is {unsafe_permission} "
+                "(security risk)"
+            )
+        if not PluginLoader._has_trusted_owner(dir_stat):
+            raise PluginLoadError(
+                f"plugin directory {plugin_dir} is not owned by root or the "
+                "current user (security risk)"
             )
 
         for filename in os.listdir(plugin_dir):
@@ -230,11 +254,22 @@ class PluginLoader:
             module_path = os.path.join(plugin_dir, filename)
             module_name = filename[:-3]  # strip .py
 
-            # Check file permissions: must not be world-writable
+            # Check file permissions: only owner may write.
             file_stat = os.stat(module_path)
-            if file_stat.st_mode & stat.S_IWOTH:
+            unsafe_permission = PluginLoader._unsafe_write_permission(
+                file_stat.st_mode
+            )
+            if unsafe_permission:
                 log.warning(
-                    "Skipping plugin %s: file is world-writable (security risk)",
+                    "Skipping plugin %s: file is %s (security risk)",
+                    filename,
+                    unsafe_permission,
+                )
+                continue
+            if not PluginLoader._has_trusted_owner(file_stat):
+                log.warning(
+                    "Skipping plugin %s: file is not owned by root or the "
+                    "current user (security risk)",
                     filename,
                 )
                 continue

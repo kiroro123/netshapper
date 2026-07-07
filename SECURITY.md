@@ -134,8 +134,13 @@ Before running in a new environment:
 
 ## Training-Mode Boundaries
 
-- ARP/NDP burst controls are capped at 5 packets per cycle with a minimum
-  interval of 0.25 seconds.
+- Core ARP/NDP burst controls are capped at 5 packets per cycle with a
+  minimum interval of 0.25 seconds.
+- ARP amplification is a separate directly connected IPv4 test mode:
+  `--arp-amplify-burst` is enforced as the maximum total transmitted frames
+  per cycle (1-50), with a minimum interval of 0.01 seconds. The selected
+  amplification scope must be both authorized and on the selected interface's
+  directly connected network.
 - DNSSEC suppression models removal of CD/DO/AD signaling and DNSSEC record
   visibility. A validating endpoint is expected to fail closed.
 - The HSTS/IDN page is static, has no credential form, and only accepts IDN
