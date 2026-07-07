@@ -150,6 +150,16 @@ class PluginLoaderDiscoveryTests(unittest.TestCase):
 
             self.assertIn("world-writable", str(ctx.exception))
 
+    def test_discover_filesystem_group_writable_dir_raises(self):
+        """Group-writable plugin directory raises PluginLoadError."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            os.chmod(tmpdir, 0o775)
+
+            with self.assertRaises(PluginLoadError) as ctx:
+                PluginLoader.discover_filesystem(tmpdir)
+
+            self.assertIn("group-writable", str(ctx.exception))
+
     def test_discover_filesystem_loads_valid_plugin(self):
         """Valid plugin file is discovered."""
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -172,6 +182,7 @@ class TestPlugin(PluginInterface):
                 f.write(plugin_code)
 
             os.chmod(tmpdir, 0o755)  # Safe: owner rw, group r, other r
+            os.chmod(plugin_file, 0o644)
             result = PluginLoader.discover_filesystem(tmpdir)
 
         self.assertEqual(len(result), 1)
@@ -200,6 +211,32 @@ class TestPlugin(PluginInterface):
 
             os.chmod(tmpdir, 0o755)
             os.chmod(plugin_file, 0o666)  # World-writable
+
+            result = PluginLoader.discover_filesystem(tmpdir)
+            self.assertEqual(result, [])
+
+    def test_discover_filesystem_skips_group_writable_file(self):
+        """Group-writable plugin file is skipped."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            plugin_code = """
+from netshaper.core.plugin import PluginInterface
+
+class TestPlugin(PluginInterface):
+    PLUGIN_ID = "fs-bad-group"
+    PLUGIN_NAME = "Filesystem Bad Group"
+
+    def start(self):
+        return True
+
+    def stop(self):
+        return True
+"""
+            plugin_file = os.path.join(tmpdir, "test_plugin.py")
+            with open(plugin_file, "w") as f:
+                f.write(plugin_code)
+
+            os.chmod(tmpdir, 0o755)
+            os.chmod(plugin_file, 0o664)
 
             result = PluginLoader.discover_filesystem(tmpdir)
             self.assertEqual(result, [])

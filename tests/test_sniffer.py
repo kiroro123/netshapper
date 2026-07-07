@@ -84,6 +84,40 @@ class PacketSnifferTests(unittest.TestCase):
     def test_packet_sniffer_tracks_liveness_and_written_pcap(self):
         self._run_one_shot_capture()
 
+    def test_packet_sniffer_drains_entire_queue_on_stop(self):
+        writes = []
+
+        class Writer:
+            def __init__(self, fileobj, **_kwargs):
+                self.fileobj = fileobj
+
+            def write(self, packet):
+                writes.append(packet)
+                self.fileobj.write(b"packet")
+
+            def close(self):
+                self.fileobj.close()
+
+        with mock.patch("netshaper.capture.sniffer._ensure_capture_tools"), \
+             mock.patch("netshaper.capture.sniffer.AsyncSniffer",
+                        new=FakeAsyncSniffer), \
+             mock.patch("netshaper.capture.sniffer.RawPcapWriter",
+                        new=Writer), \
+             tempfile.TemporaryDirectory() as capture_dir:
+            s = sniffer.PacketSniffer(
+                "eth0",
+                save_pcap=True,
+                capture_dir=capture_dir,
+            )
+            s.start()
+            for _ in range(8_000):
+                s._queue.put_nowait(object())
+            s.stop()
+
+        self.assertEqual(len(writes), 8_000)
+        self.assertEqual(s.packets_written, 8_000)
+        self.assertEqual(s.packets_shutdown_discarded, 0)
+
     def test_core_capture_rejects_preexisting_symlink(self):
         class Writer:
             def __init__(self, *_args, **_kwargs):
