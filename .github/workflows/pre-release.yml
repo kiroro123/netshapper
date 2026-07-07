@@ -8,18 +8,21 @@ on:
 # Prevent multiple runs of this workflow
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 permissions:
   contents: read
   pull-requests: read
-  issues: write
 
 jobs:
   invalidate-clearance:
     if: github.event.action == 'synchronize'
     name: Invalidate stale privileged label
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: write
     steps:
       - uses: actions/checkout@v4
         with:
@@ -50,9 +53,18 @@ jobs:
             }
 
   check-privileged-tests:
-    if: github.event.action != 'synchronize'
+    if: >
+      github.event.action != 'synchronize' &&
+      (
+        github.event.action != 'labeled' ||
+        github.event.label.name == 'privileged-tests-passed'
+      )
     name: Require Privileged Test Clearance
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
     steps:
       - uses: actions/checkout@v4
         with:
