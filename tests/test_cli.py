@@ -78,6 +78,20 @@ class CliTests(unittest.TestCase):
             args = cli.parse_args()
         self.assertEqual(args.allow_cidr, ["192.0.2.0/24"])
 
+    def test_fake_server_launch_hint_includes_health_token(self):
+        hint = cli.fake_server_launch_hint(
+            cli.ExploitOptions(),
+            host_ip="192.0.2.10",
+            authorized_cidrs=["192.0.2.0/24"],
+            smart_spoof_all=True,
+            health_token="session-token",
+        )
+
+        self.assertIn("--health-token session-token", hint)
+        self.assertIn("--smart-spoof-all", hint)
+        self.assertIn("--allow-cidr 192.0.2.0/24", hint)
+        self.assertIn("--allow-cidr 192.0.2.10/32", hint)
+
     def test_parse_args_rejects_limit_outside_interactive_range(self):
         with mock.patch("sys.argv", ["netshaper", "--limit", "0.01"]), \
              mock.patch("sys.stderr"), \
@@ -575,6 +589,7 @@ class CliTests(unittest.TestCase):
         ns.gw = "192.0.2.1"
         ns.gw_ipv6 = None
         ns.fake_server_ready.return_value = False
+        ns.fake_server_health_token.return_value = "test-health-token"
         target = Device(ip="192.0.2.20", mac="00:11:22:33:44:55")
         ns.discover.return_value = [target]
 
@@ -596,7 +611,7 @@ class CliTests(unittest.TestCase):
              mock.patch("netshaper.ui.cli.run_active_session") as run_mock, \
              mock.patch("netshaper.ui.cli.psutil.net_if_addrs",
                         return_value={"eth0": []}), \
-             self.assertRaisesRegex(SystemExit, "requires reachable fake DNS"):
+             self.assertRaisesRegex(SystemExit, "requires verified fake DNS"):
             cli.main()
 
         run_mock.assert_not_called()

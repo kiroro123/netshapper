@@ -981,7 +981,8 @@ class NetShaper:
             if dns_claimed or http_claimed:
                 log.error(
                     "Refusing to adopt unverified fake-server listener "
-                    "(dns=%s, http=%s)",
+                    "(dns=%s, http=%s). Stop the existing listener or relaunch "
+                    "it with the session health token printed by NetShaper.",
                     dns_claimed,
                     http_claimed,
                 )
@@ -1044,6 +1045,10 @@ class NetShaper:
             token = secrets.token_urlsafe(32)
             self._fake_server_health_token = token
         return token
+
+    def fake_server_health_token(self) -> str:
+        """Return the token required to verify a manually launched fake server."""
+        return self._fake_server_token()
 
     def fake_server_ready(self) -> bool:
         return self._fake_server_health_ready(self._fake_server_token())
