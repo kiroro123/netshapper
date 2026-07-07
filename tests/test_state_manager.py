@@ -175,6 +175,76 @@ class StateSnapshotTests(unittest.TestCase):
             self.assertEqual(ns._dry_run_state["session_id"], "NS-TEST")
             self.assertFalse(os.path.exists(os.path.join(tmp, "NS-TEST")))
 
+    def test_save_state_snapshots_sessions_under_lifecycle_lock(self):
+        class RecordingLock:
+            def __init__(self):
+                self.acquired = False
+                self.values_called_under_lock = False
+
+            def __enter__(self):
+                self.acquired = True
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                self.acquired = False
+
+        class LockAwareSessions(dict):
+            def __init__(self, lock, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self._lock = lock
+
+            def values(self):
+                self._lock.values_called_under_lock = self._lock.acquired
+                return super().values()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            ns = NetShaper.__new__(NetShaper)
+            ns.interface = "eth0"
+            ns.gw = "192.0.2.1"
+            ns.own_ip = "192.0.2.10"
+            ns.session_id = "NS-TEST"
+            ns.plugins = {}
+            ns.firewall_manager = mock.Mock()
+            ns.firewall_manager.get_state_for_persistence.return_value = {}
+            ns.state_snapshot = NetworkStateSnapshot(
+                session_id="NS-TEST",
+                interface="eth0",
+                ipv4_forwarding=0,
+                ipv6_forwarding=0,
+                route_localnet=0,
+                iptables_rules="",
+                ip6tables_rules="",
+                tc_configuration="",
+            )
+            lock = RecordingLock()
+            ns._lifecycle_lock = lock
+            ns.sessions = LockAwareSessions(
+                lock,
+                {
+                    "192.0.2.20": SimpleNamespace(
+                        target=SimpleNamespace(ip="192.0.2.20"),
+                        dns_on=False,
+                        limit=None,
+                        shaping_profile=None,
+                        firewall=None,
+                    )
+                },
+            )
+
+            def write_json(_path, data):
+                self.assertFalse(lock.acquired)
+                self.assertEqual(data["targets"][0]["ip"], "192.0.2.20")
+
+            with mock.patch("netshaper.core.orchestrator.config.STATE_DIR", tmp), \
+                 mock.patch(
+                     "netshaper.core.orchestrator.StateSnapshotManager.atomic_write_json",
+                     side_effect=write_json,
+                 ):
+                result = ns.save_state()
+
+            self.assertTrue(result)
+            self.assertTrue(lock.values_called_under_lock)
+
     @mock.patch("netshaper.core.state_manager.subprocess.run")
     def test_capture_records_original_forwarding_values(self, run_mock):
         run_mock.side_effect = [
