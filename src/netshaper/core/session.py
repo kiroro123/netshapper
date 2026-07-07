@@ -71,7 +71,7 @@ class TargetSession:
             journal=journal,
         )
         self.firewall = firewall
-        if self._journal and not self._journal():
+        if journal and not journal():
             raise RuntimeError(
                 f"Could not persist per-target firewall intent for {self.target.ip}"
             )

@@ -232,6 +232,57 @@ class FirewallManagerTests(unittest.TestCase):
         self.assertEqual(fw._http_input_rules, {("iptables", 8088)})
 
     @mock.patch("netshaper.network.firewall.SubprocessRunner.run")
+    def test_redirect_journals_before_input_rule_mutation(self, runner_mock):
+        runner_mock.return_value = True
+        fw = FirewallManager(
+            "192.0.2.10",
+            "eth0",
+            session_id="NS-TEST",
+            auto_setup=False,
+        )
+
+        sequence = []
+
+        def journal_side_effect():
+            sequence.append("journal")
+            return True
+
+        def run_side_effect(command, silent=True):
+            sequence.append(command)
+            return True
+
+        with mock.patch.object(fw, "_journal_resource", side_effect=journal_side_effect):
+            runner_mock.side_effect = run_side_effect
+            result = fw.add_redirect_rules(dns_spoof=True, http_redirect_port=8088)
+
+        self.assertTrue(result)
+        self.assertGreaterEqual(len(sequence), 1)
+        self.assertEqual(sequence[0], "journal")
+        self.assertEqual(
+            sequence[1],
+            [
+                "iptables",
+                "-I",
+                "INPUT",
+                "1",
+                "-i",
+                "eth0",
+                "-s",
+                "192.0.2.10",
+                "-p",
+                "udp",
+                "--dport",
+                "53",
+                "-m",
+                "comment",
+                "--comment",
+                "netshaper:NS-TEST:192.0.2.10",
+                "-j",
+                "ACCEPT",
+            ],
+        )
+
+    @mock.patch("netshaper.network.firewall.SubprocessRunner.run")
     def test_setup_journals_each_created_chain_resource(self, runner_mock):
         runner_mock.return_value = True
         journal = mock.Mock(return_value=True)
