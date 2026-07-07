@@ -71,6 +71,10 @@ class TargetSession:
             journal=journal,
         )
         self.firewall = firewall
+        if self._journal and not self._journal():
+            raise RuntimeError(
+                f"Could not persist per-target firewall intent for {self.target.ip}"
+            )
         firewall.setup()
         if dns_spoof or captive_portal or http_redirect_port:
             if not self.firewall.add_redirect_rules(

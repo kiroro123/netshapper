@@ -20,6 +20,7 @@ from netshaper.core.firewall_manager import (
     FirewallManager as ForwardingFirewallManager,
 )
 from netshaper.core.state_manager import StateSnapshotManager
+from netshaper.core.state_manager import StateSnapshotManager as _StateSnapshotManager
 from netshaper.system import InspectionStatus, SubprocessRunner, inspect_resource
 from netshaper.exceptions import NetShaperError
 
@@ -293,27 +294,11 @@ class RecoveryManager:
         data: dict[str, Any],
     ) -> bool:
         """Atomically persist recovery progress before/after mutation."""
-        tmp_path: Optional[str] = None
         try:
-            with tempfile.NamedTemporaryFile(
-                "w",
-                dir=os.path.dirname(state_path),
-                delete=False,
-                encoding="utf-8",
-            ) as handle:
-                json.dump(data, handle)
-                handle.flush()
-                os.fsync(handle.fileno())
-                tmp_path = handle.name
-            os.replace(tmp_path, state_path)
+            _StateSnapshotManager.atomic_write_json(state_path, data)
             return True
         except Exception as exc:
             log.error("[Recovery] Could not persist cleanup intent: %s", exc)
-            if tmp_path is not None:
-                try:
-                    os.unlink(tmp_path)
-                except OSError:
-                    pass
             return False
 
     def _cleanup_global_rules(

@@ -214,9 +214,17 @@ class FirewallManager:
         ok = True
         for b in self._binaries:
             for t, c in [("mangle", self.MANGLE), ("nat", self.NAT)]:
-                self._managed_chains.add((b, t, c))
                 chain_status = self._chain_state(b, t, c)
                 if chain_status is InspectionStatus.ERROR:
+                    ok = False
+                    continue
+                if chain_status is InspectionStatus.PRESENT:
+                    log.error(
+                        "Refusing to adopt pre-existing firewall chain %s %s/%s",
+                        b,
+                        t,
+                        c,
+                    )
                     ok = False
                     continue
                 if chain_status is InspectionStatus.ABSENT:
@@ -228,6 +236,7 @@ class FirewallManager:
                     linked = False
                     if created:
                         self._created_chains.add((b, t, c))
+                        self._managed_chains.add((b, t, c))
                         if not self._journal_resource():
                             ok = False
                             continue

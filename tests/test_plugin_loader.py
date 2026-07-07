@@ -280,6 +280,44 @@ class PluginLoaderRegistrationTests(unittest.TestCase):
         self.assertIs(result["test-dummy"], DummyPlugin)
         self.assertIn("test-dummy", PluginManager.available())
 
+    def test_load_and_register_requests_specific_entry_points(self):
+        """Only requested entry points are loaded when plugin IDs are supplied."""
+        mock_ep = mock.Mock()
+        mock_ep.name = "test-ep"
+        mock_ep.load.return_value = DummyPlugin
+
+        with mock.patch(
+            "netshaper.core.plugin_loader.entry_points",
+            return_value={PluginLoader.PLUGIN_ENTRY_POINT: [mock_ep]},
+        ):
+            result = PluginLoader.load_and_register(
+                discover_entry_points=True,
+                discover_filesystem=False,
+                requested_plugin_ids=["test-dummy"],
+            )
+
+        self.assertIn("test-dummy", result)
+        self.assertIs(result["test-dummy"], DummyPlugin)
+        self.assertIn("test-dummy", PluginManager.available())
+
+    def test_load_and_register_requested_entry_points_missing_is_ignored(self):
+        """Missing requested entry points do not stop loading other plugins."""
+        mock_ep = mock.Mock()
+        mock_ep.name = "test-ep"
+        mock_ep.load.return_value = DummyPlugin
+
+        with mock.patch(
+            "netshaper.core.plugin_loader.entry_points",
+            return_value={PluginLoader.PLUGIN_ENTRY_POINT: [mock_ep]},
+        ):
+            result = PluginLoader.load_and_register(
+                discover_entry_points=True,
+                discover_filesystem=False,
+                requested_plugin_ids=["unknown-plugin"],
+            )
+
+        self.assertEqual(result, {})
+
     def test_load_and_register_builtins(self):
         result = PluginLoader.load_and_register(
             discover_builtins=True,

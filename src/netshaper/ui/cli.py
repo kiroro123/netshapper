@@ -713,6 +713,7 @@ def main() -> None:
                     discover_builtins=True,
                     discover_entry_points=True,
                     discover_filesystem=False,
+                    requested_plugin_ids=args.plugin,
                 )
                 for plugin_id in args.plugin:
                     try:

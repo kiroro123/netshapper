@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess  # nosec B404
+import tempfile
 from dataclasses import dataclass
 from typing import Optional
 
@@ -31,6 +33,35 @@ class StateSnapshotManager:
     NetShaper session was active. ``tc_configuration`` is captured as evidence
     for operators and recovery logs; it is not replayed.
     """
+
+    @staticmethod
+    def atomic_write_json(path: str, data: object) -> None:
+        directory = os.path.dirname(path)
+        tmp_path: Optional[str] = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                "w",
+                dir=directory,
+                delete=False,
+                encoding="utf-8",
+            ) as handle:
+                json.dump(data, handle)
+                handle.flush()
+                os.fsync(handle.fileno())
+                tmp_path = handle.name
+            os.replace(tmp_path, path)
+            dir_fd = os.open(directory, os.O_DIRECTORY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except Exception:
+            if tmp_path is not None and os.path.exists(tmp_path):
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+            raise
 
     @staticmethod
     def _run(args: list[str]) -> str:
