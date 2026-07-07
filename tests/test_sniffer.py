@@ -35,12 +35,23 @@ class FakeAsyncSniffer:
 
 
 class PacketSnifferTests(unittest.TestCase):
-    def test_packet_callback_accepts_ipv6_packets(self):
+    def test_packet_callback_accepts_ipv6_packets_without_default_printing(self):
         with mock.patch("netshaper.capture.sniffer.IP", new=object()), \
              mock.patch("netshaper.capture.sniffer.IPv6", new=object()), \
              mock.patch("netshaper.capture.sniffer.print_flush") as print_flush_mock:
             fake_pkt = FakeIPv6Packet(sniffer.IPv6)
             s = sniffer.PacketSniffer("eth0")
+            s._packet_callback(fake_pkt)
+
+        self.assertEqual(s.packets_seen, 1)
+        print_flush_mock.assert_not_called()
+
+    def test_packet_callback_prints_when_verbose_enabled(self):
+        with mock.patch("netshaper.capture.sniffer.IP", new=object()), \
+             mock.patch("netshaper.capture.sniffer.IPv6", new=object()), \
+             mock.patch("netshaper.capture.sniffer.print_flush") as print_flush_mock:
+            fake_pkt = FakeIPv6Packet(sniffer.IPv6)
+            s = sniffer.PacketSniffer("eth0", packet_verbose=True)
             s._packet_callback(fake_pkt)
 
         print_flush_mock.assert_called_once()

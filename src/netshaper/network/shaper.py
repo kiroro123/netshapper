@@ -2,6 +2,7 @@
 NetShaper — Linux tc HTB traffic shaper.
 """
 import logging
+import zlib
 from dataclasses import dataclass
 from typing import Callable, List, Optional, Set, Tuple
 
@@ -13,6 +14,19 @@ from netshaper.system import (
 )
 
 log = logging.getLogger("netshaper")
+
+DEFAULT_ROOT_HANDLE = "1:"
+TC_ROOT_QDISC_FORMAT = "netshaper.tc-root.v1"
+
+
+def root_handle_for_session(session_id: Optional[str]) -> str:
+    """Return a stable tc root handle derived from a NetShaper session ID."""
+    if not session_id:
+        return DEFAULT_ROOT_HANDLE
+    major = zlib.crc32(session_id.encode("utf-8")) & 0xFFFF
+    if major in (0, 1):
+        major = 0x100
+    return f"{major:x}:"
 
 
 @dataclass(frozen=True)
@@ -81,8 +95,11 @@ class ShapingProfile:
 
 
 class TrafficShaper:
-    def __init__(self, interface: str):
+    def __init__(self, interface: str, session_id: Optional[str] = None):
         self.interface         = interface
+        self.session_id        = session_id
+        self.root_handle       = root_handle_for_session(session_id)
+        self._root_major       = self.root_handle.rstrip(":")
         self._base_initialized = False
         self._root_qdisc_pending = False
         self._active_marks: Set[int] = set()
@@ -90,6 +107,24 @@ class TrafficShaper:
         self._target_qdiscs: Set[int] = set()
         self._target_classes: Set[int] = set()
         self._tracked_mark_bases: Set[int] = set()
+
+    def _classid(self, mark: int) -> str:
+        return f"{self._root_major}:{mark}"
+
+    def get_state_for_persistence(self) -> dict:
+        if self._root_qdisc_pending:
+            state = "pending"
+        elif self._base_initialized:
+            state = "active"
+        else:
+            state = "absent"
+        return {
+            "format": TC_ROOT_QDISC_FORMAT,
+            "interface": self.interface,
+            "session_id": self.session_id,
+            "handle": self.root_handle,
+            "state": state,
+        }
 
     @staticmethod
     def _journal_resource(journal: Optional[Callable[[], bool]]) -> bool:
@@ -138,7 +173,7 @@ class TrafficShaper:
         result = self._inspect_root_qdisc()
         if result.status != InspectionStatus.PRESENT:
             return result
-        if "qdisc htb 1:" not in result.stdout:
+        if f"qdisc htb {self.root_handle.lower()}" not in result.stdout.lower():
             return InspectionResult(
                 InspectionStatus.ABSENT, result.stdout, result.stderr)
         return result
@@ -176,7 +211,7 @@ class TrafficShaper:
                 )
             if not SubprocessRunner.run(
                 ["tc", "qdisc", "add", "dev", self.interface,
-                 "root", "handle", "1:", "htb"]):
+                 "root", "handle", self.root_handle, "htb"]):
                 self._root_qdisc_pending = False
                 raise RuntimeError(
                     f"Failed to create NetShaper root qdisc on {self.interface}"
@@ -223,10 +258,10 @@ class TrafficShaper:
         created_qdiscs: List[int] = []
         created_filters: List[Tuple[int, str]] = []
         for mark in [mark_base, mark_base + 10]:
-            classid = f"1:{mark}"
+            classid = self._classid(mark)
             if not SubprocessRunner.run(
                 ["tc", "class", "add", "dev", self.interface,
-                 "parent", "1:", "classid", classid,
+                 "parent", self.root_handle, "classid", classid,
                  "htb", "rate", f"{k}kbit", "burst", "15k"]):
                 rollback_ok = self._rollback_failed_target(
                     created_filters, created_qdiscs, created_classes)
@@ -271,7 +306,7 @@ class TrafficShaper:
                 # is rejected as an unsafe filter flush by modern tc.
                 if not SubprocessRunner.run(
                     ["tc", "filter", "add", "dev", self.interface,
-                     "parent", "1:", "protocol", proto,
+                     "parent", self.root_handle, "protocol", proto,
                      "pref", str(self._filter_preference(mark, proto)),
                      "handle", str(mark), "fw", "flowid", classid],
                     silent=True):
@@ -336,12 +371,13 @@ class TrafficShaper:
     def _filter_state(self, mark: int, proto: str) -> InspectionStatus:
         result = inspect_resource(
             ["tc", "filter", "show", "dev", self.interface,
-             "parent", "1:", "protocol", proto])
+             "parent", self.root_handle, "protocol", proto])
         if result.status != InspectionStatus.PRESENT:
             return result.status
         output = result.stdout.lower()
+        classid = self._classid(mark).lower()
         markers = (
-            f"classid 1:{mark}",
+            f"classid {classid}",
             f"handle {mark} ",
             f"handle 0x{mark:x} ",
         )
@@ -358,14 +394,14 @@ class TrafficShaper:
             return result.status
         return (
             InspectionStatus.PRESENT
-            if f"1:{mark}" in result.stdout
+            if self._classid(mark) in result.stdout
             else InspectionStatus.ABSENT
         )
 
     def _qdisc_state(self, mark: int) -> InspectionStatus:
         result = inspect_resource(
             ["tc", "qdisc", "show", "dev", self.interface,
-             "parent", f"1:{mark}"])
+             "parent", self._classid(mark)])
         if result.status != InspectionStatus.PRESENT:
             return result.status
         output = result.stdout.lower()
@@ -378,7 +414,7 @@ class TrafficShaper:
     def _delete_filter(self, mark: int, proto: str) -> InspectionStatus:
         if SubprocessRunner.run(
                 ["tc", "filter", "del", "dev", self.interface,
-                 "parent", "1:", "protocol", proto,
+                 "parent", self.root_handle, "protocol", proto,
                  "pref", str(self._filter_preference(mark, proto)),
                  "handle", str(mark), "fw"],
                 check=False, silent=True):
@@ -391,7 +427,7 @@ class TrafficShaper:
     def _delete_class(self, mark: int) -> InspectionStatus:
         if SubprocessRunner.run(
                 ["tc", "class", "del", "dev", self.interface,
-                 "classid", f"1:{mark}"],
+                 "classid", self._classid(mark)],
                 check=False, silent=True):
             return InspectionStatus.PRESENT
         status = self._class_state(mark)
@@ -402,7 +438,7 @@ class TrafficShaper:
     def _delete_qdisc(self, mark: int) -> InspectionStatus:
         if SubprocessRunner.run(
                 ["tc", "qdisc", "del", "dev", self.interface,
-                 "parent", f"1:{mark}", "handle", f"{mark}:", "netem"],
+                 "parent", self._classid(mark), "handle", f"{mark}:", "netem"],
                 check=False, silent=True):
             return InspectionStatus.PRESENT
         status = self._qdisc_state(mark)

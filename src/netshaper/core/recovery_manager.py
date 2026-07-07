@@ -20,11 +20,13 @@ from netshaper.core.firewall_manager import (
 )
 from netshaper.core.owner import OwnerStatus, owner_status
 from netshaper.core.state_manager import StateSnapshotManager
+from netshaper.network.shaper import TC_ROOT_QDISC_FORMAT
 from netshaper.system import InspectionStatus, SubprocessRunner, inspect_resource
 from netshaper.exceptions import NetShaperError
 
 log = logging.getLogger("netshaper")
 _INTERFACE_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,15}$")
+_TC_ROOT_HANDLE_RE = re.compile(r"^[0-9A-Fa-f]{1,4}:$")
 
 
 class RecoveryError(NetShaperError):
@@ -804,19 +806,50 @@ class RecoveryManager:
             log.error("[Recovery] tc (traffic control) unavailable")
             return False
 
-        status = self._inspect_stale_resource(
-            ["tc", "qdisc", "show", "dev", iface, "root"],
-            output_contains="qdisc htb 1:",
-        )
+        root_record = data.get("shaper_root_qdisc")
+        if not isinstance(root_record, dict):
+            log.error(
+                "[Recovery] Traffic shaper state lacks exact root qdisc ownership"
+            )
+            return False
+        if root_record.get("format") != TC_ROOT_QDISC_FORMAT:
+            log.error("[Recovery] Unsupported traffic shaper ownership format")
+            return False
+        if root_record.get("interface") != iface:
+            log.error("[Recovery] Traffic shaper interface ownership mismatch")
+            return False
+        if root_record.get("session_id") != data.get("session_id"):
+            log.error("[Recovery] Traffic shaper session ownership mismatch")
+            return False
+        if root_record.get("state") not in {"active", "pending"}:
+            log.error("[Recovery] Traffic shaper ownership state mismatch")
+            return False
+        handle = root_record.get("handle")
+        if not isinstance(handle, str) or not _TC_ROOT_HANDLE_RE.fullmatch(handle):
+            log.error("[Recovery] Invalid traffic shaper root handle")
+            return False
 
-        if status is InspectionStatus.ABSENT:
+        inspection = inspect_resource(["tc", "qdisc", "show", "dev", iface, "root"])
+
+        if inspection.status is InspectionStatus.ABSENT:
             log.debug("[Recovery] Traffic shaper already removed")
             return True
 
-        if status is InspectionStatus.ERROR:
+        if inspection.status is InspectionStatus.ERROR:
             cleanup_ok = False
             log.error("[Recovery] Cannot inspect traffic shaper")
             return cleanup_ok
+
+        root_output = inspection.stdout.strip()
+        if not root_output or root_output.startswith("qdisc noqueue "):
+            log.debug("[Recovery] Traffic shaper already removed")
+            return True
+        if f"qdisc htb {handle.lower()}" not in root_output.lower():
+            log.error(
+                "[Recovery] Traffic shaper root qdisc ownership mismatch; "
+                "leaving it in place"
+            )
+            return False
 
         if SubprocessRunner.run(
             ["tc", "qdisc", "del", "dev", iface, "root"], check=False, silent=True

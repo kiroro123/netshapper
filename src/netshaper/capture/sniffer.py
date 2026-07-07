@@ -77,11 +77,13 @@ class PacketSniffer:
     def __init__(self, interface: str,
                  target_ips: Optional[List[str]] = None,
                  save_pcap: bool = False,
-                 capture_dir: Optional[str] = None):
+                 capture_dir: Optional[str] = None,
+                 packet_verbose: bool = False):
         self.interface  = interface
         self.target_ips = target_ips or []
         self.save_pcap  = save_pcap
         self.capture_dir = capture_dir
+        self.packet_verbose = packet_verbose
         self._sniffer   = None
         self._stop      = threading.Event()
         self._dropped   = 0
@@ -106,8 +108,9 @@ class PacketSniffer:
                     and src not in self.target_ips
                     and dst not in self.target_ips):
                 return
-            proto = pkt.sprintf('%IP.proto%') if pkt.haslayer(IP) else pkt.sprintf('%IPv6.nh%')
-            print_flush(f"[Sniff] {src} → {dst}  {proto}")
+            if self.packet_verbose:
+                proto = pkt.sprintf('%IP.proto%') if pkt.haslayer(IP) else pkt.sprintf('%IPv6.nh%')
+                print_flush(f"[Sniff] {src} → {dst}  {proto}")
         if self._queue is not None:
             try:
                 self._queue.put_nowait(pkt)
@@ -190,12 +193,14 @@ class RollingPacketSniffer:
                  base_filename: str = "capture",
                  target_ips: Optional[List[str]] = None,
                  capture_dir: Optional[str] = None,
-                 max_file_size_bytes: int = 50 * 1024 * 1024):
+                 max_file_size_bytes: int = 50 * 1024 * 1024,
+                 packet_verbose: bool = False):
         self.interface           = interface
         self.base_filename       = base_filename
         self.target_ips          = target_ips or []
         self.capture_dir         = capture_dir
         self.max_file_size_bytes = max_file_size_bytes
+        self.packet_verbose      = packet_verbose
         self._queue              = queue.Queue(maxsize=10_000)
         self._stop_event         = threading.Event()
         self._dropped            = 0
@@ -228,8 +233,9 @@ class RollingPacketSniffer:
                     and src not in self.target_ips
                     and dst not in self.target_ips):
                 return
-            proto = pkt.sprintf('%IP.proto%') if pkt.haslayer(IP) else pkt.sprintf('%IPv6.nh%')
-            print_flush(f"[Sniff] {src} → {dst}  {proto}")
+            if self.packet_verbose:
+                proto = pkt.sprintf('%IP.proto%') if pkt.haslayer(IP) else pkt.sprintf('%IPv6.nh%')
+                print_flush(f"[Sniff] {src} → {dst}  {proto}")
         try:
             self._queue.put_nowait(pkt)
         except queue.Full:

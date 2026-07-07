@@ -153,6 +153,39 @@ class TrafficShaperTests(unittest.TestCase):
 
     @mock.patch("netshaper.network.shaper.SubprocessRunner.run")
     @mock.patch("netshaper.network.shaper.inspect_resource")
+    def test_apply_target_uses_session_derived_root_handle(
+            self, inspect_mock, runner_mock):
+        shaper = TrafficShaper("eth0", session_id="NS-TEST")
+        inspect_mock.side_effect = [
+            InspectionResult(InspectionStatus.ABSENT),
+            InspectionResult(
+                InspectionStatus.PRESENT,
+                stdout=f"qdisc htb {shaper.root_handle} root refcnt 2",
+            ),
+        ]
+        runner_mock.return_value = True
+
+        shaper.apply_target("192.0.2.10", 5.0)
+
+        runner_mock.assert_any_call(
+            ["tc", "qdisc", "add", "dev", "eth0",
+             "root", "handle", shaper.root_handle, "htb"],
+        )
+        runner_mock.assert_any_call(
+            [
+                "tc", "class", "add", "dev", "eth0",
+                "parent", shaper.root_handle,
+                "classid", f"{shaper.root_handle.rstrip(':')}:10",
+                "htb", "rate", "5000kbit", "burst", "15k",
+            ],
+        )
+        self.assertEqual(
+            shaper.get_state_for_persistence()["handle"],
+            shaper.root_handle,
+        )
+
+    @mock.patch("netshaper.network.shaper.SubprocessRunner.run")
+    @mock.patch("netshaper.network.shaper.inspect_resource")
     def test_cleanup_ignores_foreign_root_qdisc(
             self, inspect_mock, runner_mock):
         inspect_mock.return_value = InspectionResult(

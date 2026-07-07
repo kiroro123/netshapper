@@ -115,6 +115,17 @@ class CliTests(unittest.TestCase):
         self.assertEqual(args.dnssec_upstream, "1.1.1.1")
         self.assertTrue(args.hsts_bypass)
 
+    def test_parse_args_accepts_capture_and_discovery_safety_flags(self):
+        with mock.patch("sys.argv", [
+            "netshaper",
+            "--max-discovery-hosts", "128",
+            "--packet-verbose",
+        ]):
+            args = cli.parse_args()
+
+        self.assertEqual(args.max_discovery_hosts, 128)
+        self.assertTrue(args.packet_verbose)
+
     def test_resolve_exploit_options_merges_menu_and_flags(self):
         with mock.patch("sys.argv", [
             "netshaper",
@@ -284,6 +295,7 @@ class CliTests(unittest.TestCase):
             target_ips=targets,
             save_pcap=False,
             rolling=False,
+            packet_verbose=False,
         )
         self.assertEqual(ns.save_state.call_count, 3)
         ns.cleanup.assert_called_once()
@@ -325,6 +337,7 @@ class CliTests(unittest.TestCase):
             target_ips=["192.0.2.10"],
             save_pcap=False,
             rolling=False,
+            packet_verbose=False,
         )
         ns.cleanup.assert_called_once()
 
@@ -551,7 +564,7 @@ class CliTests(unittest.TestCase):
         authorized = ns_cls.call_args.kwargs["authorized_cidrs"]
         self.assertEqual([str(network) for network in authorized],
                          ["192.0.2.16/28"])
-        ns.discover.assert_called_once_with()
+        ns.discover.assert_called_once_with(max_discovery_hosts=4096)
         ns.close.assert_called_once()
 
     def test_main_exits_when_required_dns_service_is_unreachable(self):
@@ -561,6 +574,7 @@ class CliTests(unittest.TestCase):
         ns.own_ipv6 = None
         ns.gw = "192.0.2.1"
         ns.gw_ipv6 = None
+        ns.fake_server_ready.return_value = False
         target = Device(ip="192.0.2.20", mac="00:11:22:33:44:55")
         ns.discover.return_value = [target]
 

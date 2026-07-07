@@ -17,6 +17,18 @@ class DiscoveryHostnameTests(unittest.TestCase):
         self.assertEqual(batches[0][0], "192.0.2.1")
         self.assertEqual(batches[-1][-1], "192.0.2.69")
 
+    def test_target_batches_from_scopes_apply_budget_without_full_materialization(self):
+        batches = list(NetworkDiscovery._target_batches_from_scopes(
+            [IPv4Network("10.0.0.0/8")],
+            gateway_ip=None,
+            batch_size=64,
+            max_hosts=130,
+        ))
+
+        self.assertEqual([len(batch) for batch in batches], [64, 64, 2])
+        self.assertEqual(batches[0][0], "10.0.0.1")
+        self.assertEqual(batches[-1][-1], "10.0.0.130")
+
     def test_merge_proc_arp_cache_adds_valid_neighbors_only(self):
         arp_table = (
             "IP address       HW type     Flags       HW address            Mask     Device\n"
@@ -118,8 +130,8 @@ class DiscoveryHostnameTests(unittest.TestCase):
         with mock.patch("netshaper.network.discovery._ensure_scapy_layers"), \
              mock.patch.object(disc, "_merge_neighbor_caches",
                                return_value=0), \
-             mock.patch.object(disc, "_target_batches",
-                               wraps=disc._target_batches) as batches_mock, \
+             mock.patch.object(disc, "_target_batches_from_scopes",
+                               wraps=disc._target_batches_from_scopes) as batches_mock, \
              mock.patch("netshaper.network.discovery.Ether", FakeLayer), \
              mock.patch("netshaper.network.discovery.ARP", FakeLayer), \
              mock.patch("netshaper.network.discovery.srp",
@@ -133,10 +145,9 @@ class DiscoveryHostnameTests(unittest.TestCase):
                 [ip_network("192.0.2.64/28")],
             )
 
-        targets = batches_mock.call_args.args[0]
-        self.assertEqual(targets[0], "192.0.2.65")
-        self.assertEqual(targets[-1], "192.0.2.78")
-        self.assertEqual(len(targets), 14)
+        scope_networks = batches_mock.call_args.args[0]
+        self.assertEqual(scope_networks, [IPv4Network("192.0.2.64/28")])
+        self.assertEqual(batches_mock.call_args.kwargs["max_hosts"], 4096)
 
     def test_authorized_scope_filters_neighbor_cache_entries(self):
         arp_table = (

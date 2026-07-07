@@ -9,6 +9,7 @@ sniffer management, and the bandwidth monitor thread.
 from __future__ import annotations
 
 import fcntl
+import http.client
 from ipaddress import (
     IPv4Address,
     IPv4Network,
@@ -20,6 +21,7 @@ from ipaddress import (
 import json
 import logging
 import os
+import secrets
 import socket
 import subprocess  # nosec B404
 import sys
@@ -73,7 +75,7 @@ class NetShaper:
             else None
         )
         self.gw_ipv6 = self.disc.get_default_gateway_ipv6()
-        self.shaper = TrafficShaper(interface)
+        self.shaper = TrafficShaper(interface, self.session_id)
         self.mark_pool = MarkIDPool()
         self.firewall_manager = FirewallManager(
             interface,
@@ -92,6 +94,7 @@ class NetShaper:
         self.stop_event = threading.Event()
         self._mitm_log_path: Optional[str] = None
         self._fake_server_proc: Optional[subprocess.Popen] = None
+        self._fake_server_health_token: Optional[str] = None
         self._arp_amplifier = None
         self._monitor_thread: Optional[threading.Thread] = None
         self._runtime_errors: List[str] = []
@@ -435,7 +438,7 @@ class NetShaper:
         return manager
 
     # ── Discovery ─────────────────────────────────────────────────────────────
-    def discover(self) -> List[Device]:
+    def discover(self, max_discovery_hosts: Optional[int] = None) -> List[Device]:
         from netshaper.exceptions import DiscoveryError
 
         # Ensure the immutable policy is present and use its CIDRs.
@@ -448,7 +451,10 @@ class NetShaper:
         subnet = self.disc.get_subnet_v4()
         if not subnet:
             raise DiscoveryError("Could not determine subnet.")
-        devices = self.disc.arp_sweep(subnet, self.gw, authorized_cidrs)
+        arp_kwargs: dict[str, Any] = {}
+        if max_discovery_hosts is not None:
+            arp_kwargs["max_discovery_hosts"] = max_discovery_hosts
+        devices = self.disc.arp_sweep(subnet, self.gw, authorized_cidrs, **arp_kwargs)
         self.disc.resolve_hostnames(devices)
         return devices
 
@@ -962,51 +968,61 @@ class NetShaper:
             )
             return True
 
-        dns_ready = check_local_port(self.own_ip, 53, socket.SOCK_DGRAM)
-        http_ready = check_local_port(self.own_ip, 80)
-        if dns_ready and (http_ready or not web_security_demo):
-            log.info("fake server ports already reachable")
+        health_token = self._fake_server_token()
+        if self.fake_server_ready():
+            log.info("netshaper-fake-server already ready for this session")
             return True
 
         if self._fake_server_proc and self._fake_server_proc.poll() is None:
-            return dns_ready and (http_ready or not web_security_demo)
+            log.debug("Waiting for existing netshaper-fake-server child")
+        else:
+            dns_claimed = check_local_port(self.own_ip, 53, socket.SOCK_DGRAM)
+            http_claimed = check_local_port(self.own_ip, 80)
+            if dns_claimed or http_claimed:
+                log.error(
+                    "Refusing to adopt unverified fake-server listener "
+                    "(dns=%s, http=%s)",
+                    dns_claimed,
+                    http_claimed,
+                )
+                return False
 
-        cmd = [
-            sys.executable,
-            "-m",
-            "netshaper.fake_server3",
-            "--host-ip",
-            self.own_ip,
-            "--upstream",
-            dns_upstream,
-        ]
-        if smart_spoof_all:
-            cmd.append("--smart-spoof-all")
-        if dnssec_mode != "off":
-            cmd.extend(["--dnssec-mode", dnssec_mode])
-        allowed_cidrs = {
-            str(network) for network in self.authorized_cidrs
-        }
-        allowed_cidrs.add(f"{self.own_ip}/32")
-        for allowed_cidr in sorted(allowed_cidrs):
-            cmd.extend(["--allow-cidr", allowed_cidr])
-        if web_security_demo:
-            cmd.append("--web-security-demo")
+            cmd = [
+                sys.executable,
+                "-m",
+                "netshaper.fake_server3",
+                "--host-ip",
+                self.own_ip,
+                "--upstream",
+                dns_upstream,
+                "--health-token",
+                health_token,
+            ]
+            if smart_spoof_all:
+                cmd.append("--smart-spoof-all")
+            if dnssec_mode != "off":
+                cmd.extend(["--dnssec-mode", dnssec_mode])
+            allowed_cidrs = {
+                str(network) for network in self.authorized_cidrs
+            }
+            allowed_cidrs.add(f"{self.own_ip}/32")
+            for allowed_cidr in sorted(allowed_cidrs):
+                cmd.extend(["--allow-cidr", allowed_cidr])
+            if web_security_demo:
+                cmd.append("--web-security-demo")
 
-        try:
-            self._fake_server_proc = subprocess.Popen(  # nosec B603
-                cmd,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-        except OSError as exc:
-            log.error(f"fake server launch failed: {exc}")
-            return False
+            try:
+                self._fake_server_proc = subprocess.Popen(  # nosec B603
+                    cmd,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            except OSError as exc:
+                log.error(f"fake server launch failed: {exc}")
+                return False
 
         for _ in range(20):
-            dns_ready = check_local_port(self.own_ip, 53, socket.SOCK_DGRAM)
-            http_ready = check_local_port(self.own_ip, 80)
-            if dns_ready and (http_ready or not web_security_demo):
+            if self.fake_server_ready():
                 log.info("netshaper-fake-server ready")
                 return True
             if self._fake_server_proc.poll() is not None:
@@ -1021,6 +1037,38 @@ class NetShaper:
         log.error("netshaper-fake-server did not become reachable within 5s")
         self._terminate_fake_server()
         return False
+
+    def _fake_server_token(self) -> str:
+        token = getattr(self, "_fake_server_health_token", None)
+        if not token:
+            token = secrets.token_urlsafe(32)
+            self._fake_server_health_token = token
+        return token
+
+    def fake_server_ready(self) -> bool:
+        return self._fake_server_health_ready(self._fake_server_token())
+
+    def _fake_server_health_ready(self, token: str) -> bool:
+        conn: Optional[http.client.HTTPConnection] = None
+        try:
+            conn = http.client.HTTPConnection(self.own_ip, 80, timeout=1.0)
+            conn.request(
+                "GET",
+                "/_netshaper/health",
+                headers={"X-NetShaper-Session": token},
+            )
+            response = conn.getresponse()
+            body = response.read(256).decode("utf-8", errors="replace")
+            return (
+                response.status == 200
+                and response.getheader("X-NetShaper-Session") == token
+                and body == token
+            )
+        except Exception:
+            return False
+        finally:
+            if conn is not None:
+                conn.close()
 
     def _terminate_fake_server(self) -> bool:
         proc = getattr(self, "_fake_server_proc", None)
@@ -1064,6 +1112,7 @@ class NetShaper:
         target_ips: Optional[List[str]] = None,
         save_pcap: bool = False,
         rolling: bool = False,
+        packet_verbose: bool = False,
     ) -> None:
         if config.DRY_RUN:
             print_flush("[DRY-RUN] Would launch packet sniffer")
@@ -1075,6 +1124,7 @@ class NetShaper:
                 self.interface,
                 target_ips=target_ips,
                 capture_dir=self._capture_dir(),
+                packet_verbose=packet_verbose,
             )
         else:
             self.sniffer = PacketSniffer(
@@ -1082,6 +1132,7 @@ class NetShaper:
                 target_ips=target_ips,
                 save_pcap=save_pcap,
                 capture_dir=self._capture_dir(),
+                packet_verbose=packet_verbose,
             )
         self.sniffer.start()
 
@@ -1095,8 +1146,11 @@ class NetShaper:
             )
             return True
         if check_local_port(self.own_ip, port):
-            log.info(f"mitmproxy already running on :{port}")
-            return True
+            log.error(
+                "Refusing to adopt existing listener on mitmproxy port :%s",
+                port,
+            )
+            return False
         try:
             manager = self._get_mitm_manager()
             ok = manager.launch(port=port, web_port=web_port)
@@ -1203,6 +1257,16 @@ class NetShaper:
         ]
 
         firewall_state = self._get_firewall_manager().get_state_for_persistence() or {}
+        shaper = getattr(self, "shaper", None)
+        shaper_state: dict[str, Any] = {}
+        shaper_state_method = getattr(shaper, "get_state_for_persistence", None)
+        if callable(shaper_state_method):
+            try:
+                candidate = shaper_state_method()
+            except Exception:
+                candidate = {}
+            if isinstance(candidate, dict):
+                shaper_state = candidate
 
         data = {
             "session_id": self.session_id,
@@ -1217,6 +1281,7 @@ class NetShaper:
             "shaper_root_qdisc_pending": getattr(
                 getattr(self, "shaper", None), "_root_qdisc_pending", False
             ),
+            "shaper_root_qdisc": shaper_state,
             "owner": getattr(self, "_owner_metadata", {}),
             "snapshot": self._snapshot_to_dict(self.state_snapshot),
             "plugins": [

@@ -65,6 +65,10 @@ class MitmProxyManager:
         finally:
             self._mitm_log_handle = None
 
+    def _clear_completed_process(self) -> None:
+        self._mitm_proc = None
+        self._close_log()
+
     @staticmethod
     def _timestamp() -> str:
         """Get ISO-formatted timestamp."""
@@ -93,8 +97,11 @@ class MitmProxyManager:
             return True
 
         if check_local_port(self.own_ip, port):
-            log.info(f"mitmproxy already running on :{port}")
-            return True
+            log.error(
+                "Refusing to adopt existing listener on mitmproxy port :%s",
+                port,
+            )
+            return False
 
         log_handle = None
         try:
@@ -116,6 +123,14 @@ class MitmProxyManager:
 
             # Poll for readiness
             for attempt in range(10):
+                return_code = self._mitm_proc.poll()
+                if return_code is not None:
+                    log.error(
+                        f"mitmproxy exited during startup with code {return_code}; "
+                        f"see {self._mitm_log_path or 'logs'}"
+                    )
+                    self._clear_completed_process()
+                    return False
                 if check_local_port(self.own_ip, port):
                     log.info(
                         f"  [+] mitmproxy ready → http://127.0.0.1:{web_port}"
@@ -130,12 +145,13 @@ class MitmProxyManager:
             return_code = self._mitm_proc.poll()
             if return_code is None:
                 log.error(f"mitmproxy did not bind to :{port} within 5s")
+                self.terminate()
             else:
                 log.error(
                     f"mitmproxy exited during startup with code {return_code}; "
                     f"see {self._mitm_log_path or 'logs'}"
                 )
-            self.terminate()
+                self._clear_completed_process()
             return False
 
         except FileNotFoundError as exc:
