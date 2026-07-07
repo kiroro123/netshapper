@@ -95,7 +95,7 @@ A typical flow for testing a target device:
 4. SHUTDOWN PHASE
    ├─ Signal all subsystems to halt
    ├─ TargetSession cleanup (remove ARP spoofing, iptables rules)
-   ├─ FirewallManager cleanup (remove global forwarding rules)
+   ├─ FirewallManager cleanup (remove session/target forwarding resources)
    ├─ MitmProxyManager cleanup (terminate mitmproxy)
    ├─ RecoveryManager verifies no stale rules remain
    ├─ Sysctl settings restored to pre-session state
@@ -372,7 +372,9 @@ If any health check fails, it is reported as an error and normal cleanup is trig
 - `fake_server3` is an optional helper for captive-portal and DNS lab scenarios; it is not required for ARP spoofing or traffic shaping
 - Use `--dry-run` extensively before running live sessions
 - Monitor `/var/log/netshaper.log` during and after sessions
-- Firewall rules are tagged with `netshaper:<session-id>:global` for easy identification
+- Forwarding uses a session-specific chain. ACCEPT and IPv4 MASQUERADE rules
+  are tagged and scoped to each active authorized target; IPv6 forwarding is
+  scoped equivalently without adding IPv6 NAT.
 
 ## Troubleshooting
 

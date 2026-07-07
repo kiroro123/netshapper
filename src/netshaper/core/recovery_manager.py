@@ -11,9 +11,14 @@ import logging
 import os
 import re
 import shutil
-from typing import Any, List, Optional
+import tempfile
+from ipaddress import ip_address
+from typing import Any, Callable, List, Mapping, Optional
 
 from netshaper import config
+from netshaper.core.firewall_manager import (
+    FirewallManager as ForwardingFirewallManager,
+)
 from netshaper.core.state_manager import StateSnapshotManager
 from netshaper.system import InspectionStatus, SubprocessRunner, inspect_resource
 from netshaper.exceptions import NetShaperError
@@ -248,7 +253,11 @@ class RecoveryManager:
             log.info(f"[Recovery] Cleaning stale session on {iface}…")
 
             # Clean global rules
-            cleanup_ok = self._cleanup_global_rules(data, iface) and cleanup_ok
+            cleanup_ok = self._cleanup_global_rules(
+                data,
+                iface,
+                journal=lambda: self._write_recovery_state(state_path, data),
+            ) and cleanup_ok
 
             # Clean per-target rules
             cleanup_ok = self._cleanup_target_rules(data, iface) and cleanup_ok
@@ -278,14 +287,56 @@ class RecoveryManager:
 
         return cleanup_ok
 
-    def _cleanup_global_rules(self, data: dict[str, Any], iface: str) -> bool:
-        """Clean global firewall rules from stale session."""
-        cleanup_ok = True
+    @staticmethod
+    def _write_recovery_state(
+        state_path: str,
+        data: dict[str, Any],
+    ) -> bool:
+        """Atomically persist recovery progress before/after mutation."""
+        tmp_path: Optional[str] = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                "w",
+                dir=os.path.dirname(state_path),
+                delete=False,
+                encoding="utf-8",
+            ) as handle:
+                json.dump(data, handle)
+                handle.flush()
+                os.fsync(handle.fileno())
+                tmp_path = handle.name
+            os.replace(tmp_path, state_path)
+            return True
+        except Exception as exc:
+            log.error("[Recovery] Could not persist cleanup intent: %s", exc)
+            if tmp_path is not None:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+            return False
 
-        if not data.get("global_rules_applied"):
+    def _cleanup_global_rules(
+        self,
+        data: dict[str, Any],
+        iface: str,
+        *,
+        journal: Optional[Callable[[], bool]] = None,
+    ) -> bool:
+        """Clean global firewall rules from stale session."""
+        rule_records = data.get("global_rules_created") or []
+        if not isinstance(rule_records, list):
+            log.error("[Recovery] Invalid global firewall resource list")
+            return False
+        if not rule_records and not data.get("global_rules_applied"):
             return True
 
         binaries = data.get("global_firewall_binaries") or []
+        if not isinstance(binaries, list) or not all(
+            isinstance(binary, str) for binary in binaries
+        ):
+            log.error("[Recovery] Invalid global firewall binary list")
+            return False
         if not binaries:
             binaries = [
                 binary
@@ -294,9 +345,30 @@ class RecoveryManager:
             ]
 
         comment = data.get("global_rule_comment")
-        rule_records = data.get("global_rules_created") or []
-
-        if not rule_records:
+        firewall_format = data.get("global_firewall_format")
+        expected_legacy_comment = (
+            f"netshaper:{data.get('session_id')}:global"
+        )
+        if firewall_format == ForwardingFirewallManager.FIREWALL_FORMAT:
+            if not self._validate_scoped_firewall_records(
+                data,
+                iface,
+                rule_records,
+            ):
+                return False
+        elif firewall_format is not None:
+            log.error(
+                "[Recovery] Unsupported global firewall format %r",
+                firewall_format,
+            )
+            return False
+        elif not rule_records:
+            if comment != expected_legacy_comment:
+                log.error(
+                    "[Recovery] Legacy global firewall state lacks exact "
+                    "resource records and a valid ownership comment"
+                )
+                return False
             for binary in binaries:
                 for spec in self._global_firewall_rule_specs(binary, iface, comment):
                     rule_records.append(
@@ -307,8 +379,22 @@ class RecoveryManager:
                             "check": spec["check"],
                         }
                     )
+        elif comment != expected_legacy_comment:
+            log.error("[Recovery] Legacy firewall ownership comment mismatch")
+            return False
+        elif not self._validate_legacy_firewall_records(
+            rule_records,
+            binaries,
+            iface,
+            comment,
+        ):
+            return False
 
-        for record in rule_records:
+        cleanup_ok = True
+        scoped_format = (
+            firewall_format == ForwardingFirewallManager.FIREWALL_FORMAT
+        )
+        for record in reversed(list(rule_records)):
             binary = record.get("binary")
             if not binary or not shutil.which(binary):
                 log.error(
@@ -323,19 +409,219 @@ class RecoveryManager:
                 log.info(
                     f"[Recovery] Skipped {record['description']} (already absent)"
                 )
+                if scoped_format and not self._drop_recovered_record(
+                    rule_records,
+                    record,
+                    journal,
+                ):
+                    cleanup_ok = False
+                    break
             elif status is InspectionStatus.ERROR:
                 cleanup_ok = False
                 log.error(
                     f"[Recovery] Cannot inspect {record['description']}"
                 )
             else:
+                previous_state = record.get("state")
+                if scoped_format:
+                    if journal is None:
+                        log.error(
+                            "[Recovery] No journal available for scoped "
+                            "firewall deletion"
+                        )
+                        cleanup_ok = False
+                        break
+                    record["state"] = "delete_pending"
+                    if not journal():
+                        record["state"] = previous_state
+                        cleanup_ok = False
+                        break
                 if SubprocessRunner.run(record["delete"], check=False, silent=True):
-                    log.info(f"[Recovery] Removed {record['description']}")
+                    verified = self._inspect_stale_resource(record["check"])
+                    if verified is InspectionStatus.ABSENT:
+                        log.info(f"[Recovery] Removed {record['description']}")
+                        if scoped_format and not self._drop_recovered_record(
+                            rule_records,
+                            record,
+                            journal,
+                        ):
+                            cleanup_ok = False
+                            break
+                    else:
+                        cleanup_ok = False
+                        log.error(
+                            "[Recovery] Could not verify removal of %s",
+                            record["description"],
+                        )
                 else:
                     cleanup_ok = False
                     log.error(f"[Recovery] Failed to remove {record['description']}")
 
         return cleanup_ok
+
+    @staticmethod
+    def _drop_recovered_record(
+        records: List[Any],
+        record: dict[str, Any],
+        journal: Optional[Callable[[], bool]],
+    ) -> bool:
+        if journal is None:
+            return False
+        try:
+            index = records.index(record)
+        except ValueError:
+            return True
+        records.pop(index)
+        if journal():
+            return True
+        record["state"] = "delete_pending"
+        records.insert(index, record)
+        return False
+
+    @staticmethod
+    def _record_commands_match(
+        record: Mapping[str, Any],
+        expected: Mapping[str, Any],
+    ) -> bool:
+        return (
+            record.get("resource_id") == expected.get("resource_id")
+            and record.get("kind") == expected.get("kind")
+            and record.get("binary") == expected.get("binary")
+            and record.get("description") == expected.get("description")
+            and record.get("target_ip") == expected.get("target_ip")
+            and record.get("apply") == expected.get("apply")
+            and record.get("check") == expected.get("check")
+            and record.get("delete") == expected.get("delete")
+            and record.get("state") in {"pending", "active", "delete_pending"}
+        )
+
+    @classmethod
+    def _validate_scoped_firewall_records(
+        cls,
+        data: dict[str, Any],
+        iface: str,
+        records: List[Any],
+    ) -> bool:
+        session_id = data.get("session_id")
+        if not isinstance(session_id, str) or not session_id:
+            log.error("[Recovery] Scoped firewall state lacks a session ID")
+            return False
+        try:
+            manager = ForwardingFirewallManager(iface, session_id)
+        except ValueError as exc:
+            log.error("[Recovery] Invalid scoped firewall ownership: %s", exc)
+            return False
+        if data.get("global_forward_chain") != manager._forward_chain():
+            log.error("[Recovery] Scoped forwarding chain ownership mismatch")
+            return False
+
+        seen: set[str] = set()
+        for raw_record in records:
+            if not isinstance(raw_record, dict):
+                log.error("[Recovery] Invalid scoped firewall resource record")
+                return False
+            binary = raw_record.get("binary")
+            target_ip = raw_record.get("target_ip")
+            if binary not in {"iptables", "ip6tables"}:
+                log.error("[Recovery] Invalid scoped firewall binary %r", binary)
+                return False
+            if target_ip is not None and not isinstance(target_ip, str):
+                log.error("[Recovery] Invalid scoped firewall target %r", target_ip)
+                return False
+            if target_ip is not None:
+                try:
+                    parsed_target = ip_address(target_ip)
+                except ValueError:
+                    log.error(
+                        "[Recovery] Invalid scoped firewall target %r",
+                        target_ip,
+                    )
+                    return False
+                expected_binary = (
+                    "ip6tables" if parsed_target.version == 6 else "iptables"
+                )
+                if binary != expected_binary or str(parsed_target) != target_ip:
+                    log.error(
+                        "[Recovery] Scoped firewall target family mismatch"
+                    )
+                    return False
+            try:
+                expected_records = (
+                    manager._shared_resource_specs(binary)
+                    if target_ip is None
+                    else manager._target_resource_specs(binary, target_ip)
+                )
+            except ValueError:
+                log.error("[Recovery] Invalid scoped firewall target %r", target_ip)
+                return False
+            expected = next(
+                (
+                    candidate
+                    for candidate in expected_records
+                    if candidate["resource_id"] == raw_record.get("resource_id")
+                ),
+                None,
+            )
+            if expected is None or not cls._record_commands_match(
+                raw_record,
+                expected,
+            ):
+                log.error("[Recovery] Scoped firewall resource validation failed")
+                return False
+            resource_id = expected["resource_id"]
+            if resource_id in seen:
+                log.error("[Recovery] Duplicate scoped firewall resource record")
+                return False
+            seen.add(resource_id)
+        return True
+
+    @classmethod
+    def _validate_legacy_firewall_records(
+        cls,
+        records: List[Any],
+        binaries: List[str],
+        iface: str,
+        comment: Any,
+    ) -> bool:
+        if not isinstance(comment, str) or not comment.startswith("netshaper:"):
+            log.error("[Recovery] Legacy firewall records lack an ownership comment")
+            return False
+        expected_records = [
+            {
+                "binary": binary,
+                "description": spec["description"],
+                "delete": spec["delete"],
+                "check": spec["check"],
+            }
+            for binary in binaries
+            for spec in cls._global_firewall_rule_specs(binary, iface, comment)
+        ]
+        seen: set[tuple[str, ...]] = set()
+        for record in records:
+            if not isinstance(record, dict):
+                log.error("[Recovery] Invalid legacy firewall resource record")
+                return False
+            matched = any(
+                record.get("binary") == expected["binary"]
+                and record.get("description") == expected["description"]
+                and record.get("delete") == expected["delete"]
+                and record.get("check") == expected["check"]
+                for expected in expected_records
+            )
+            check = record.get("check")
+            if (
+                not matched
+                or not isinstance(check, list)
+                or not all(isinstance(part, str) for part in check)
+            ):
+                log.error("[Recovery] Legacy firewall resource validation failed")
+                return False
+            key = tuple(check)
+            if key in seen:
+                log.error("[Recovery] Duplicate legacy firewall resource record")
+                return False
+            seen.add(key)
+        return True
 
     def _cleanup_target_rules(self, data: dict[str, Any], iface: str) -> bool:
         """Clean per-target firewall rules from stale session."""

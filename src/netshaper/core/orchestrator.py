@@ -79,6 +79,7 @@ class NetShaper:
             interface,
             self.session_id,
             journal=self._sync_firewall_state,
+            target_authorizer=self._assert_authorized_target,
         )
         self.mitm_manager = MitmProxyManager(getattr(self, "own_ip", None))
         self.recovery_manager = RecoveryManager(interface)
@@ -394,6 +395,7 @@ class NetShaper:
             getattr(self, "interface", ""),
             getattr(self, "session_id", ""),
             journal=self._sync_firewall_state,
+            target_authorizer=self._assert_authorized_target,
         )
         if getattr(self, "_global_rules_applied", False):
             manager._global_rules_applied = True
@@ -480,6 +482,8 @@ class NetShaper:
             if target_ip in self.sessions:
                 raise ValueError(f"Target {target_ip} is already active.")
         self._assert_authorized_target(target_ip)
+        if isinstance(target, Device) and target.ipv6:
+            self._assert_authorized_target(target.ipv6)
 
         # Resolve IP -> Device if needed
         if isinstance(target, str):
@@ -517,6 +521,11 @@ class NetShaper:
             )
             self.sessions[target.ip] = session
 
+        forwarding_addresses = [target.ip]
+        if target.ipv6 and target.ipv6 != target.ip:
+            forwarding_addresses.append(target.ipv6)
+        forwarding_manager: Optional[FirewallManager] = None
+
         try:
             session.setup(
                 dns_spoof=dns_spoof,
@@ -526,22 +535,50 @@ class NetShaper:
                 shaping_profile=shaping_profile,
                 mark_base=mark_base,
             )
+            forwarding_manager = self._get_firewall_manager()
+            for address in forwarding_addresses:
+                forwarding_manager.add_target_rules(address)
             session.start_spoof(
                 arp_on=arp_on,
                 interval=arp_interval,
                 burst=arp_burst,
             )
         except Exception as exc:
-            cleanup_ok = False
+            cleanup_ok = True
+            if forwarding_manager is not None:
+                for address in reversed(forwarding_addresses):
+                    try:
+                        cleanup_ok = (
+                            forwarding_manager.remove_target_rules(address)
+                            and cleanup_ok
+                        )
+                    except Exception as cleanup_exc:
+                        log.error(
+                            "Forwarding rollback for %s failed: %s",
+                            address,
+                            cleanup_exc,
+                        )
+                        cleanup_ok = False
             try:
-                cleanup_ok = session.cleanup()
+                cleanup_ok = session.cleanup() and cleanup_ok
             except Exception as cleanup_exc:
                 log.error(f"Rollback cleanup for {target.ip} failed: {cleanup_exc}")
+                cleanup_ok = False
             if cleanup_ok:
                 with self._lifecycle_lock:
                     if self.sessions.get(target.ip) is session:
                         del self.sessions[target.ip]
-                self.mark_pool.release(target.ip)
+                if self._journal_state_if_ready():
+                    self.mark_pool.release(target.ip)
+                else:
+                    with self._lifecycle_lock:
+                        self.sessions[target.ip] = session
+                    cleanup_ok = False
+                    log.error(
+                        "Keeping failed target %s because rollback state "
+                        "could not be persisted",
+                        target.ip,
+                    )
             else:
                 log.error(
                     f"Keeping failed target {target.ip} in recovery state "
@@ -564,14 +601,34 @@ class NetShaper:
                 return True
             session.active = False
             session.is_shutting_down = True
-        # Cleanup outside lock — spoof threads exit naturally via flag check
-        ok = session.cleanup()
+        # Cleanup outside lock — spoof threads exit naturally via flag check.
+        # Remove forwarding first so its incremental journal writes retain the
+        # target firewall chain metadata needed for exact crash recovery.
+        ok = True
+        forwarding_manager = self._get_firewall_manager()
+        forwarding_addresses = [ip]
+        target_ipv6 = getattr(getattr(session, "target", None), "ipv6", None)
+        if isinstance(target_ipv6, str) and target_ipv6 and target_ipv6 != ip:
+            forwarding_addresses.append(target_ipv6)
+        for address in reversed(forwarding_addresses):
+            ok = forwarding_manager.remove_target_rules(address) and ok
+        ok = session.cleanup() and ok
         if ok:
             with self._lifecycle_lock:
                 if self.sessions.get(ip) is session:
                     del self.sessions[ip]
-            self.mark_pool.release(ip)
-            log.info(f"Target {ip} removed")
+            if self._journal_state_if_ready():
+                self.mark_pool.release(ip)
+                log.info(f"Target {ip} removed")
+            else:
+                with self._lifecycle_lock:
+                    self.sessions[ip] = session
+                ok = False
+                log.error(
+                    "Target %s cleanup completed but state removal "
+                    "could not be persisted",
+                    ip,
+                )
         else:
             log.warning(f"Target {ip} removed with cleanup errors")
         return ok
@@ -1084,6 +1141,7 @@ class NetShaper:
         targets = [
             {
                 "ip": s.target.ip,
+                "ipv6": getattr(s.target, "ipv6", None),
                 "dns": self._session_dns_recorded(s),
                 "limit": s.limit,
                 "shaping_profile": (
