@@ -333,7 +333,8 @@ bandit -r src/netshaper/ -ll
 
 Pre-release checklist (before merging to `main`):
 - [ ] All unit tests pass (`pytest tests/`)
-- [ ] Coverage ≥ 80% (`coverage report`)
+- [ ] Coverage meets the 60% package ratchet and 80% security-module gate
+      (`coverage report`)
 - [ ] Type checking passes (`mypy src/netshaper/`)
 - [ ] Style and lint pass (`ruff check`)
 - [ ] Security checks pass (`bandit`)

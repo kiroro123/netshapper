@@ -18,6 +18,7 @@ from netshaper import config
 from netshaper.core.firewall_manager import (
     FirewallManager as ForwardingFirewallManager,
 )
+from netshaper.core.owner import OwnerStatus, owner_status
 from netshaper.core.state_manager import StateSnapshotManager
 from netshaper.system import InspectionStatus, SubprocessRunner, inspect_resource
 from netshaper.exceptions import NetShaperError
@@ -45,26 +46,6 @@ class RecoveryManager:
             interface: Network interface name
         """
         self.interface = interface
-
-    @staticmethod
-    def _process_start_time(pid: int) -> Optional[str]:
-        """Get process start time from /proc/pid/stat."""
-        try:
-            with open(f"/proc/{pid}/stat", encoding="utf-8") as fh:
-                return fh.read().split()[21]
-        except Exception:
-            return None
-
-    @staticmethod
-    def _process_is_live(
-        pid: Optional[int],
-        start_time: Optional[str],
-    ) -> bool:
-        """Check if a process is still running with the same start time."""
-        if not pid or not start_time:
-            return False
-        current_start = RecoveryManager._process_start_time(pid)
-        return current_start == str(start_time)
 
     @staticmethod
     def _inspect_stale_resource(
@@ -243,10 +224,16 @@ class RecoveryManager:
                 return True
 
             owner = data.get("owner") or {}
-            if self._process_is_live(
-                owner.get("pid"), owner.get("process_start_time")
-            ):
+            status = owner_status(owner)
+            if status is OwnerStatus.LIVE:
                 log.info(f"Skipping live NetShaper session: {state_path}")
+                return False
+            if status is OwnerStatus.UNKNOWN:
+                log.error(
+                    "[Recovery] Could not verify session owner for %s; "
+                    "leaving manifest in place",
+                    state_path,
+                )
                 return False
 
             log.info(f"[Recovery] Cleaning stale session on {iface}…")

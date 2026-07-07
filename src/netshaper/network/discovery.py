@@ -11,7 +11,14 @@ import subprocess  # nosec B404
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from ipaddress import IPv4Address, IPv4Network, ip_address, summarize_address_range
+from ipaddress import (
+    IPv4Address,
+    IPv4Network,
+    IPv6Network,
+    ip_address,
+    ip_network,
+    summarize_address_range,
+)
 from typing import Dict, List, Optional, Sequence
 
 import psutil
@@ -110,6 +117,21 @@ class NetworkDiscovery:
                 except ValueError:
                     pass
         return None
+
+    def get_connected_networks(self) -> tuple[IPv4Network | IPv6Network, ...]:
+        """Return interface networks derived from local addresses and netmasks."""
+        networks: list[IPv4Network | IPv6Network] = []
+        for a in psutil.net_if_addrs().get(self.interface, []):
+            if a.family not in (socket.AF_INET, socket.AF_INET6) or not a.netmask:
+                continue
+            address = a.address.split("%", 1)[0]
+            try:
+                network = ip_network(f"{address}/{a.netmask}", strict=False)
+            except ValueError:
+                continue
+            if isinstance(network, (IPv4Network, IPv6Network)):
+                networks.append(network)
+        return tuple(networks)
 
     def get_default_gateway(self) -> Optional[str]:
         try:

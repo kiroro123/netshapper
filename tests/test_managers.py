@@ -1,11 +1,15 @@
+import json
+import os
 import tempfile
 import unittest
+from ipaddress import IPv4Network
 from unittest import mock
 
 from netshaper import config
 from netshaper.core.authorization import AuthorizationError, AuthorizationPolicy
 from netshaper.core.firewall_manager import FirewallManager
 from netshaper.core.mitm_manager import MitmProxyManager
+from netshaper.core.owner import OwnerStatus
 from netshaper.core.recovery_manager import RecoveryManager
 from netshaper.system import InspectionStatus
 
@@ -19,6 +23,26 @@ class ManagerTests(unittest.TestCase):
         policy = AuthorizationPolicy(["10.0.0.0/8"])
         with self.assertRaises(AuthorizationError):
             policy.assert_target_authorized("192.0.2.1")
+
+    def test_authorization_rejects_connected_network_boundaries(self):
+        policy = AuthorizationPolicy(["10.0.0.0/8"])
+        connected = [IPv4Network("10.1.1.0/24")]
+
+        with self.assertRaisesRegex(AuthorizationError, "network/broadcast"):
+            policy.assert_target_authorized(
+                "10.1.1.0",
+                connected_networks=connected,
+            )
+        with self.assertRaisesRegex(AuthorizationError, "network/broadcast"):
+            policy.assert_target_authorized(
+                "10.1.1.255",
+                connected_networks=connected,
+            )
+
+        policy.assert_target_authorized(
+            "10.1.1.254",
+            connected_networks=connected,
+        )
 
     def test_firewall_manager_state_and_remove(self):
         manager = FirewallManager("lo", "TEST")
@@ -37,6 +61,28 @@ class ManagerTests(unittest.TestCase):
             with mock.patch.object(config, "STATE_DIR", missing):
                 manager = RecoveryManager("lo")
                 self.assertTrue(manager.recover_stale_state())
+
+    def test_recovery_unknown_owner_leaves_manifest(self):
+        state = {
+            "interface": "eth0",
+            "owner": {"pid": 1234, "process_start_time": "legacy"},
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = f"{tmp}/state.json"
+            with open(state_path, "w", encoding="utf-8") as handle:
+                json.dump(state, handle)
+
+            with mock.patch(
+                "netshaper.core.recovery_manager.owner_status",
+                return_value=OwnerStatus.UNKNOWN,
+            ):
+                result = RecoveryManager("eth0")._cleanup_stale_session(
+                    state_path
+                )
+
+            self.assertFalse(result)
+            self.assertTrue(os.path.exists(state_path))
 
     def test_recovery_fails_when_recorded_global_binary_is_missing(self):
         manager = RecoveryManager("eth0")

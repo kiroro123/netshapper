@@ -9,12 +9,20 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 import logging
-from ipaddress import IPv4Network, IPv6Network, ip_address, ip_network
+from ipaddress import (
+    IPv4Address,
+    IPv4Network,
+    IPv6Address,
+    IPv6Network,
+    ip_address,
+    ip_network,
+)
 from netshaper.exceptions import NetShaperError
 from typing import Optional, cast
 
 log = logging.getLogger("netshaper")
 Network = IPv4Network | IPv6Network
+IPAddress = IPv4Address | IPv6Address
 
 
 class AuthorizationError(NetShaperError):
@@ -82,6 +90,7 @@ class AuthorizationPolicy:
         own_ipv6: Optional[str] = None,
         gateway: Optional[str] = None,
         gateway_ipv6: Optional[str] = None,
+        connected_networks: Sequence[object] = (),
     ) -> None:
         """
         Validate that target IP is authorized and not reserved.
@@ -89,6 +98,8 @@ class AuthorizationPolicy:
         Args:
             raw_ip: IP address to validate
             own_ip, own_ipv6, gateway, gateway_ipv6: Local addresses to reject
+            connected_networks: Interface networks whose reserved boundary
+                addresses must never be accepted as targets
 
         Raises:
             AuthorizationError: If IP is not authorized or is reserved
@@ -123,8 +134,38 @@ class AuthorizationPolicy:
                 f"target {parsed} is outside authorized CIDR allowlist"
             )
 
-        # Reject network/broadcast addresses
-        for network in self._authorized_cidrs:
+        self._reject_network_boundary(parsed, self._authorized_cidrs)
+        self._reject_network_boundary(
+            parsed,
+            self._normalize_networks(connected_networks),
+        )
+
+    @staticmethod
+    def _normalize_networks(raw_networks: Sequence[object]) -> tuple[Network, ...]:
+        networks: list[Network] = []
+        for raw_network in raw_networks or ():
+            try:
+                if isinstance(raw_network, str):
+                    network = ip_network(raw_network, strict=False)
+                elif (
+                    hasattr(raw_network, "version")
+                    and hasattr(raw_network, "network_address")
+                    and hasattr(raw_network, "prefixlen")
+                ):
+                    network = cast(Network, raw_network)
+                else:
+                    continue
+            except ValueError:
+                continue
+            networks.append(cast(Network, network))
+        return tuple(networks)
+
+    @staticmethod
+    def _reject_network_boundary(
+        parsed: IPAddress,
+        networks: Sequence[Network],
+    ) -> None:
+        for network in networks:
             if parsed.version != network.version or parsed not in network:
                 continue
             if parsed == network.network_address and network.prefixlen < (
