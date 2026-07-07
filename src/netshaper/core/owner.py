@@ -36,6 +36,8 @@ def _expected_create_time(owner: Mapping[str, object]) -> Optional[float]:
     raw_value = owner.get("process_create_time")
     if raw_value is None:
         return None
+    if not isinstance(raw_value, (int, float, str)):
+        return None
     try:
         return float(raw_value)
     except (TypeError, ValueError):
@@ -50,8 +52,13 @@ def owner_status(owner: Mapping[str, object] | None) -> OwnerStatus:
     create-time metadata for an existing process is ambiguous and fails closed.
     """
     owner = owner or {}
+    raw_pid = owner.get("pid", 0)
+    if raw_pid is None:
+        raw_pid = 0
+    if not isinstance(raw_pid, (int, str)):
+        return OwnerStatus.UNKNOWN
     try:
-        pid = int(owner.get("pid") or 0)
+        pid = int(raw_pid)
     except (TypeError, ValueError):
         return OwnerStatus.UNKNOWN
     if pid <= 0:

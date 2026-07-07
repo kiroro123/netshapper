@@ -32,6 +32,39 @@ class ConfigLoggingTests(unittest.TestCase):
             self.assertEqual(handler.backupCount, config.LOG_BACKUP_COUNT)
             handler.close()
 
+    def test_secure_log_handler_rejects_symlink_log_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = os.path.join(tmp, "target.log")
+            log_file = os.path.join(tmp, "netshaper.log")
+            with open(target, "w", encoding="utf-8"):
+                pass
+            os.symlink(target, log_file)
+
+            handler = config._secure_log_handler(log_file)
+
+            self.assertIsNone(handler)
+
+    def test_root_logging_rejects_non_root_owned_parent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            original_lstat = os.lstat
+            untrusted = os.path.abspath(tmp)
+
+            def fake_lstat(path):
+                result = original_lstat(path)
+                if os.path.abspath(os.fspath(path)) == untrusted:
+                    values = list(result)
+                    values[4] = 1234
+                    return os.stat_result(values)
+                return result
+
+            with mock.patch("netshaper.config.os.geteuid", return_value=0), \
+                 mock.patch("netshaper.config.os.lstat", side_effect=fake_lstat):
+                handler = config._secure_log_handler(
+                    os.path.join(tmp, "netshaper.log")
+                )
+
+            self.assertIsNone(handler)
+
     def test_configure_logging_uses_environment_overrides(self):
         root_logger = mock.Mock()
         root_logger.handlers = []

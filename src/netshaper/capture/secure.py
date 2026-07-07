@@ -61,6 +61,10 @@ class SecureCaptureDirectory:
     def _verify_parent(metadata: os.stat_result, path: Path) -> None:
         if stat.S_ISLNK(metadata.st_mode):
             raise CapturePathError("capture directory and parents must not be symlinks")
+        if os.geteuid() == 0 and metadata.st_uid != 0:
+            raise CapturePathError(
+                f"capture directory parent is not owned by root: {path}"
+            )
         if (
             metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
             and not metadata.st_mode & stat.S_ISVTX

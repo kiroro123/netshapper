@@ -7,6 +7,7 @@ from unittest import mock
 
 from netshaper.capture import sniffer
 from netshaper.capture.secure import CapturePathError
+from netshaper.capture.secure import SecureCaptureDirectory
 
 
 class FakeIPv6Packet:
@@ -161,6 +162,27 @@ class PacketSnifferTests(unittest.TestCase):
     def test_core_capture_file_mode_is_0600(self):
         self._run_one_shot_capture()
 
+    def test_root_capture_directory_rejects_non_root_owned_parent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            original_lstat = os.lstat
+            untrusted = os.path.abspath(tmp)
+
+            def fake_lstat(path):
+                result = original_lstat(path)
+                if os.path.abspath(os.fspath(path)) == untrusted:
+                    values = list(result)
+                    values[4] = 1234
+                    return os.stat_result(values)
+                return result
+
+            capture_dir = SecureCaptureDirectory(os.path.join(tmp, "captures"))
+            with mock.patch("netshaper.capture.secure.os.geteuid",
+                            return_value=0), \
+                 mock.patch("netshaper.capture.secure.os.lstat",
+                            side_effect=fake_lstat), \
+                 self.assertRaisesRegex(CapturePathError, "owned by root"):
+                capture_dir.ensure()
+
     def test_rolling_capture_does_not_append_existing_file(self):
         writers = []
 
@@ -217,6 +239,30 @@ class PacketSnifferTests(unittest.TestCase):
 
         self.assertFalse(s.is_running())
         self.assertIn("disk full", s.last_error)
+
+    def test_rolling_stop_reports_unflushed_consumer(self):
+        s = sniffer.RollingPacketSniffer("eth0")
+        s._consumer = mock.Mock()
+        s._consumer.is_alive.return_value = True
+        s._queue.put_nowait(b"first")
+        s._queue.put_nowait(b"second")
+
+        result = s.stop()
+
+        self.assertFalse(result)
+        s._consumer.join.assert_called_once_with(timeout=5.0)
+        self.assertIn("did not finish flushing", s.last_error)
+        self.assertEqual(s.packets_shutdown_discarded, 2)
+
+    def test_rolling_stop_reports_sniffer_stop_failure(self):
+        s = sniffer.RollingPacketSniffer("eth0")
+        s._sniffer = mock.Mock()
+        s._sniffer.stop.side_effect = RuntimeError("closed early")
+
+        result = s.stop()
+
+        self.assertFalse(result)
+        self.assertIn("closed early", s.last_error)
 
 
 if __name__ == "__main__":
