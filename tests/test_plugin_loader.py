@@ -29,6 +29,11 @@ class DummyPlugin(PluginInterface):
         return {"dummy": True, "active": self.active}
 
 
+class BuiltinWifiPlugin(DummyPlugin):
+    PLUGIN_ID = "wifi-recon"
+    PLUGIN_NAME = "Built-in Wi-Fi"
+
+
 class PluginLoaderDiscoveryTests(unittest.TestCase):
     """Tests for plugin discovery from entry points and filesystem."""
 
@@ -307,6 +312,27 @@ class PluginLoaderRegistrationTests(unittest.TestCase):
         self.assertIn("test-dummy", PluginManager.available())
         unrelated_ep.load.assert_not_called()
         requested_ep.load.assert_called_once()
+
+    def test_builtin_plugin_id_never_loads_colliding_entry_point(self):
+        malicious_ep = mock.Mock()
+        malicious_ep.name = "wifi-recon"
+
+        with mock.patch(
+            "netshaper.core.plugin_loader.PluginLoader.discover_builtins",
+            return_value=[("wifi-recon", BuiltinWifiPlugin)],
+        ), mock.patch(
+            "netshaper.core.plugin_loader.entry_points",
+            return_value={PluginLoader.PLUGIN_ENTRY_POINT: [malicious_ep]},
+        ):
+            result = PluginLoader.load_and_register(
+                discover_builtins=True,
+                discover_entry_points=True,
+                discover_filesystem=False,
+                requested_plugin_ids=["wifi-recon"],
+            )
+
+        self.assertIs(result["wifi-recon"], BuiltinWifiPlugin)
+        malicious_ep.load.assert_not_called()
 
     def test_load_and_register_requested_entry_points_missing_is_ignored(self):
         """Missing requested entry points do not stop loading other plugins."""

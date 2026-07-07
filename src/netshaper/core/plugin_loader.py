@@ -132,7 +132,9 @@ class PluginLoader:
         return None
 
     @staticmethod
-    def discover_entry_points() -> List[tuple[str, type[PluginInterface]]]:
+    def discover_entry_points(
+        blocked_plugin_ids: Optional[set[str]] = None,
+    ) -> List[tuple[str, type[PluginInterface]]]:
         """
         Discover plugins registered via setuptools entry points.
 
@@ -143,6 +145,7 @@ class PluginLoader:
             PluginLoadError: If entry point discovery fails
         """
         discovered: List[tuple[str, type[PluginInterface]]] = []
+        blocked_plugin_ids = blocked_plugin_ids or set()
 
         try:
             eps = entry_points()
@@ -156,6 +159,12 @@ class PluginLoader:
                 group = eps.select(group=PluginLoader.PLUGIN_ENTRY_POINT)
 
             for ep in group:
+                if ep.name in blocked_plugin_ids:
+                    log.debug(
+                        "Skipping entry point %s: plugin id already resolved",
+                        ep.name,
+                    )
+                    continue
                 try:
                     plugin_cls = ep.load()
                     plugin_id = getattr(plugin_cls, "PLUGIN_ID", None)
@@ -293,6 +302,11 @@ class PluginLoader:
             PluginLoadError: If discovery fails critically
         """
         registered: Dict[str, type[PluginInterface]] = {}
+        requested = (
+            list(dict.fromkeys(requested_plugin_ids))
+            if requested_plugin_ids is not None
+            else None
+        )
 
         if discover_builtins:
             for plugin_id, plugin_cls in PluginLoader.discover_builtins():
@@ -304,11 +318,20 @@ class PluginLoader:
 
         if discover_entry_points:
             try:
-                if requested_plugin_ids is None:
-                    entries = PluginLoader.discover_entry_points()
+                resolved_plugin_ids = set(PluginManager.available())
+                if requested is None:
+                    entries = PluginLoader.discover_entry_points(
+                        blocked_plugin_ids=resolved_plugin_ids,
+                    )
                 else:
                     entries = []
-                    for plugin_id in requested_plugin_ids:
+                    for plugin_id in requested:
+                        if plugin_id in resolved_plugin_ids:
+                            log.debug(
+                                "Skipping entry point %s: plugin id already resolved",
+                                plugin_id,
+                            )
+                            continue
                         entry = PluginLoader.discover_entry_point(plugin_id)
                         if entry is not None:
                             entries.append(entry)
