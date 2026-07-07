@@ -94,6 +94,12 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--max-discovery-hosts",
+        type=int,
+        default=4096,
+        help="Maximum authorized IPv4 hosts to actively probe during discovery.",
+    )
+    parser.add_argument(
         "--limit",
         type=float,
         help="Set bandwidth throttling in Mbps without using the interactive prompt.",
@@ -149,6 +155,11 @@ def parse_args() -> argparse.Namespace:
         "--hsts-bypass",
         action="store_true",
         help="Enable HSTS bypass and IDN homograph injection demo.",
+    )
+    parser.add_argument(
+        "--packet-verbose",
+        action="store_true",
+        help="Print per-packet sniffer lines while capturing.",
     )
     parser.add_argument(
         "--latency-ms",
@@ -218,6 +229,8 @@ def parse_args() -> argparse.Namespace:
         ]
     if args.limit is not None and not 0.1 <= args.limit <= 1000:
         parser.error("--limit must be between 0.1 and 1000 Mbps")
+    if not 1 <= args.max_discovery_hosts <= 65536:
+        parser.error("--max-discovery-hosts must be between 1 and 65536")
     try:
         validate_spoof_timing(args.arp_interval, args.arp_burst)
     except ValueError as exc:
@@ -538,6 +551,7 @@ def run_active_session(
     sniff_on: bool,
     save_pcap: bool,
     rolling: bool,
+    packet_verbose: bool = False,
     shaping_profile: Optional[ShapingProfile] = None,
     arp_interval: float = 2.0,
     arp_burst: int = 1,
@@ -574,6 +588,7 @@ def run_active_session(
                 target_ips=target_ips,
                 save_pcap=save_pcap,
                 rolling=rolling,
+                packet_verbose=packet_verbose,
             )
 
         if exploit.arp_amplification_enabled:
@@ -736,7 +751,7 @@ def main() -> None:
                 sys.exit(f"[NetShaper] {exc}")
             print_flush(f"  Targets from --targets: {', '.join(targets)}")
         else:
-            devices = ns.discover()
+            devices = ns.discover(max_discovery_hosts=args.max_discovery_hosts)
             selected_targets = pick_targets_ui(devices)
             try:
                 targets = validate_targets(
@@ -844,7 +859,7 @@ def main() -> None:
                     safe_input("  Use rolling 50 MB files? (y/n): ").lower() == "y"
                 )
 
-        if dns_spoof_on and not check_local_port(ns.own_ip, 53, socket.SOCK_DGRAM):
+        if dns_spoof_on and not ns.fake_server_ready():
             print_flush("  [!] Fake DNS (port 53) not reachable.")
             print_flush(
                 "      "
@@ -869,7 +884,7 @@ def main() -> None:
             else:
                 sys.exit("[NetShaper] DNS spoofing requires reachable fake DNS.")
 
-        if http_redirect_port == 80 and not check_local_port(ns.own_ip, 80):
+        if http_redirect_port == 80 and not ns.fake_server_ready():
             print_flush("  [!] Fake HTTP (port 80) not reachable.")
             print_flush(
                 "      "
@@ -893,9 +908,7 @@ def main() -> None:
                     sys.exit("[NetShaper] Captive portal requires reachable fake HTTP.")
             else:
                 sys.exit("[NetShaper] Captive portal requires reachable fake HTTP.")
-        elif exploit.fake_server_web_security_demo and not check_local_port(
-            ns.own_ip, 80
-        ):
+        elif exploit.fake_server_web_security_demo and not ns.fake_server_ready():
             print_flush("  [!] HSTS demo HTTP service (port 80) not reachable.")
             print_flush(
                 "      "
@@ -920,8 +933,13 @@ def main() -> None:
             else:
                 sys.exit("[NetShaper] HSTS demo requires reachable fake HTTP.")
 
-        if http_redirect_port == 8088 and not check_local_port(ns.own_ip, 8088):
-            print_flush("  [!] mitmproxy (port 8088) not reachable.")
+        if http_redirect_port == 8088:
+            if check_local_port(ns.own_ip, 8088):
+                sys.exit(
+                    "[NetShaper] Port 8088 is already in use by an "
+                    "unverified listener."
+                )
+            print_flush("  [!] mitmproxy (port 8088) not running.")
             if safe_input("  Auto-launch mitmproxy? (y/n): ").lower() == "y":
                 if not ns.launch_mitmproxy(port=8088, web_port=8083):
                     sys.exit("[NetShaper] mitmproxy did not become reachable.")
@@ -1008,6 +1026,7 @@ def main() -> None:
                 sniff_on=sniff_on,
                 save_pcap=save_pcap,
                 rolling=rolling,
+                packet_verbose=args.packet_verbose,
                 shaping_profile=shaping_profile,
                 arp_interval=args.arp_interval,
                 arp_burst=args.arp_burst,

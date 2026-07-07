@@ -282,12 +282,17 @@ class NetShaperCleanupTests(unittest.TestCase):
         self._set_authorized(ns)
         ns.own_ip = "192.0.2.1"
         ns._fake_server_proc = None
+        ns._fake_server_health_token = "test-health-token"
         process = mock.Mock()
         process.poll.return_value = None
 
         with mock.patch(
             "netshaper.core.orchestrator.check_local_port",
-            side_effect=[False, False, True, False],
+            side_effect=[False, False],
+        ), mock.patch.object(
+            ns,
+            "_fake_server_health_ready",
+            side_effect=[False, True],
         ), mock.patch(
             "netshaper.core.orchestrator.subprocess.Popen",
             return_value=process,
@@ -304,6 +309,8 @@ class NetShaperCleanupTests(unittest.TestCase):
         self.assertIn("nxdomain", command)
         self.assertIn("192.0.2.0/24", command)
         self.assertIn("192.0.2.1/32", command)
+        self.assertIn("--health-token", command)
+        self.assertIn("test-health-token", command)
 
     def test_dry_run_discover_does_not_touch_network(self):
         ns = NetShaper.__new__(NetShaper)
@@ -402,8 +409,8 @@ class NetShaperCleanupTests(unittest.TestCase):
             result = ns.launch_mitmproxy()
 
         self.assertFalse(result)
-        proc.terminate.assert_called_once()
-        proc.wait.assert_called_once_with(timeout=5)
+        proc.terminate.assert_not_called()
+        proc.wait.assert_not_called()
         self.assertIsNone(ns.mitm_manager._mitm_proc)
         self.assertIsNone(ns.mitm_manager._mitm_log_handle)
         self.assertTrue(ns._mitm_log_path.endswith("mitmproxy.log"))
@@ -581,6 +588,13 @@ class NetShaperCleanupTests(unittest.TestCase):
             "targets": [],
             "global_rules_applied": False,
             "shaper_base_initialized": True,
+            "shaper_root_qdisc": {
+                "format": "netshaper.tc-root.v1",
+                "interface": "eth0",
+                "session_id": "NS-OLD",
+                "handle": "7abc:",
+                "state": "active",
+            },
             "snapshot": snapshot,
         }
 
@@ -596,7 +610,7 @@ class NetShaperCleanupTests(unittest.TestCase):
                  mock.patch("netshaper.system.subprocess.run",
                             return_value=mock.Mock(
                                 returncode=0,
-                                stdout="qdisc htb 1: root refcnt 2\n",
+                                stdout="qdisc htb 7abc: root refcnt 2\n",
                             )), \
                  mock.patch("netshaper.core.recovery_manager.shutil.which",
                             return_value="/sbin/tool"), \
@@ -636,6 +650,13 @@ class NetShaperCleanupTests(unittest.TestCase):
             "global_rules_applied": False,
             "shaper_base_initialized": False,
             "shaper_root_qdisc_pending": True,
+            "shaper_root_qdisc": {
+                "format": "netshaper.tc-root.v1",
+                "interface": "eth0",
+                "session_id": "NS-OLD",
+                "handle": "7abd:",
+                "state": "pending",
+            },
             "snapshot": snapshot,
         }
 
@@ -651,7 +672,7 @@ class NetShaperCleanupTests(unittest.TestCase):
                  mock.patch("netshaper.system.subprocess.run",
                             return_value=mock.Mock(
                                 returncode=0,
-                                stdout="qdisc htb 1: root refcnt 2\n",
+                                stdout="qdisc htb 7abd: root refcnt 2\n",
                             )), \
                  mock.patch("netshaper.core.recovery_manager.shutil.which",
                             return_value="/sbin/tool"), \
@@ -668,6 +689,60 @@ class NetShaperCleanupTests(unittest.TestCase):
                 silent=True,
             )
             self.assertFalse(os.path.exists(state_path))
+
+    def test_stale_cleanup_preserves_mismatched_tc_root_qdisc(self):
+        ns = NetShaper.__new__(NetShaper)
+        snapshot = {
+            "session_id": "NS-OLD",
+            "interface": "eth0",
+            "ipv4_forwarding": None,
+            "ipv6_forwarding": None,
+            "route_localnet": None,
+            "iptables_rules": "",
+            "ip6tables_rules": "",
+            "tc_configuration": "",
+        }
+        state = {
+            "session_id": "NS-OLD",
+            "interface": "eth0",
+            "targets": [],
+            "global_rules_applied": False,
+            "shaper_base_initialized": True,
+            "shaper_root_qdisc": {
+                "format": "netshaper.tc-root.v1",
+                "interface": "eth0",
+                "session_id": "NS-OLD",
+                "handle": "7abe:",
+                "state": "active",
+            },
+            "snapshot": snapshot,
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = os.path.join(tmp, "NS-OLD")
+            os.makedirs(state_dir)
+            state_path = os.path.join(state_dir, "state.json")
+            with open(state_path, "w", encoding="utf-8") as fh:
+                json.dump(state, fh)
+
+            with mock.patch("netshaper.core.orchestrator.config.STATE_DIR", tmp), \
+                 mock.patch("netshaper.core.orchestrator.print_flush"), \
+                 mock.patch("netshaper.system.subprocess.run",
+                            return_value=mock.Mock(
+                                returncode=0,
+                                stdout="qdisc htb 9000: root refcnt 2\n",
+                            )), \
+                 mock.patch("netshaper.core.recovery_manager.shutil.which",
+                            return_value="/sbin/tool"), \
+                 mock.patch("netshaper.core.recovery_manager.SubprocessRunner.run",
+                            return_value=True) as runner_mock, \
+                 mock.patch("netshaper.core.orchestrator.StateSnapshotManager.restore",
+                            return_value=True):
+                result = ns.load_state_and_cleanup()
+
+            self.assertFalse(result)
+            runner_mock.assert_not_called()
+            self.assertTrue(os.path.exists(state_path))
 
     def test_stale_cleanup_removes_only_commented_global_rules(self):
         ns = NetShaper.__new__(NetShaper)

@@ -17,6 +17,7 @@ NetShaper packaged fake server
 
 import argparse
 import errno
+import hmac
 import html
 import os
 import pwd
@@ -93,6 +94,7 @@ DNS_SMART_SPOOF_ALL = os.environ.get("DNS_SMART_SPOOF_ALL", "").lower() in (
 DNS_VERBOSE = os.environ.get("DNS_VERBOSE", "").lower() in ("1", "true", "yes")
 DNS_MAX_WORKERS = int(os.environ.get("DNS_MAX_WORKERS", "16"))
 SERVE_CA_CERT = os.environ.get("SERVE_CA_CERT", "").lower() in ("1", "true", "yes")
+HEALTH_TOKEN = os.environ.get("NETSHAPER_HEALTH_TOKEN", "")
 DNS_SUPPRESS_DNSSEC = os.environ.get("DNS_SUPPRESS_DNSSEC", "").lower() in (
     "1",
     "true",
@@ -701,6 +703,11 @@ def parse_args():
         help="IPv4 address to return for spoofed DNS. Defaults to auto-detect.",
     )
     parser.add_argument(
+        "--health-token",
+        default=HEALTH_TOKEN,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
         "--verbose-dns",
         action="store_true",
         help="Print every DNS question, including forwarded domains.",
@@ -761,6 +768,7 @@ def configure_dns(args) -> None:
     global DNS_SPOOF_ALL, DNS_SMART_SPOOF_ALL, DNS_SPOOF_DOMAINS
     global DNS_FORWARD_DOMAINS, DNS_BLOCK_DOMAINS, DNS_FORWARD_CATEGORIES
     global DNS_UPSTREAM, DNS_VERBOSE, DNS_MAX_WORKERS, SERVE_CA_CERT
+    global HEALTH_TOKEN
     global DNS_SUPPRESS_DNSSEC, DNSSEC_MODE, DNS_ALLOWED_NETWORKS
     global WEB_SECURITY_DEMO, IDN_DEMO_DOMAINS
     DNS_SPOOF_ALL = DNS_SPOOF_ALL or args.spoof_all
@@ -769,6 +777,7 @@ def configure_dns(args) -> None:
     DNS_UPSTREAM = args.upstream
     DNS_MAX_WORKERS = max(1, min(args.dns_workers, 128))
     SERVE_CA_CERT = SERVE_CA_CERT or args.serve_ca_cert
+    HEALTH_TOKEN = getattr(args, "health_token", "") or HEALTH_TOKEN
     requested_dnssec_mode = getattr(args, "dnssec_mode", "off")
     if requested_dnssec_mode != "off":
         DNSSEC_MODE = requested_dnssec_mode
@@ -1035,6 +1044,27 @@ class CaptivePortalHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         client = self.client_address[0]
         path = self.path
+
+        if path == "/_netshaper/health":
+            supplied = self.headers.get("X-NetShaper-Session", "")
+            if HEALTH_TOKEN and hmac.compare_digest(supplied, HEALTH_TOKEN):
+                content = HEALTH_TOKEN.encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain")
+                self.send_header("Content-Length", str(len(content)))
+                self.send_header("X-NetShaper-Session", HEALTH_TOKEN)
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(content)
+                return
+            msg = b"Not found."
+            self.send_response(404)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(msg)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(msg)
+            return
 
         # 1. Static HSTS/IDN training page (no forms or credential capture)
         if path == "/training/web-security":

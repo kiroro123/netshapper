@@ -26,8 +26,15 @@ class FakeSocket:
         self.writer.write(data)
 
 
-def handle_http_request(path: str) -> bytes:
-    request = f"GET {path} HTTP/1.1\r\nHost: portal.test\r\n\r\n".encode()
+def handle_http_request(path: str, headers: dict[str, str] | None = None) -> bytes:
+    header_lines = "".join(
+        f"{name}: {value}\r\n" for name, value in (headers or {}).items()
+    )
+    request = (
+        f"GET {path} HTTP/1.1\r\n"
+        f"Host: portal.test\r\n"
+        f"{header_lines}\r\n"
+    ).encode()
     sock = FakeSocket(request)
     fake_server3.CaptivePortalHandler(sock, ("192.0.2.55", 54321), mock.Mock())
     return sock.writer.getvalue()
@@ -188,6 +195,33 @@ class CertificateHandlerTests(unittest.TestCase):
         load_cert_mock.assert_not_called()
         self.assertIn(b"HTTP/1.0 404 Not Found", response)
         self.assertIn(b"CA certificate serving is disabled", response)
+
+
+class HealthHandlerTests(unittest.TestCase):
+    def setUp(self):
+        self.original_health_token = fake_server3.HEALTH_TOKEN
+
+    def tearDown(self):
+        fake_server3.HEALTH_TOKEN = self.original_health_token
+
+    def test_health_endpoint_requires_session_token(self):
+        fake_server3.HEALTH_TOKEN = "session-secret"
+
+        response = handle_http_request("/_netshaper/health")
+
+        self.assertIn(b"HTTP/1.0 404 Not Found", response)
+
+    def test_health_endpoint_echoes_valid_session_token(self):
+        fake_server3.HEALTH_TOKEN = "session-secret"
+
+        response = handle_http_request(
+            "/_netshaper/health",
+            {"X-NetShaper-Session": "session-secret"},
+        )
+
+        self.assertIn(b"HTTP/1.0 200 OK", response)
+        self.assertIn(b"X-NetShaper-Session: session-secret", response)
+        self.assertTrue(response.endswith(b"\r\n\r\nsession-secret"))
 
 
 class WebSecurityDemoTests(unittest.TestCase):

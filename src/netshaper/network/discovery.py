@@ -19,7 +19,7 @@ from ipaddress import (
     ip_network,
     summarize_address_range,
 )
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, Iterator, List, Optional, Sequence
 
 import psutil
 
@@ -39,6 +39,7 @@ LEASE_FILE_PATTERNS = (
 ARP_BATCH_SIZE = 64
 ARP_SEND_INTERVAL = 0.006
 ARP_BATCH_TIMEOUTS = (0.35, 0.45)
+MAX_DISCOVERY_HOSTS = 4096
 
 ARP = None
 Ether = None
@@ -209,6 +210,43 @@ class NetworkDiscovery:
         ]
 
     @staticmethod
+    def _iter_targets_from_scopes(
+            scope_networks: Sequence[IPv4Network],
+            gateway_ip: Optional[str],
+            max_hosts: int = MAX_DISCOVERY_HOSTS) -> Iterator[str]:
+        seen = set()
+        yielded = 0
+        for network in scope_networks:
+            for ip in network.hosts():
+                candidate = str(ip)
+                if candidate == gateway_ip or candidate in seen:
+                    continue
+                seen.add(candidate)
+                yield candidate
+                yielded += 1
+                if yielded >= max_hosts:
+                    return
+
+    @classmethod
+    def _target_batches_from_scopes(
+            cls,
+            scope_networks: Sequence[IPv4Network],
+            gateway_ip: Optional[str],
+            batch_size: int = ARP_BATCH_SIZE,
+            max_hosts: int = MAX_DISCOVERY_HOSTS) -> Iterator[List[str]]:
+        batch: List[str] = []
+        for target in cls._iter_targets_from_scopes(
+                scope_networks,
+                gateway_ip,
+                max_hosts=max_hosts):
+            batch.append(target)
+            if len(batch) >= batch_size:
+                yield batch
+                batch = []
+        if batch:
+            yield batch
+
+    @staticmethod
     def _ipv4_scope_networks(
             connected_subnet: IPv4Network,
             authorized_cidrs: Optional[Sequence]) -> List[IPv4Network]:
@@ -248,17 +286,13 @@ class NetworkDiscovery:
     @staticmethod
     def _targets_from_scopes(
             scope_networks: Sequence[IPv4Network],
-            gateway_ip: Optional[str]) -> List[str]:
-        targets: List[str] = []
-        seen = set()
-        for network in scope_networks:
-            for ip in network.hosts():
-                candidate = str(ip)
-                if candidate == gateway_ip or candidate in seen:
-                    continue
-                seen.add(candidate)
-                targets.append(candidate)
-        return targets
+            gateway_ip: Optional[str],
+            max_hosts: int = MAX_DISCOVERY_HOSTS) -> List[str]:
+        return list(NetworkDiscovery._iter_targets_from_scopes(
+            scope_networks,
+            gateway_ip,
+            max_hosts=max_hosts,
+        ))
 
     @staticmethod
     def _ip_in_scopes(ip: str, scope_networks: Sequence[IPv4Network]) -> bool:
@@ -393,17 +427,29 @@ class NetworkDiscovery:
             self,
             subnet: str,
             gateway_ip: str,
-            authorized_cidrs: Optional[Sequence] = None) -> List[Device]:
+            authorized_cidrs: Optional[Sequence] = None,
+            max_discovery_hosts: int = MAX_DISCOVERY_HOSTS) -> List[Device]:
         log.info(f"ARP sweep on {subnet}")
         scope_networks: List[IPv4Network] = []
         try:
             _ensure_scapy_layers()
             net = IPv4Network(subnet, strict=False)
             scope_networks = self._ipv4_scope_networks(net, authorized_cidrs)
-            targets = self._targets_from_scopes(scope_networks, gateway_ip)
-            if not targets:
+            if max_discovery_hosts < 1:
+                raise ValueError("max_discovery_hosts must be at least 1")
+            batches = list(self._target_batches_from_scopes(
+                scope_networks,
+                gateway_ip,
+                max_hosts=max_discovery_hosts,
+            ))
+            target_count = sum(len(batch) for batch in batches)
+            if not batches:
                 print_flush("  No authorized IPv4 probe targets in interface subnet.")
                 return []
+            if target_count >= max_discovery_hosts:
+                print_flush(
+                    f"  Discovery probe budget: {max_discovery_hosts} hosts"
+                )
 
             cached_count = self._merge_neighbor_caches(
                 net,
@@ -413,7 +459,6 @@ class NetworkDiscovery:
             if cached_count:
                 print_flush(f"  Cached neighbors: {cached_count} devices")
 
-            batches = self._target_batches(targets)
             # Short visible passes avoid long silent waits on Wi-Fi while still
             # refreshing the cached neighbor list with live replies.
             for pass_idx, timeout_val in enumerate(
