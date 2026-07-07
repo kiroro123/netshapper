@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
-Combined Captive Portal (HTTP) + Fake DNS Server
-NetShaper packaged fake server
+NetShaper offensive DNS + captive portal engine
 ─────────────────────────────────────────────────
 • Fail-fast IP detection with psutil fallback (no silent loopback fallback)
 • UDP 53 : Dual-stack DNS (AF_INET6 + IPV6_V6ONLY=0)
@@ -146,7 +145,7 @@ DNS_BLOCK_DOMAINS = parse_domain_csv(os.environ.get("DNS_BLOCK_DOMAINS", ""))
 
 
 def normalize_idn_demo_domain(value: str) -> tuple[str, str]:
-    """Return (Unicode, ASCII/IDNA) for a reserved training-only domain."""
+    """Return (Unicode, ASCII/IDNA) for a reserved demo-only domain."""
     unicode_domain = value.strip().rstrip(".").lower()
     if not unicode_domain or "/" in unicode_domain or "@" in unicode_domain:
         raise ValueError(f"invalid IDN demo domain: {value!r}")
@@ -163,7 +162,7 @@ def normalize_idn_demo_domain(value: str) -> tuple[str, str]:
 
 
 def render_web_security_demo(domains: list[tuple[str, str]]) -> bytes:
-    """Render a static, non-credential-capturing HSTS and IDN training page."""
+    """Render a static, non-credential-capturing HSTS and IDN offensive demo."""
     rows = "".join(
         "<tr>"
         f"<td>{html.escape(unicode_domain)}</td>"
@@ -177,7 +176,7 @@ def render_web_security_demo(domains: list[tuple[str, str]]) -> bytes:
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <title>NetShaper Web Security Lab</title>
+  <title>NetShaper HSTS/IDN Offensive Demo</title>
   <style>
     body {{ max-width: 54rem; margin: 3rem auto; font: 16px/1.5 sans-serif; }}
     table {{ border-collapse: collapse; width: 100%; }}
@@ -186,13 +185,13 @@ def render_web_security_demo(domains: list[tuple[str, str]]) -> bytes:
   </style>
 </head>
 <body>
-  <h1>HSTS and IDN training lab</h1>
+  <h1>HSTS and IDN offensive demo</h1>
   <p>This page intentionally contains no sign-in form and stores no credentials.</p>
   <h2>HSTS outcomes</h2>
   <ul>
     <li><strong>Preloaded or previously learned HSTS:</strong> the browser upgrades
         to HTTPS before an HTTP intermediary can rewrite the request.</li>
-    <li><strong>First visit without HSTS:</strong> a lab intermediary can demonstrate
+    <li><strong>First visit without HSTS:</strong> an authorized intermediary can demonstrate
         an HTTP downgrade before the browser learns the policy.</li>
     <li><strong>HSTS sent over HTTP:</strong> ignored by conforming browsers. This
         response includes such a header so the behavior can be observed.</li>
@@ -707,7 +706,7 @@ def forward_dns_query(data: bytes) -> bytes | None:
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Combined captive portal HTTP server + selective fake DNS"
+        description="NetShaper offensive DNS + captive portal engine"
     )
     parser.add_argument(
         "--spoof",
@@ -718,7 +717,7 @@ def parse_args():
     parser.add_argument(
         "--spoof-all",
         action="store_true",
-        help="Spoof every queried domain to this host for lab testing.",
+        help="Spoof every queried domain to this host for authorized offensive testing.",
     )
     parser.add_argument(
         "--smart-spoof-all",
@@ -787,11 +786,6 @@ def parse_args():
         help="Maximum concurrent DNS forwarding workers.",
     )
     parser.add_argument(
-        "--suppress-dnssec",
-        action="store_true",
-        help="Compatibility alias for --dnssec-mode fail-open.",
-    )
-    parser.add_argument(
         "--dnssec-mode",
         choices=["off", "fail-closed", "fail-open", "nxdomain", "timeout"],
         default="off",
@@ -807,10 +801,11 @@ def parse_args():
         ),
     )
     parser.add_argument(
-        "--web-security-demo",
+        "--hsts-idn-demo",
+        dest="hsts_idn_demo",
         action="store_true",
         help=(
-            "Serve a non-credential-capturing HSTS/IDN lesson at "
+            "Serve a non-credential-capturing HSTS/IDN offensive demo at "
             "/training/web-security."
         ),
     )
@@ -819,7 +814,7 @@ def parse_args():
         action="append",
         default=[],
         help=(
-            "Unicode domain shown in the web lesson; restricted to reserved "
+            "Unicode domain shown in the HSTS/IDN demo; restricted to reserved "
             ".test/.example/.invalid/.localhost names."
         ),
     )
@@ -844,8 +839,6 @@ def configure_dns(args) -> None:
     requested_dnssec_mode = getattr(args, "dnssec_mode", "off")
     if requested_dnssec_mode != "off":
         DNSSEC_MODE = requested_dnssec_mode
-    elif getattr(args, "suppress_dnssec", False):
-        DNSSEC_MODE = "fail-open"
     DNS_SUPPRESS_DNSSEC = DNSSEC_MODE != "off"
     allowed_networks = []
     for token in getattr(args, "allow_cidr", []) or []:
@@ -857,9 +850,7 @@ def configure_dns(args) -> None:
         ip_network("127.0.0.0/8"),
         ip_network("::1/128"),
     )
-    WEB_SECURITY_DEMO = WEB_SECURITY_DEMO or getattr(
-        args, "web_security_demo", False
-    )
+    WEB_SECURITY_DEMO = WEB_SECURITY_DEMO or getattr(args, "hsts_idn_demo", False)
     IDN_DEMO_DOMAINS = [
         normalize_idn_demo_domain(domain)
         for domain in getattr(args, "idn_demo_domain", [])
@@ -924,7 +915,7 @@ def print_dns_startup(port: int) -> None:
     forwarded = ", ".join(sorted(DNS_FORWARD_DOMAINS)) or "none"
     blocked = ", ".join(sorted(DNS_BLOCK_DOMAINS)) or "none"
     categories = ", ".join(sorted(active_smart_categories())) or "none"
-    print_flush(bold(cyan("NetShaper captive portal + DNS")))
+    print_flush(bold(cyan("NetShaper offensive DNS + portal")))
     print_flush(
         f"{cyan('[DNS]')} Dual-stack DNS listening on port {port}  "
         f"(YOUR_IP={YOUR_IP})"
@@ -944,7 +935,7 @@ def print_dns_startup(port: int) -> None:
         )
     if WEB_SECURITY_DEMO:
         print_flush(
-            f"{cyan('[Portal]')} Web security lesson: /training/web-security"
+            f"{cyan('[Portal]')} HSTS/IDN offensive demo: /training/web-security"
         )
 
 
@@ -1129,10 +1120,10 @@ class CaptivePortalHandler(BaseHTTPRequestHandler):
             self.wfile.write(msg)
             return
 
-        # 1. Static HSTS/IDN training page (no forms or credential capture)
+        # 1. Static HSTS/IDN offensive demo (no forms or credential capture)
         if path == "/training/web-security":
             if not WEB_SECURITY_DEMO:
-                msg = b"Web security training demo is disabled."
+                msg = b"HSTS/IDN offensive demo is disabled."
                 self.send_response(404)
                 self.send_header("Content-Type", "text/plain")
                 self.send_header("Content-Length", str(len(msg)))

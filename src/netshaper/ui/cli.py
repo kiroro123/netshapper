@@ -5,7 +5,7 @@ NetShaper — Command Line Interface.
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from ipaddress import ip_address, ip_network
 import os
 import signal
@@ -42,7 +42,7 @@ class ExploitOptions:
     cam_exhaust: int = 0
     dnssec_mode: str = "off"
     dnssec_upstream: str = "8.8.8.8"
-    hsts_bypass: bool = False
+    hsts_idn_demo: bool = False
 
     @property
     def arp_amplification_enabled(self) -> bool:
@@ -53,12 +53,12 @@ class ExploitOptions:
         return self.dnssec_mode != "off"
 
     @property
-    def fake_server_suppress_dnssec(self) -> bool:
+    def portal_suppress_dnssec(self) -> bool:
         return self.dnssec_enabled
 
     @property
-    def fake_server_web_security_demo(self) -> bool:
-        return self.hsts_bypass
+    def portal_web_security_demo(self) -> bool:
+        return self.hsts_idn_demo
 
 
 def parse_args() -> argparse.Namespace:
@@ -83,6 +83,13 @@ def parse_args() -> argparse.Namespace:
         "--targets",
         nargs="+",
         help="Skip discovery and use these IPs directly (comma-separated values allowed).",
+    )
+    parser.add_argument(
+        "--modules",
+        help=(
+            "Offensive network module numbers to enable without the interactive prompt "
+            "(e.g. 1,2,3,5)."
+        ),
     )
     parser.add_argument(
         "--allow-cidr",
@@ -152,9 +159,10 @@ def parse_args() -> argparse.Namespace:
         help="Upstream DNS for DNSSEC suppression.",
     )
     parser.add_argument(
-        "--hsts-bypass",
+        "--hsts-idn-demo",
+        dest="hsts_idn_demo",
         action="store_true",
-        help="Enable HSTS bypass and IDN homograph injection demo.",
+        help="Enable HSTS/IDN first-visit offensive demo.",
     )
     parser.add_argument(
         "--packet-verbose",
@@ -380,9 +388,9 @@ def pick_targets_ui(devices: List[Device]) -> List[Device]:
             print_flush("  [!] Invalid format. Use numbers, ranges, or 'all'.")
 
 
-def normalize_feature_choices(raw: str) -> tuple[set[int], list[str]]:
-    """Parse feature numbers (space- or comma-separated) and return valid features plus invalid tokens."""
-    features: set[int] = set()
+def normalize_module_choices(raw: str) -> tuple[set[int], list[str]]:
+    """Parse module numbers and return valid module choices plus invalid tokens."""
+    modules: set[int] = set()
     invalid: list[str] = []
 
     # Accept both "1 3 5" and "1,3,5" and "1, 3, 5"
@@ -394,26 +402,43 @@ def normalize_feature_choices(raw: str) -> tuple[set[int], list[str]]:
             continue
 
         if 1 <= value <= 9:
-            features.add(value)
+            modules.add(value)
         else:
             invalid.append(token)
 
-    return features, invalid
+    return modules, invalid
+
+
+def print_module_menu() -> None:
+    print_flush("\n  -- Offensive network toolkit modules (enter numbers e.g. 1 3 5) --")
+    print_flush("  [1] ARP spoofing (core MITM)")
+    print_flush("  [2] DNS spoofing (lab redirect)")
+    print_flush("  [3] Captive portal (HTTP index.html)")
+    print_flush("  [4] Bandwidth throttle / netem impairment")
+    print_flush("  [5] Packet sniffer")
+    print_flush("  [6] mitmproxy HTTPS inspection")
+    print_flush(
+        "  [7] ARP amplification (requires [1], default 256 phantom IPs)"
+    )
+    print_flush(
+        "  [8] DNSSEC suppression (requires [2], default fail-closed)"
+    )
+    print_flush("  [9] HSTS/IDN first-visit offensive demo (requires [3])")
 
 
 def resolve_exploit_options(
-    args: argparse.Namespace, features: set[int]
+    args: argparse.Namespace, modules: set[int]
 ) -> ExploitOptions:
-    """Merge interactive feature picks with explicit CLI exploit flags."""
+    """Merge module picks with explicit CLI exploit flags."""
     arp_amplify = args.arp_amplify
-    if 7 in features and arp_amplify == 0:
+    if 7 in modules and arp_amplify == 0:
         arp_amplify = 256
 
     dnssec_mode = args.dnssec_suppression
-    if 8 in features and dnssec_mode == "off":
+    if 8 in modules and dnssec_mode == "off":
         dnssec_mode = "fail-closed"
 
-    hsts_bypass = args.hsts_bypass or 9 in features
+    hsts_idn_demo = args.hsts_idn_demo or 9 in modules
 
     return ExploitOptions(
         arp_amplify=arp_amplify,
@@ -422,11 +447,50 @@ def resolve_exploit_options(
         cam_exhaust=args.cam_exhaust,
         dnssec_mode=dnssec_mode,
         dnssec_upstream=args.dnssec_upstream,
-        hsts_bypass=hsts_bypass,
+        hsts_idn_demo=hsts_idn_demo,
     )
 
 
-def fake_server_launch_hint(
+def apply_module_dependencies(
+    modules: set[int], exploit: ExploitOptions
+) -> tuple[set[int], ExploitOptions]:
+    """Prompt for required base modules or disable dependent advanced modules."""
+    modules = set(modules)
+
+    if exploit.arp_amplification_enabled and 1 not in modules:
+        print_flush("  [!] ARP amplification requires ARP spoofing.")
+        if safe_input("  Enable ARP spoofing too? (y/n): ").lower() == "y":
+            modules.add(1)
+        else:
+            modules.discard(7)
+            exploit = replace(exploit, arp_amplify=0, cam_exhaust=0)
+            print_flush("  [-] ARP amplification disabled.")
+
+    if exploit.dnssec_enabled and 2 not in modules:
+        print_flush("  [!] DNSSEC suppression requires DNS spoofing.")
+        if safe_input("  Enable DNS spoofing too? (y/n): ").lower() == "y":
+            modules.add(2)
+        else:
+            modules.discard(8)
+            exploit = replace(exploit, dnssec_mode="off")
+            print_flush("  [-] DNSSEC suppression disabled.")
+
+    if exploit.hsts_idn_demo and 3 not in modules:
+        print_flush(
+            "  [!] HSTS/IDN first-visit offensive demo requires the "
+            "captive portal HTTP service."
+        )
+        if safe_input("  Enable captive portal too? (y/n): ").lower() == "y":
+            modules.add(3)
+        else:
+            modules.discard(9)
+            exploit = replace(exploit, hsts_idn_demo=False)
+            print_flush("  [-] HSTS/IDN offensive demo disabled.")
+
+    return modules, exploit
+
+
+def portal_launch_hint(
     exploit: ExploitOptions,
     *,
     host_ip: str,
@@ -442,13 +506,13 @@ def fake_server_launch_hint(
     for network in authorized_cidrs or []:
         flags.append(f"--allow-cidr {network}")
     flags.append(f"--allow-cidr {host_ip}/32")
-    if exploit.fake_server_suppress_dnssec:
+    if exploit.portal_suppress_dnssec:
         flags.append(f"--dnssec-mode {exploit.dnssec_mode}")
-    if exploit.fake_server_web_security_demo:
-        flags.append("--web-security-demo")
+    if exploit.portal_web_security_demo:
+        flags.append("--hsts-idn-demo")
     if exploit.dnssec_enabled:
         flags.append(f"--upstream {exploit.dnssec_upstream}")
-    return "sudo netshaper-fake-server " + " ".join(flags)
+    return "sudo netshaper-portal " + " ".join(flags)
 
 
 def pick_limit_ui() -> float:
@@ -770,48 +834,35 @@ def main() -> None:
                 sys.exit(f"[NetShaper] {exc}")
         target_ips = [target_ip(target) for target in targets]
 
-        print_flush("\n  -- Features (enter numbers e.g. 1 3 5) ------------------")
-        print_flush("  [1] ARP spoofing (core MITM)")
-        print_flush("  [2] DNS spoofing")
-        print_flush("  [3] Captive portal (index.html for HTTP)")
-        print_flush("  [4] Bandwidth throttle")
-        print_flush("  [5] Packet sniffer")
-        print_flush("  [6] mitmproxy HTTPS inspection")
-        print_flush("  [7] ARP amplification (broad cache poisoning)")
-        print_flush("  [8] DNSSEC suppression")
-        print_flush("  [9] HSTS bypass / IDN homograph demo")
-
-        raw_choices = safe_input("  Choices: ")
-        features, invalid = normalize_feature_choices(raw_choices)
+        if args.modules:
+            raw_choices = args.modules
+            print_flush(f"  Offensive network modules from CLI: {raw_choices}")
+        else:
+            print_module_menu()
+            raw_choices = safe_input("  Choices: ")
+        modules, invalid = normalize_module_choices(raw_choices)
         if invalid:
-            print_flush("  [!] Ignoring invalid feature choices: " + ", ".join(invalid))
-        if not features:
-            print_flush("  [!] No valid features selected.")
+            print_flush("  [!] Ignoring invalid module choices: " + ", ".join(invalid))
+        if not modules:
+            print_flush("  [!] No valid offensive network modules selected.")
             sys.exit(0)
 
-        exploit = resolve_exploit_options(args, features)
+        exploit = resolve_exploit_options(args, modules)
+        modules, exploit = apply_module_dependencies(modules, exploit)
+        if not modules and not (
+            exploit.arp_amplification_enabled
+            or exploit.dnssec_enabled
+            or exploit.hsts_idn_demo
+        ):
+            print_flush("  [!] No offensive network modules remain enabled.")
+            sys.exit(0)
 
-        arp_on = 1 in features
-        dns_spoof_on = 2 in features
-        captive_portal = 3 in features
-        throttle_on = 4 in features
-        sniff_on = 5 in features
-        mitm_on = 6 in features
-
-        if exploit.arp_amplification_enabled and not arp_on:
-            print_flush("  [!] ARP amplification requires core ARP spoofing.")
-            if safe_input("  Enable ARP spoofing too? (y/n): ").lower() == "y":
-                arp_on = True
-
-        if exploit.dnssec_enabled and not dns_spoof_on:
-            print_flush("  [!] DNSSEC suppression requires DNS spoofing.")
-            if safe_input("  Enable DNS spoofing too? (y/n): ").lower() == "y":
-                dns_spoof_on = True
-
-        if exploit.hsts_bypass and not captive_portal:
-            print_flush("  [!] HSTS demo requires the captive portal HTTP service.")
-            if safe_input("  Enable captive portal too? (y/n): ").lower() == "y":
-                captive_portal = True
+        arp_on = 1 in modules
+        dns_spoof_on = 2 in modules
+        captive_portal = 3 in modules
+        throttle_on = 4 in modules
+        sniff_on = 5 in modules
+        mitm_on = 6 in modules
 
         if dns_spoof_on and not captive_portal:
             print_flush("  [!] DNS spoofing without captive portal can break HTTP.")
@@ -868,7 +919,7 @@ def main() -> None:
             )
             print_flush(
                 "      "
-                + fake_server_launch_hint(
+                + portal_launch_hint(
                     exploit,
                     host_ip=ns.own_ip,
                     authorized_cidrs=authorized_cidrs,
@@ -877,12 +928,12 @@ def main() -> None:
                 )
             )
             if (
-                safe_input("  Auto-launch netshaper-fake-server? (y/n): ").lower()
+                safe_input("  Auto-launch netshaper-portal? (y/n): ").lower()
                 == "y"
             ):
                 if not ns.launch_fake_server(
                     dnssec_mode=exploit.dnssec_mode,
-                    web_security_demo=exploit.fake_server_web_security_demo,
+                    web_security_demo=exploit.portal_web_security_demo,
                     dns_upstream=exploit.dnssec_upstream,
                     smart_spoof_all=True,
                 ):
@@ -896,7 +947,7 @@ def main() -> None:
             )
             print_flush(
                 "      "
-                + fake_server_launch_hint(
+                + portal_launch_hint(
                     exploit,
                     host_ip=ns.own_ip,
                     authorized_cidrs=authorized_cidrs,
@@ -905,26 +956,26 @@ def main() -> None:
                 )
             )
             if (
-                safe_input("  Auto-launch netshaper-fake-server? (y/n): ").lower()
+                safe_input("  Auto-launch netshaper-portal? (y/n): ").lower()
                 == "y"
             ):
                 if not ns.launch_fake_server(
                     dnssec_mode=exploit.dnssec_mode,
-                    web_security_demo=exploit.fake_server_web_security_demo,
+                    web_security_demo=exploit.portal_web_security_demo,
                     dns_upstream=exploit.dnssec_upstream,
                     smart_spoof_all=dns_spoof_on,
                 ):
                     sys.exit("[NetShaper] Captive portal requires verified fake HTTP.")
             else:
                 sys.exit("[NetShaper] Captive portal requires verified fake HTTP.")
-        elif exploit.fake_server_web_security_demo and not ns.fake_server_ready():
+        elif exploit.portal_web_security_demo and not ns.fake_server_ready():
             print_flush(
                 "  [!] HSTS demo HTTP service (port 80) is not verified "
                 "for this session."
             )
             print_flush(
                 "      "
-                + fake_server_launch_hint(
+                + portal_launch_hint(
                     exploit,
                     host_ip=ns.own_ip,
                     authorized_cidrs=authorized_cidrs,
@@ -933,7 +984,7 @@ def main() -> None:
                 )
             )
             if (
-                safe_input("  Auto-launch netshaper-fake-server? (y/n): ").lower()
+                safe_input("  Auto-launch netshaper-portal? (y/n): ").lower()
                 == "y"
             ):
                 if not ns.launch_fake_server(
@@ -969,8 +1020,12 @@ def main() -> None:
             return green("Yes") if flag else "No"
 
         print_flush(f"\n{cyan('=' * W)}")
-        print_flush(bold(f"  {'Session Summary'}"))
+        print_flush(bold(f"  {'Offensive Network Session'}"))
         print_flush(cyan("-" * W))
+        print_flush(
+            f"  Scope CIDRs   : "
+            f"{cyan(', '.join(str(network) for network in authorized_cidrs))}"
+        )
         print_flush(f"  Targets       : {cyan(', '.join(target_ips))}")
         print_flush(f"  ARP spoof     : {_yn(arp_on)}")
         if arp_on:
@@ -1007,8 +1062,11 @@ def main() -> None:
             f"  DNSSEC mode   : "
             f"{exploit.dnssec_mode if exploit.dnssec_enabled else 'off'}"
         )
-        print_flush(f"  HSTS demo     : {_yn(exploit.hsts_bypass)}")
+        print_flush(f"  HSTS/IDN demo : {_yn(exploit.hsts_idn_demo)}")
         print_flush(f"{cyan('=' * W)}")
+        print_flush(
+            "  Proceeding confirms authorization for the listed scope and targets."
+        )
 
         if safe_input(f"\n  {bold('Proceed?')} (y/n): ").lower() != "y":
             sys.exit(0)

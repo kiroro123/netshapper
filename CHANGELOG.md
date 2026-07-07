@@ -4,6 +4,14 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Offensive network toolkit migration
+
+- Rebranded public CLI/docs/package metadata around the offensive network
+  toolkit/module model.
+- Replaced the public portal helper command with `netshaper-portal`.
+- Removed legacy public aliases for module selection and DNSSEC suppression;
+  use `--modules` and `--dnssec-mode fail-open`.
+
 ### Safety and lifecycle fixes
 
 - Made stale firewall recovery fail closed when binaries or rule deletions fail.
@@ -89,7 +97,7 @@ All notable changes to this project are documented in this file.
   - `DnsConfig` dataclass (spoof_all, smart_spoof_all, etc.)
   - `HTTPPortalConfig` dataclass (host_ip, ports, paths)
   - CLI args for hardcoded paths (--index-file, --ca-cert, etc.)
-- Backward-compatible: `fake_server3.py` remains, new entry point `netshaper-captive-portal`
+- Introduced a consolidated captive-portal/DNS helper during the refactor.
 - Global mutable state eliminated
 
 #### Security Documentation
@@ -125,7 +133,7 @@ All notable changes to this project are documented in this file.
 
 **For users:**
 - No breaking changes to CLI interface
-- `fake_server3` continues to work; `netshaper-captive-portal` is preferred
+- Use the packaged portal helper command for captive-portal and DNS workflows.
 - Verify authorized CIDRs with `--dry-run` before first run
 
 **For developers:**

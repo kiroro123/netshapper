@@ -1,7 +1,7 @@
 # NetShaper User Guide
 
-NetShaper is for authorized lab testing and controlled diagnostics on networks
-you own or have explicit permission to test.
+NetShaper is a modular offensive network toolkit for authorized labs and
+client networks you own or have explicit permission to test.
 
 ## Run From Source
 
@@ -34,30 +34,30 @@ No module named netshaper
 Root's `$PYTHONPATH` is stripped by default. The `env PYTHONPATH=...` form
 passes it through explicitly.
 
-## Fake Server
+## Offensive DNS + Portal Engine
 
-The fake server handles DNS queries and serves the captive-portal HTTP page.
-Run it in a **separate terminal** before starting NetShaper when using features
+`netshaper-portal` handles DNS queries and serves the captive-portal HTTP page.
+Run it in a **separate terminal** before starting NetShaper when using modules
 2 or 3.
 
 ```bash
-sudo env PYTHONPATH="$PWD/src" python -m netshaper.fake_server3
+sudo env PYTHONPATH="$PWD/src" python -m netshaper.portal
 ```
 
 Suggested alias:
 
 ```bash
-alias sfakeserver='sudo env PYTHONPATH=/path/to/netshaper/src python -m netshaper.fake_server3'
+alias sportal='sudo env PYTHONPATH=/path/to/netshaper/src python -m netshaper.portal'
 ```
 
-The fake server binds ports `53` (DNS) and `80` (HTTP), so it requires `sudo`.
+The portal engine binds ports `53` (DNS) and `80` (HTTP), so it requires `sudo`.
 
 ## Recommended Two-Terminal Workflow
 
-**Terminal 1** — fake server:
+**Terminal 1** — portal engine:
 
 ```bash
-sfakeserver --smart-spoof-all --host-ip <your-ip> \
+sportal --smart-spoof-all --host-ip <your-ip> \
   --allow-cidr <authorized-cidr> --verbose-dns
 ```
 
@@ -67,17 +67,20 @@ sfakeserver --smart-spoof-all --host-ip <your-ip> \
 snetshaper -i <interface> --allow-cidr <authorized-cidr>
 ```
 
-Then select features `1 2 3` (or `1,2,3`) for ARP + DNS + captive portal.
+Then select modules `1 2 3` (or `1,2,3`) for ARP + DNS + captive portal.
 
-## Feature Menu
+## Offensive Network Module Menu
 
 ```text
 [1] ARP spoofing (core MITM)
-[2] DNS spoofing
-[3] Captive portal (index.html for HTTP)
-[4] Bandwidth throttle
+[2] DNS spoofing (lab redirect)
+[3] Captive portal (HTTP index.html)
+[4] Bandwidth throttle / netem impairment
 [5] Packet sniffer
 [6] mitmproxy HTTPS inspection
+[7] ARP amplification (requires [1], default 256 phantom IPs)
+[8] DNSSEC suppression (requires [2], default fail-closed)
+[9] HSTS/IDN first-visit offensive demo (requires [3])
 ```
 
 Enter numbers separated by spaces or commas:
@@ -87,11 +90,18 @@ Enter numbers separated by spaces or commas:
 1,2,3,4      same + bandwidth throttle
 1 5          ARP + packet capture
 1 6          ARP + mitmproxy HTTPS inspection
+1 7          ARP + ARP amplification
+2 8          DNS spoofing + DNSSEC suppression
+3 9          captive portal + HSTS/IDN offensive demo
 ```
+
+Offensive network modules prompt to enable their required base module if it was
+not selected. If you decline the base module, the dependent module is
+disabled before the final session summary.
 
 ## Bandwidth Throttle Presets
 
-When feature `4` is selected you'll be shown:
+When module `4` is selected you'll be shown:
 
 ```text
 [1] 1 Mbps   [2] 2 Mbps   [3] 3 Mbps
@@ -106,7 +116,7 @@ You can also set throttle non-interactively:
 snetshaper -i <interface> --allow-cidr 192.168.1.0/24 --targets 192.168.1.5 --limit 2.5
 ```
 
-Feature `4` also supports controlled `tc netem` impairment:
+Module `4` also supports controlled `tc netem` impairment:
 
 ```bash
 snetshaper -i eth0 \
@@ -125,7 +135,7 @@ All resources are journaled and removed during normal or stale-session cleanup.
 
 ## ARP/NDP Cache-Race Training
 
-Feature `1` supports bounded packet timing controls:
+Module `1` supports bounded packet timing controls:
 
 ```bash
 snetshaper -i eth0 \
@@ -157,16 +167,15 @@ IPv6 information.
 | `--allow-cidr 192.0.2.0/24` | Allow DNS clients from this CIDR; repeat as needed |
 | `--serve-ca-cert` | Explicitly enable serving the mitmproxy CA at `/cert` |
 | `--dnssec-mode <mode>` | Select `fail-closed`, `fail-open`, `nxdomain`, or `timeout` behavior |
-| `--suppress-dnssec` | Compatibility alias for `--dnssec-mode fail-open` |
-| `--web-security-demo` | Enable the static lesson at `/training/web-security` |
-| `--idn-demo-domain арр.test` | Add a Unicode/Punycode example using a reserved training domain |
+| `--hsts-idn-demo` | Enable the static HSTS/IDN offensive demo at `/training/web-security` |
+| `--idn-demo-domain арр.test` | Add a Unicode/Punycode example using a reserved demo domain |
 
 DNS defaults to loopback-only clients unless at least one `--allow-cidr` is
 provided. DNSSEC `fail-open` models a non-validating intermediary; the other
 modes return SERVFAIL, NXDOMAIN, or no response for DNSSEC-aware queries.
 None of these modes defeats validation on the endpoint.
 
-The web security lesson contains no sign-in form and captures no credentials.
+The HSTS/IDN offensive demo contains no sign-in form and captures no credentials.
 It explains that preloaded or previously learned HSTS upgrades the request
 before an HTTP intermediary can act. IDN examples must end in `.test`,
 `.example`, `.invalid`, or `.localhost`.
@@ -176,12 +185,18 @@ before an HTTP intermediary can act. IDN examples must end in `.test`,
 Skip discovery and set all options from the command line:
 
 ```bash
-snetshaper -i eth0 --allow-cidr 192.168.1.0/24 --targets 192.168.1.5,192.168.1.6 --limit 1.5
+snetshaper -i eth0 \
+  --allow-cidr 192.168.1.0/24 \
+  --targets 192.168.1.5,192.168.1.6 \
+  --modules 1,4,5 \
+  --limit 1.5
 ```
 
-`--targets` accepts space-separated or comma-separated IPs. `--limit` and the
-netem flags configure feature 4 after it is selected. `--allow-cidr` is
-required and should match the written authorization scope for the test.
+`--targets` accepts space-separated or comma-separated IPs. `--modules`
+accepts space-separated or comma-separated offensive network module numbers and
+skips the interactive module menu. `--limit` and the netem flags configure
+module 4 after it is selected. `--allow-cidr` is required and should match the
+written authorization scope for the test.
 
 ## Discovery Behaviour
 
@@ -299,7 +314,7 @@ experimental advertisement monitoring enabled and kernel 5.10 or newer.
 
 ## Port Conflicts
 
-If the fake server cannot bind its ports:
+If the portal engine cannot bind its ports:
 
 ```bash
 sudo ss -ltnup | grep -E ':53|:80|:8088'

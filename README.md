@@ -1,6 +1,6 @@
 # NetShaper
 
-NetShaper is a modular, authorized network-testing toolkit for controlled lab and client-network analysis. It combines discovery, packet capture, DNS handling, traffic shaping, and MITM-style interception in a single Python CLI.
+NetShaper is a modular offensive network toolkit for authorized lab and client-network analysis. It combines discovery, packet capture, DNS handling, traffic shaping, and MITM-style interception in a single Python CLI.
 
 **Use only on networks and devices you own or have explicit written permission to test.**
 
@@ -76,12 +76,12 @@ A typical flow for testing a target device:
    ├─ FirewallManager applies per-target iptables rules
    ├─ Setup ARP/NDP spoofing (TargetSession)
    │  └─ Device now sends traffic to NetShaper IP
-   ├─ Setup DNS interception (iptables redirect 53 → fake_server3)
+   ├─ Setup DNS interception (iptables redirect 53 → netshaper-portal)
    ├─ Setup HTTP captive portal redirect
    └─ Setup HTTPS inspection (mitmproxy transparent mode)
 
 3. ACTIVE SESSION
-   ├─ fake_server3 captures DNS queries
+   ├─ netshaper-portal captures DNS queries
    │  ├─ Responds with spoofed A/AAAA records
    │  └─ Serves captive portal redirect
    ├─ Device visits http://..., gets 302 to captive portal
@@ -112,13 +112,14 @@ A typical flow for testing a target device:
    └─ Recovery logged to /var/log/netshaper.log
 ```
 
-## Features
+## Offensive Network Modules
 
 - Dual-stack ARP + NDP spoofing (IPv4 and IPv6 MITM)
-- Bounded ARP/NDP burst controls for cache-race training
+- Bounded ARP/NDP burst controls for cache-race offensive testing
 - Per-target DNS redirect and captive portal (HTTP)
+- ARP amplification for authorized directly connected IPv4 scopes
 - DNSSEC suppression/fail-closed modeling in the fake resolver
-- Reserved-domain HSTS and IDN/Punycode training page (no credential capture)
+- Reserved-domain HSTS and IDN/Punycode offensive demo (no credential capture)
 - Bandwidth throttling and controlled impairment via Linux `tc` HTB + netem
 - Packet capture with optional rolling `.pcap` files
 - Transparent HTTPS inspection via mitmproxy
@@ -153,6 +154,13 @@ sudo env PYTHONPATH="$PWD/src" python -m netshaper -i <interface> \
   --allow-cidr <authorized-cidr>
 ```
 
+Repeatable offensive module selection without the interactive prompt:
+
+```bash
+sudo env PYTHONPATH="$PWD/src" python -m netshaper -i <interface> \
+  --allow-cidr <authorized-cidr> --targets <ip> --modules 1,2,3,5
+```
+
 Dry-run preview (no system changes):
 
 ```bash
@@ -163,7 +171,7 @@ sudo env PYTHONPATH="$PWD/src" python -m netshaper -i <interface> \
 Optional DNS/HTTP captive-portal helper (separate terminal):
 
 ```bash
-sudo env PYTHONPATH="$PWD/src" python -m netshaper.fake_server3 \
+sudo env PYTHONPATH="$PWD/src" python -m netshaper.portal \
   --smart-spoof-all --host-ip <your-ip> \
   --allow-cidr <authorized-cidr>
 ```
@@ -176,16 +184,16 @@ sudo env PYTHONPATH="$PWD/src" python -m netshaper -i <interface> \
   --allow-cidr <authorized-cidr> --targets <ip> \
   --arp-burst 3 --arp-interval 0.5
 
-# Model DNSSEC suppression and serve the static HSTS/IDN lesson.
-sudo env PYTHONPATH="$PWD/src" python -m netshaper.fake_server3 \
+# Model DNSSEC suppression and serve the static HSTS/IDN offensive demo.
+sudo env PYTHONPATH="$PWD/src" python -m netshaper.portal \
   --host-ip <your-ip> --allow-cidr <authorized-cidr> \
-  --dnssec-mode fail-closed --web-security-demo \
+  --dnssec-mode fail-closed --hsts-idn-demo \
   --idn-demo-domain арр.test
 ```
 
-The web lesson is available at `/training/web-security`. IDN examples are
+The HSTS/IDN offensive demo is available at `/training/web-security`. IDN examples are
 restricted to reserved `.test`, `.example`, `.invalid`, and `.localhost`
-domains. Established or preloaded HSTS is not bypassed; the lesson demonstrates
+domains. Established or preloaded HSTS is not bypassed; the demo demonstrates
 the first-visit downgrade boundary and browser IDN display behavior.
 
 ## Wireless Plugins
@@ -299,7 +307,7 @@ sudo env PYTHONPATH="$PWD/src" python -m netshaper -i <interface> \
 
 ## User Guide
 
-See [USER_GUIDE.md](USER_GUIDE.md) for the full workflow, shell aliases, fake-server modes, discovery behaviour, dry-run usage, and troubleshooting.
+See [USER_GUIDE.md](USER_GUIDE.md) for the full workflow, shell aliases, portal modes, discovery behaviour, dry-run usage, and troubleshooting.
 
 ## Security & Risk
 
@@ -373,7 +381,7 @@ If any health check fails, it is reported as an error and normal cleanup is trig
 
 - Session state is stored under `/run/netshaper/` (root-owned, mode 0700) and cleaned up on exit
 - Only one NetShaper instance may run at a time (enforced via `/run/netshaper/netshaper.lock`)
-- `fake_server3` is an optional helper for captive-portal and DNS lab scenarios; it is not required for ARP spoofing or traffic shaping
+- `netshaper-portal` is an optional helper for captive-portal and DNS scenarios; it is not required for ARP spoofing or traffic shaping
 - Use `--dry-run` extensively before running live sessions
 - Monitor `/var/log/netshaper.log` during and after sessions
 - Forwarding uses a session-specific chain. ACCEPT and IPv4 MASQUERADE rules

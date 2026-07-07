@@ -18,6 +18,11 @@ class CliTests(unittest.TestCase):
             args = cli.parse_args()
         self.assertEqual(args.targets, ["192.0.2.10", "192.0.2.11"])
 
+    def test_parse_args_accepts_modules_flag(self):
+        with mock.patch("sys.argv", ["netshaper", "--modules", "1,2,5"]):
+            args = cli.parse_args()
+        self.assertEqual(args.modules, "1,2,5")
+
     def test_parse_args_accepts_limit_flag(self):
         with mock.patch("sys.argv", ["netshaper", "--limit", "7.5"]):
             args = cli.parse_args()
@@ -78,8 +83,8 @@ class CliTests(unittest.TestCase):
             args = cli.parse_args()
         self.assertEqual(args.allow_cidr, ["192.0.2.0/24"])
 
-    def test_fake_server_launch_hint_includes_health_token(self):
-        hint = cli.fake_server_launch_hint(
+    def test_portal_launch_hint_includes_health_token(self):
+        hint = cli.portal_launch_hint(
             cli.ExploitOptions(),
             host_ip="192.0.2.10",
             authorized_cidrs=["192.0.2.0/24"],
@@ -91,6 +96,7 @@ class CliTests(unittest.TestCase):
         self.assertIn("--smart-spoof-all", hint)
         self.assertIn("--allow-cidr 192.0.2.0/24", hint)
         self.assertIn("--allow-cidr 192.0.2.10/32", hint)
+        self.assertTrue(hint.startswith("sudo netshaper-portal "))
 
     def test_parse_args_rejects_limit_outside_interactive_range(self):
         with mock.patch("sys.argv", ["netshaper", "--limit", "0.01"]), \
@@ -98,14 +104,14 @@ class CliTests(unittest.TestCase):
              self.assertRaises(SystemExit):
             cli.parse_args()
 
-    def test_normalize_feature_choices_rejects_bad_input(self):
-        features, invalid = cli.normalize_feature_choices("1 10 x")
-        self.assertEqual(features, {1})
+    def test_normalize_module_choices_rejects_bad_input(self):
+        modules, invalid = cli.normalize_module_choices("1 10 x")
+        self.assertEqual(modules, {1})
         self.assertEqual(invalid, ["10", "x"])
 
-    def test_normalize_feature_choices_accepts_exploit_features(self):
-        features, invalid = cli.normalize_feature_choices("7 8 9")
-        self.assertEqual(features, {7, 8, 9})
+    def test_normalize_module_choices_accepts_exploit_modules(self):
+        modules, invalid = cli.normalize_module_choices("7 8 9")
+        self.assertEqual(modules, {7, 8, 9})
         self.assertEqual(invalid, [])
 
     def test_parse_args_accepts_exploit_flags(self):
@@ -117,7 +123,7 @@ class CliTests(unittest.TestCase):
             "--cam-exhaust", "64",
             "--dnssec-suppression", "fail-open",
             "--dnssec-upstream", "1.1.1.1",
-            "--hsts-bypass",
+            "--hsts-idn-demo",
         ]):
             args = cli.parse_args()
 
@@ -127,7 +133,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(args.cam_exhaust, 64)
         self.assertEqual(args.dnssec_suppression, "fail-open")
         self.assertEqual(args.dnssec_upstream, "1.1.1.1")
-        self.assertTrue(args.hsts_bypass)
+        self.assertTrue(args.hsts_idn_demo)
 
     def test_parse_args_accepts_capture_and_discovery_safety_flags(self):
         with mock.patch("sys.argv", [
@@ -151,7 +157,7 @@ class CliTests(unittest.TestCase):
         exploit = cli.resolve_exploit_options(args, {8, 9})
         self.assertEqual(exploit.dnssec_mode, "nxdomain")
         self.assertEqual(exploit.arp_amplify, 32)
-        self.assertTrue(exploit.hsts_bypass)
+        self.assertTrue(exploit.hsts_idn_demo)
 
     def test_resolve_exploit_options_uses_defaults_for_menu_only(self):
         with mock.patch("sys.argv", ["netshaper"]):
@@ -160,11 +166,37 @@ class CliTests(unittest.TestCase):
         exploit = cli.resolve_exploit_options(args, {7, 8, 9})
         self.assertEqual(exploit.arp_amplify, 256)
         self.assertEqual(exploit.dnssec_mode, "fail-closed")
-        self.assertTrue(exploit.hsts_bypass)
+        self.assertTrue(exploit.hsts_idn_demo)
 
-    def test_normalize_feature_choices_accepts_comma_separated_values(self):
-        features, invalid = cli.normalize_feature_choices("1, 3,5 6")
-        self.assertEqual(features, {1, 3, 5, 6})
+    def test_apply_module_dependencies_adds_required_base_module(self):
+        exploit = cli.ExploitOptions(arp_amplify=64)
+
+        with mock.patch("netshaper.ui.cli.safe_input", return_value="y"), \
+             mock.patch("netshaper.ui.cli.print_flush"):
+            modules, updated = cli.apply_module_dependencies({7}, exploit)
+
+        self.assertEqual(modules, {1, 7})
+        self.assertEqual(updated.arp_amplify, 64)
+
+    def test_apply_module_dependencies_disables_declined_advanced_module(self):
+        exploit = cli.ExploitOptions(
+            arp_amplify=64,
+            dnssec_mode="fail-closed",
+            hsts_idn_demo=True,
+        )
+
+        with mock.patch("netshaper.ui.cli.safe_input", return_value="n"), \
+             mock.patch("netshaper.ui.cli.print_flush"):
+            modules, updated = cli.apply_module_dependencies({7, 8, 9}, exploit)
+
+        self.assertEqual(modules, set())
+        self.assertFalse(updated.arp_amplification_enabled)
+        self.assertFalse(updated.dnssec_enabled)
+        self.assertFalse(updated.hsts_idn_demo)
+
+    def test_normalize_module_choices_accepts_comma_separated_values(self):
+        modules, invalid = cli.normalize_module_choices("1, 3,5 6")
+        self.assertEqual(modules, {1, 3, 5, 6})
         self.assertEqual(invalid, [])
 
     def test_pick_limit_ui_returns_new_10_mbps_preset(self):

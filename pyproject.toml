@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "netshaper"
 dynamic = ["version"]
-description = "A safety-first, authorized network shaping and diagnostics toolkit for controlled lab testing"
+description = "A modular offensive network toolkit for authorized lab and client-network operations"
 readme = "README.md"
 requires-python = ">=3.10"
 authors = [{name = "NetShaper Contributors"}]
@@ -38,8 +38,7 @@ dev = [
 
 [project.scripts]
 netshaper = "netshaper.ui.cli:main"
-netshaper-fake-server = "netshaper.fake_server3:main"
-netshaper-captive-portal = "netshaper.captive_portal:main"
+netshaper-portal = "netshaper.portal:main"
 
 [project.entry-points."netshaper.plugins"]
 wifi-recon = "netshaper.plugins.wifi_recon:WifiReconPlugin"
