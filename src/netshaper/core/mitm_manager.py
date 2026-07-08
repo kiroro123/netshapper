@@ -240,7 +240,10 @@ class MitmProxyManager:
             if self._mitm_process_identity is None:
                 log.error("Live mitmproxy process has no recoverable identity")
                 return state
-            command = list(self._mitm_command or getattr(proc, "args", []) or [])
+            command = list(self._mitm_command or [])
+            if not command:
+                log.error("Live mitmproxy process has no recoverable command")
+                return state
             state.update(
                 {
                     "service": "mitmproxy",

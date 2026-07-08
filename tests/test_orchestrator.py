@@ -420,6 +420,46 @@ class NetShaperCleanupTests(unittest.TestCase):
             self.assertEqual(ns.fake_server_health_token(), "manual-token")
             self.assertEqual(ns.fake_server_health_token(), "manual-token")
 
+    def test_legacy_fake_server_proc_attaches_recoverable_portal_before_ready(self):
+        ns = NetShaper.__new__(NetShaper)
+        self._set_authorized(ns)
+        ns.own_ip = "192.0.2.1"
+        ns._fake_server_health_token = "test-health-token"
+        process = mock.Mock()
+        process.pid = 1234
+        process.poll.return_value = None
+        process.args = [
+            "/usr/bin/python3",
+            "-m",
+            "netshaper.portal",
+            "--health-token",
+            "test-health-token",
+        ]
+        ns._fake_server_proc = process
+
+        with mock.patch(
+            "netshaper.core.portal_manager.process_owner_metadata",
+            return_value={
+                "pid": 1234,
+                "process_create_time": 456.0,
+                "created_at": 789.0,
+            },
+        ) as owner_metadata, mock.patch(
+            "netshaper.core.portal_manager.PortalManager.health_ready",
+            return_value=True,
+        ), mock.patch(
+            "netshaper.core.portal_manager.subprocess.Popen"
+        ) as popen:
+            self.assertTrue(ns.fake_server_ready())
+            state = ns._portal_manager().get_state_for_persistence()
+
+        owner_metadata.assert_called_once_with(1234)
+        popen.assert_not_called()
+        self.assertEqual(state["pid"], 1234)
+        self.assertEqual(state["process_create_time"], 456.0)
+        self.assertEqual(state["argv"], process.args)
+        self.assertEqual(state["ownership_token"], "test-health-token")
+
     def test_fake_server_launch_refuses_unverified_claimed_listener(self):
         ns = NetShaper.__new__(NetShaper)
         ns.own_ip = "192.0.2.1"
