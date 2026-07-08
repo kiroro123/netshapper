@@ -9,7 +9,6 @@ sniffer management, and the bandwidth monitor thread.
 from __future__ import annotations
 
 import fcntl
-import http.client
 from ipaddress import (
     IPv4Address,
     IPv4Network,
@@ -21,10 +20,7 @@ from ipaddress import (
 import json
 import logging
 import os
-import secrets
 import socket
-import subprocess  # nosec B404
-import sys
 import threading
 import time
 import uuid
@@ -39,6 +35,7 @@ from netshaper.core.authorization import AuthorizationPolicy
 from netshaper.core.firewall_manager import FirewallManager
 from netshaper.core.mitm_manager import MitmProxyManager, MitmProxyError
 from netshaper.core.owner import current_owner_metadata
+from netshaper.core.portal_manager import PortalConfig, PortalManager
 from netshaper.core.recovery_manager import RecoveryManager
 from netshaper.core.session import TargetSession
 from netshaper.core.plugin import PluginInterface, PluginManager
@@ -93,8 +90,7 @@ class NetShaper:
         self.sniffer: Optional[Union[PacketSniffer, RollingPacketSniffer]] = None
         self.stop_event = threading.Event()
         self._mitm_log_path: Optional[str] = None
-        self._fake_server_proc: Optional[subprocess.Popen] = None
-        self._fake_server_health_token: Optional[str] = None
+        self.portal_manager = PortalManager(self.own_ip, self.authorized_cidrs)
         self._arp_amplifier = None
         self._monitor_thread: Optional[threading.Thread] = None
         self._runtime_errors: List[str] = []
@@ -113,6 +109,22 @@ class NetShaper:
     def authorized_cidrs(self) -> tuple:
         policy = getattr(self, "_auth_policy", None)
         return policy.cidrs if policy else ()
+
+    def _portal_manager(self) -> PortalManager:
+        manager = getattr(self, "portal_manager", None)
+        if manager is None:
+            manager = PortalManager(
+                getattr(self, "own_ip", "127.0.0.1"),
+                self.authorized_cidrs,
+            )
+            legacy_proc = getattr(self, "_fake_server_proc", None)
+            if legacy_proc is not None:
+                manager.process = legacy_proc
+            legacy_token = getattr(self, "_fake_server_health_token", None)
+            if legacy_token:
+                manager._health_token = legacy_token
+            self.portal_manager = manager
+        return manager
 
     @staticmethod
     def _normalize_authorized_cidrs(raw_values: Sequence) -> list:
@@ -950,156 +962,28 @@ class NetShaper:
         smart_spoof_all: bool = False,
     ) -> bool:
         """Launch netshaper-portal when DNS/HTTP services are required."""
-        if dnssec_mode not in {
-            "off",
-            "fail-closed",
-            "fail-open",
-            "nxdomain",
-            "timeout",
-        }:
-            raise ValueError(f"invalid DNSSEC mode: {dnssec_mode}")
-        if suppress_dnssec and dnssec_mode == "off":
-            dnssec_mode = "fail-open"
-        if config.DRY_RUN:
-            print_flush(
-                "[DRY-RUN] Would launch netshaper-portal "
-                f"(dnssec={dnssec_mode}, hsts={web_security_demo}, "
-                f"smart-spoof-all={smart_spoof_all})"
+        return self._portal_manager().start(
+            PortalConfig(
+                suppress_dnssec=suppress_dnssec,
+                dnssec_mode=dnssec_mode,
+                web_security_demo=web_security_demo,
+                dns_upstream=dns_upstream,
+                smart_spoof_all=smart_spoof_all,
             )
-            return True
-
-        health_token = self._fake_server_token()
-        if self.fake_server_ready():
-            log.info("netshaper-portal already ready for this session")
-            return True
-
-        if self._fake_server_proc and self._fake_server_proc.poll() is None:
-            log.debug("Waiting for existing netshaper-portal child")
-        else:
-            dns_claimed = check_local_port(self.own_ip, 53, socket.SOCK_DGRAM)
-            http_claimed = check_local_port(self.own_ip, 80)
-            if dns_claimed or http_claimed:
-                log.error(
-                    "Refusing to adopt unverified portal listener "
-                    "(dns=%s, http=%s). Stop the existing listener or relaunch "
-                    "it with the session health token printed by NetShaper.",
-                    dns_claimed,
-                    http_claimed,
-                )
-                return False
-
-            cmd = [
-                sys.executable,
-                "-m",
-                "netshaper.fake_server3",
-                "--host-ip",
-                self.own_ip,
-                "--upstream",
-                dns_upstream,
-                "--health-token",
-                health_token,
-            ]
-            if smart_spoof_all:
-                cmd.append("--smart-spoof-all")
-            if dnssec_mode != "off":
-                cmd.extend(["--dnssec-mode", dnssec_mode])
-            allowed_cidrs = {
-                str(network) for network in self.authorized_cidrs
-            }
-            allowed_cidrs.add(f"{self.own_ip}/32")
-            for allowed_cidr in sorted(allowed_cidrs):
-                cmd.extend(["--allow-cidr", allowed_cidr])
-            if web_security_demo:
-                cmd.append("--hsts-idn-demo")
-
-            try:
-                self._fake_server_proc = subprocess.Popen(  # nosec B603
-                    cmd,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
-            except OSError as exc:
-                log.error(f"portal launch failed: {exc}")
-                return False
-
-        for _ in range(20):
-            if self.fake_server_ready():
-                log.info("netshaper-portal ready")
-                return True
-            if self._fake_server_proc.poll() is not None:
-                log.error(
-                    "netshaper-portal exited during startup "
-                    f"with code {self._fake_server_proc.returncode}"
-                )
-                self._terminate_fake_server()
-                return False
-            time.sleep(0.25)
-
-        log.error("netshaper-portal did not become reachable within 5s")
-        self._terminate_fake_server()
-        return False
-
-    def _fake_server_token(self) -> str:
-        token = getattr(self, "_fake_server_health_token", None)
-        if not token:
-            token = secrets.token_urlsafe(32)
-            self._fake_server_health_token = token
-        return token
+        )
 
     def fake_server_health_token(self) -> str:
         """Return the token required to verify a manually launched portal."""
-        return self._fake_server_token()
+        return self._portal_manager().health_token()
 
     def fake_server_ready(self) -> bool:
-        return self._fake_server_health_ready(self._fake_server_token())
+        return self._portal_manager().ready()
 
     def _fake_server_health_ready(self, token: str) -> bool:
-        conn: Optional[http.client.HTTPConnection] = None
-        try:
-            conn = http.client.HTTPConnection(self.own_ip, 80, timeout=1.0)
-            conn.request(
-                "GET",
-                "/_netshaper/health",
-                headers={"X-NetShaper-Session": token},
-            )
-            response = conn.getresponse()
-            body = response.read(256).decode("utf-8", errors="replace")
-            return (
-                response.status == 200
-                and response.getheader("X-NetShaper-Session") == token
-                and body == token
-            )
-        except Exception:
-            return False
-        finally:
-            if conn is not None:
-                conn.close()
+        return self._portal_manager().health_ready(token)
 
     def _terminate_fake_server(self) -> bool:
-        proc = getattr(self, "_fake_server_proc", None)
-        if not proc:
-            return True
-
-        ok = True
-        try:
-            if proc.poll() is None:
-                proc.terminate()
-                try:
-                    proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                    proc.wait(timeout=5)
-            if proc.poll() is None:
-                ok = False
-            else:
-                log.info("netshaper-portal terminated")
-        except Exception as exc:
-            ok = False
-            log.error(f"portal cleanup failed: {exc}")
-
-        if ok:
-            self._fake_server_proc = None
-        return ok
+        return self._portal_manager().stop()
 
     def _stop_arp_amplification(self) -> bool:
         amplifier = getattr(self, "_arp_amplifier", None)

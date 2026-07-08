@@ -377,14 +377,13 @@ class NetShaperCleanupTests(unittest.TestCase):
         process.poll.return_value = None
 
         with mock.patch(
-            "netshaper.core.orchestrator.check_local_port",
+            "netshaper.core.portal_manager.check_local_port",
             side_effect=[False, False],
-        ), mock.patch.object(
-            ns,
-            "_fake_server_health_ready",
+        ), mock.patch(
+            "netshaper.core.portal_manager.PortalManager.health_ready",
             side_effect=[False, True],
         ), mock.patch(
-            "netshaper.core.orchestrator.subprocess.Popen",
+            "netshaper.core.portal_manager.subprocess.Popen",
             return_value=process,
         ) as popen:
             self.assertTrue(
@@ -407,7 +406,7 @@ class NetShaperCleanupTests(unittest.TestCase):
         ns._fake_server_health_token = None
 
         with mock.patch(
-            "netshaper.core.orchestrator.secrets.token_urlsafe",
+            "netshaper.core.portal_manager.secrets.token_urlsafe",
             return_value="manual-token",
         ):
             self.assertEqual(ns.fake_server_health_token(), "manual-token")
@@ -419,17 +418,16 @@ class NetShaperCleanupTests(unittest.TestCase):
         ns._fake_server_proc = None
         ns._fake_server_health_token = "test-health-token"
 
-        with mock.patch.object(
-            ns,
-            "_fake_server_health_ready",
+        with mock.patch(
+            "netshaper.core.portal_manager.PortalManager.health_ready",
             return_value=False,
         ), mock.patch(
-            "netshaper.core.orchestrator.check_local_port",
+            "netshaper.core.portal_manager.check_local_port",
             side_effect=[True, True],
         ), mock.patch(
-            "netshaper.core.orchestrator.subprocess.Popen"
+            "netshaper.core.portal_manager.subprocess.Popen"
         ) as popen, mock.patch(
-            "netshaper.core.orchestrator.log"
+            "netshaper.core.portal_manager.log"
         ) as log:
             self.assertFalse(ns.launch_fake_server())
 

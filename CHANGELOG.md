@@ -4,6 +4,17 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Architecture
+
+- Added a typed `SessionPlan` model and `SessionRunner` execution boundary so
+  the CLI now resolves operator choices into a plan before core session
+  lifecycle execution.
+- Extracted DNS/HTTP portal process launch, health-token verification, and
+  shutdown into `PortalManager` while preserving the existing NetShaper wrapper
+  methods.
+- Replaced internal numeric module checks with named module IDs after CLI
+  parsing while keeping the user-facing numeric menu unchanged.
+
 ### Offensive network toolkit migration
 
 - Rebranded public CLI/docs/package metadata around the offensive network
