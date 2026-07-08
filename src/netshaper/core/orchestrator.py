@@ -1101,16 +1101,22 @@ class NetShaper:
             self._fake_server_proc = None
         return ok
 
-    def _stop_arp_amplification(self) -> None:
+    def _stop_arp_amplification(self) -> bool:
         amplifier = getattr(self, "_arp_amplifier", None)
         if not amplifier:
-            return
+            return True
         try:
-            amplifier.shutdown()
+            stopped = amplifier.shutdown()
         except Exception as exc:
             log.error(f"ARP amplification cleanup failed: {exc}")
-        finally:
-            self._arp_amplifier = None
+            return False
+
+        if stopped is False:
+            log.error("ARP amplification cleanup failed")
+            return False
+
+        self._arp_amplifier = None
+        return True
 
     def launch_sniffer(
         self,

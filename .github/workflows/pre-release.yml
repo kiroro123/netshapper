@@ -29,7 +29,7 @@ jobs:
           fetch-depth: 0
 
       - name: Invalidate stale privileged label on PR sync
-        uses: actions/github-script@v6
+        uses: actions/github-script@v8
         with:
           script: |
             const { data: pullRequest } = await github.rest.pulls.get({
@@ -100,7 +100,7 @@ jobs:
           bandit -r src/netshaper/ -ll
 
       - name: Require privileged-test label
-        uses: actions/github-script@v6
+        uses: actions/github-script@v8
         with:
           script: |
             const { data: pullRequest } = await github.rest.pulls.get({
