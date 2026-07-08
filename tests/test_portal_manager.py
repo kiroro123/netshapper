@@ -33,6 +33,37 @@ class PortalManagerTests(unittest.TestCase):
 
         port_check.assert_not_called()
         popen.assert_not_called()
+        self.assertEqual(manager.get_state_for_persistence(), {})
+
+    def test_state_includes_owned_portal_process(self):
+        manager = PortalManager("192.0.2.10", ["192.0.2.0/24"])
+        process = mock.Mock()
+        process.pid = 1234
+        process.poll.return_value = None
+        manager.process = process
+        manager._command = [
+            "/usr/bin/python3",
+            "-m",
+            "netshaper.portal",
+            "--health-token",
+            "token",
+        ]
+        manager._health_token = "token"
+
+        with mock.patch(
+            "netshaper.core.portal_manager.process_owner_metadata",
+            return_value={
+                "pid": 1234,
+                "process_create_time": 456.0,
+                "created_at": 789.0,
+            },
+        ):
+            state = manager.get_state_for_persistence()
+
+        self.assertEqual(state["service"], "portal")
+        self.assertEqual(state["pid"], 1234)
+        self.assertEqual(state["ownership_token"], "token")
+        self.assertIn("netshaper.portal", state["argv"])
 
     def test_start_waits_for_existing_child(self):
         manager = PortalManager("192.0.2.10", ["192.0.2.0/24"])

@@ -20,7 +20,11 @@ class OwnerStatus(Enum):
 
 def current_owner_metadata() -> dict[str, object]:
     """Return metadata that can later identify this exact process instance."""
-    pid = os.getpid()
+    return process_owner_metadata(os.getpid())
+
+
+def process_owner_metadata(pid: int) -> dict[str, object]:
+    """Return metadata that can later identify an exact process instance."""
     try:
         process_create_time: Optional[float] = psutil.Process(pid).create_time()
     except Exception:
