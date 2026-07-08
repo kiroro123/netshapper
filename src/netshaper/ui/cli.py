@@ -8,6 +8,7 @@ import argparse
 from dataclasses import dataclass, replace
 from ipaddress import ip_address, ip_network
 import os
+import shlex
 import signal
 import socket
 import sys
@@ -27,6 +28,16 @@ from netshaper import config
 from netshaper.config import VERSION
 from netshaper.core.authorization import AuthorizationError, AuthorizationPolicy
 from netshaper.core.plugin_loader import PluginLoadError, PluginLoader
+from netshaper.core.session_plan import (
+    ArpOptions,
+    CaptureOptions,
+    DnsOptions,
+    MitmOptions,
+    ModuleID,
+    PortalOptions,
+    SessionPlan,
+)
+from netshaper.core.session_runner import SessionRunner
 from netshaper.models import Device
 from netshaper.network.shaper import ShapingProfile
 from netshaper.network.spoofers import validate_spoof_timing
@@ -59,6 +70,19 @@ class ExploitOptions:
     @property
     def portal_web_security_demo(self) -> bool:
         return self.hsts_idn_demo
+
+
+MODULE_BY_NUMBER = {
+    1: ModuleID.ARP,
+    2: ModuleID.DNS,
+    3: ModuleID.PORTAL,
+    4: ModuleID.SHAPING,
+    5: ModuleID.CAPTURE,
+    6: ModuleID.MITM,
+    7: ModuleID.ARP_AMPLIFICATION,
+    8: ModuleID.DNSSEC,
+    9: ModuleID.HSTS_IDN_DEMO,
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -388,9 +412,9 @@ def pick_targets_ui(devices: List[Device]) -> List[Device]:
             print_flush("  [!] Invalid format. Use numbers, ranges, or 'all'.")
 
 
-def normalize_module_choices(raw: str) -> tuple[set[int], list[str]]:
+def normalize_module_choices(raw: str) -> tuple[set[ModuleID], list[str]]:
     """Parse module numbers and return valid module choices plus invalid tokens."""
-    modules: set[int] = set()
+    modules: set[ModuleID] = set()
     invalid: list[str] = []
 
     # Accept both "1 3 5" and "1,3,5" and "1, 3, 5"
@@ -401,8 +425,9 @@ def normalize_module_choices(raw: str) -> tuple[set[int], list[str]]:
             invalid.append(token)
             continue
 
-        if 1 <= value <= 9:
-            modules.add(value)
+        module = MODULE_BY_NUMBER.get(value)
+        if module is not None:
+            modules.add(module)
         else:
             invalid.append(token)
 
@@ -427,18 +452,18 @@ def print_module_menu() -> None:
 
 
 def resolve_exploit_options(
-    args: argparse.Namespace, modules: set[int]
+    args: argparse.Namespace, modules: set[ModuleID]
 ) -> ExploitOptions:
     """Merge module picks with explicit CLI exploit flags."""
     arp_amplify = args.arp_amplify
-    if 7 in modules and arp_amplify == 0:
+    if ModuleID.ARP_AMPLIFICATION in modules and arp_amplify == 0:
         arp_amplify = 256
 
     dnssec_mode = args.dnssec_suppression
-    if 8 in modules and dnssec_mode == "off":
+    if ModuleID.DNSSEC in modules and dnssec_mode == "off":
         dnssec_mode = "fail-closed"
 
-    hsts_idn_demo = args.hsts_idn_demo or 9 in modules
+    hsts_idn_demo = args.hsts_idn_demo or ModuleID.HSTS_IDN_DEMO in modules
 
     return ExploitOptions(
         arp_amplify=arp_amplify,
@@ -452,38 +477,38 @@ def resolve_exploit_options(
 
 
 def apply_module_dependencies(
-    modules: set[int], exploit: ExploitOptions
-) -> tuple[set[int], ExploitOptions]:
+    modules: set[ModuleID], exploit: ExploitOptions
+) -> tuple[set[ModuleID], ExploitOptions]:
     """Prompt for required base modules or disable dependent advanced modules."""
     modules = set(modules)
 
-    if exploit.arp_amplification_enabled and 1 not in modules:
+    if exploit.arp_amplification_enabled and ModuleID.ARP not in modules:
         print_flush("  [!] ARP amplification requires ARP spoofing.")
         if safe_input("  Enable ARP spoofing too? (y/n): ").lower() == "y":
-            modules.add(1)
+            modules.add(ModuleID.ARP)
         else:
-            modules.discard(7)
+            modules.discard(ModuleID.ARP_AMPLIFICATION)
             exploit = replace(exploit, arp_amplify=0, cam_exhaust=0)
             print_flush("  [-] ARP amplification disabled.")
 
-    if exploit.dnssec_enabled and 2 not in modules:
+    if exploit.dnssec_enabled and ModuleID.DNS not in modules:
         print_flush("  [!] DNSSEC suppression requires DNS spoofing.")
         if safe_input("  Enable DNS spoofing too? (y/n): ").lower() == "y":
-            modules.add(2)
+            modules.add(ModuleID.DNS)
         else:
-            modules.discard(8)
+            modules.discard(ModuleID.DNSSEC)
             exploit = replace(exploit, dnssec_mode="off")
             print_flush("  [-] DNSSEC suppression disabled.")
 
-    if exploit.hsts_idn_demo and 3 not in modules:
+    if exploit.hsts_idn_demo and ModuleID.PORTAL not in modules:
         print_flush(
             "  [!] HSTS/IDN first-visit offensive demo requires the "
             "captive portal HTTP service."
         )
         if safe_input("  Enable captive portal too? (y/n): ").lower() == "y":
-            modules.add(3)
+            modules.add(ModuleID.PORTAL)
         else:
-            modules.discard(9)
+            modules.discard(ModuleID.HSTS_IDN_DEMO)
             exploit = replace(exploit, hsts_idn_demo=False)
             print_flush("  [-] HSTS/IDN offensive demo disabled.")
 
@@ -498,21 +523,35 @@ def portal_launch_hint(
     smart_spoof_all: bool = False,
     health_token: Optional[str] = None,
 ) -> str:
-    flags = [f"--host-ip {host_ip}"]
+    flags = [f"--host-ip {shlex.quote(host_ip)}"]
     if health_token:
-        flags.extend(["--health-token", health_token])
+        flags.extend(["--health-token", shlex.quote(health_token)])
     if smart_spoof_all:
         flags.append("--smart-spoof-all")
     for network in authorized_cidrs or []:
-        flags.append(f"--allow-cidr {network}")
-    flags.append(f"--allow-cidr {host_ip}/32")
+        flags.append(f"--allow-cidr {shlex.quote(str(network))}")
+    flags.append(f"--allow-cidr {shlex.quote(f'{host_ip}/32')}")
     if exploit.portal_suppress_dnssec:
-        flags.append(f"--dnssec-mode {exploit.dnssec_mode}")
+        flags.append(f"--dnssec-mode {shlex.quote(exploit.dnssec_mode)}")
     if exploit.portal_web_security_demo:
         flags.append("--hsts-idn-demo")
     if exploit.dnssec_enabled:
-        flags.append(f"--upstream {exploit.dnssec_upstream}")
-    return "sudo netshaper-portal " + " ".join(flags)
+        flags.append(f"--upstream {shlex.quote(exploit.dnssec_upstream)}")
+
+    project_root = os.path.dirname(PACKAGE_PARENT)
+    running_from_source = (
+        os.path.isfile(os.path.join(project_root, "pyproject.toml"))
+        and os.path.isdir(os.path.join(PACKAGE_PARENT, "netshaper"))
+    )
+    if running_from_source:
+        command = (
+            "sudo env PYTHONPATH="
+            f"{shlex.quote(PACKAGE_PARENT)} "
+            f"{shlex.quote(sys.executable)} -m netshaper.portal"
+        )
+    else:
+        command = "sudo netshaper-portal"
+    return command + " " + " ".join(flags)
 
 
 def pick_limit_ui() -> float:
@@ -605,16 +644,16 @@ def validate_targets(
     return validated
 
 
-def run_active_session(
-    ns,
-    targets: List[Union[Device, str]],
+def build_session_plan(
     *,
+    interface: str,
+    authorized_cidrs: list,
+    targets: List[Union[Device, str]],
+    modules: set[ModuleID],
     arp_on: bool,
     dns_spoof_on: bool,
     captive_portal: bool,
     http_redirect_port: Optional[int],
-    throttle_on: bool,
-    limit: Optional[float],
     sniff_on: bool,
     save_pcap: bool,
     rolling: bool,
@@ -623,85 +662,41 @@ def run_active_session(
     arp_interval: float = 2.0,
     arp_burst: int = 1,
     exploit: Optional[ExploitOptions] = None,
-) -> None:
+) -> SessionPlan:
     exploit = exploit or ExploitOptions()
-    try:
-        target_ips = [target_ip(target) for target in targets]
-        if not ns.save_state():
-            raise RuntimeError("Could not write recovery state before setup.")
-        ns._apply_global_rules()
-        if not ns.save_state():
-            raise RuntimeError("Could not update recovery state after global rules.")
-        for target in targets:
-            target_options = {
-                "arp_on": arp_on,
-                "dns_spoof": dns_spoof_on,
-                "captive_portal": captive_portal,
-                "http_redirect_port": http_redirect_port,
-                "limit": limit if throttle_on else None,
-                "arp_interval": arp_interval,
-                "arp_burst": arp_burst,
-            }
-            if shaping_profile is not None:
-                target_options["shaping_profile"] = shaping_profile
-            ns.add_target(target, **target_options)
-            if not ns.save_state():
-                raise RuntimeError(
-                    "Could not update recovery state after target setup."
-                )
-
-        if sniff_on:
-            ns.launch_sniffer(
-                target_ips=target_ips,
-                save_pcap=save_pcap,
-                rolling=rolling,
-                packet_verbose=packet_verbose,
-            )
-
-        if exploit.arp_amplification_enabled:
-            ns.start_arp_amplification(
-                phantom_count=exploit.arp_amplify,
-                burst=exploit.arp_amplify_burst,
-                interval=exploit.arp_amplify_interval,
-                cam_exhaust=exploit.cam_exhaust,
-            )
-
-        if not ns.save_state():
-            raise RuntimeError("Could not update recovery state after startup.")
-
-        expected_tcp_ports = [http_redirect_port] if http_redirect_port else []
-        expected_udp_ports = [53] if dns_spoof_on else []
-        ns.start_monitor_thread()
-        issues = ns.runtime_health_issues(
-            expect_sniffer=sniff_on,
-            expect_monitor=True,
-            expected_tcp_ports=expected_tcp_ports,
-            expected_udp_ports=expected_udp_ports,
-        )
-        if issues:
-            raise RuntimeError("Startup verification failed: " + "; ".join(issues))
-
-        print_flush(green("[+] Startup verified. Evidence:"))
-        for line in ns.runtime_evidence_lines(
-            target_ips, expect_sniffer=sniff_on, save_pcap=save_pcap, rolling=rolling
-        ):
-            print_flush(f"    {line}")
-        print_flush(green("[*] Monitoring.") + " Press " + bold("Ctrl+C") + " to stop.")
-        while not ns.stop_event.wait(1):
-            issues = ns.runtime_health_issues(
-                expect_sniffer=sniff_on,
-                expect_monitor=True,
-                expected_tcp_ports=expected_tcp_ports,
-                expected_udp_ports=expected_udp_ports,
-            )
-            if issues:
-                raise RuntimeError("Runtime health check failed: " + "; ".join(issues))
-    finally:
-        ns.cleanup()
-        if getattr(ns, "_cleanup_complete", True):
-            print_flush("[+] Teardown complete. Goodbye.")
-        else:
-            print_flush("[!] Teardown finished with cleanup errors. Check logs.")
+    return SessionPlan(
+        interface=interface,
+        authorized_cidrs=tuple(str(network) for network in authorized_cidrs),
+        targets=tuple(targets),
+        modules=frozenset(modules),
+        arp=ArpOptions(
+            enabled=arp_on,
+            interval=arp_interval,
+            burst=arp_burst,
+            amplify=exploit.arp_amplify,
+            amplify_burst=exploit.arp_amplify_burst,
+            amplify_interval=exploit.arp_amplify_interval,
+            cam_exhaust=exploit.cam_exhaust,
+        ),
+        dns=DnsOptions(
+            enabled=dns_spoof_on,
+            dnssec_mode=exploit.dnssec_mode,
+            upstream=exploit.dnssec_upstream,
+        ),
+        portal=PortalOptions(
+            enabled=captive_portal,
+            http_redirect_port=http_redirect_port,
+            hsts_idn_demo=exploit.hsts_idn_demo,
+        ),
+        capture=CaptureOptions(
+            enabled=sniff_on,
+            save_pcap=save_pcap,
+            rolling=rolling,
+            packet_verbose=packet_verbose,
+        ),
+        shaping=shaping_profile,
+        mitm=MitmOptions(enabled=ModuleID.MITM in modules),
+    )
 
 
 def main() -> None:
@@ -857,17 +852,18 @@ def main() -> None:
             print_flush("  [!] No offensive network modules remain enabled.")
             sys.exit(0)
 
-        arp_on = 1 in modules
-        dns_spoof_on = 2 in modules
-        captive_portal = 3 in modules
-        throttle_on = 4 in modules
-        sniff_on = 5 in modules
-        mitm_on = 6 in modules
+        arp_on = ModuleID.ARP in modules
+        dns_spoof_on = ModuleID.DNS in modules
+        captive_portal = ModuleID.PORTAL in modules
+        throttle_on = ModuleID.SHAPING in modules
+        sniff_on = ModuleID.CAPTURE in modules
+        mitm_on = ModuleID.MITM in modules
 
         if dns_spoof_on and not captive_portal:
             print_flush("  [!] DNS spoofing without captive portal can break HTTP.")
             if safe_input("  Enable captive portal too? (y/n): ").lower() == "y":
                 captive_portal = True
+                modules.add(ModuleID.PORTAL)
 
         if captive_portal and mitm_on:
             http_redirect_port: Optional[int] = 8088
@@ -1014,6 +1010,25 @@ def main() -> None:
                 )
                 sys.exit("[NetShaper] mitmproxy is required for HTTPS inspection.")
 
+        plan = build_session_plan(
+            interface=interface,
+            authorized_cidrs=authorized_cidrs,
+            targets=targets,
+            modules=modules,
+            arp_on=arp_on,
+            dns_spoof_on=dns_spoof_on,
+            captive_portal=captive_portal,
+            http_redirect_port=http_redirect_port,
+            sniff_on=sniff_on,
+            save_pcap=save_pcap,
+            rolling=rolling,
+            packet_verbose=args.packet_verbose,
+            shaping_profile=shaping_profile,
+            arp_interval=args.arp_interval,
+            arp_burst=args.arp_burst,
+            exploit=exploit,
+        )
+
         W = 58
 
         def _yn(flag: bool) -> str:
@@ -1085,24 +1100,7 @@ def main() -> None:
                     )
                 else:
                     raise RuntimeError(f"Plugin {plugin_id} failed to start")
-            run_active_session(
-                ns,
-                targets,
-                arp_on=arp_on,
-                dns_spoof_on=dns_spoof_on,
-                captive_portal=captive_portal,
-                http_redirect_port=http_redirect_port,
-                throttle_on=throttle_on,
-                limit=limit,
-                sniff_on=sniff_on,
-                save_pcap=save_pcap,
-                rolling=rolling,
-                packet_verbose=args.packet_verbose,
-                shaping_profile=shaping_profile,
-                arp_interval=args.arp_interval,
-                arp_burst=args.arp_burst,
-                exploit=exploit,
-            )
+            SessionRunner(ns).execute(plan)
         except KeyboardInterrupt:
             ns.stop_event.set()
     except RuntimeError as exc:

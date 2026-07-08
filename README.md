@@ -168,11 +168,13 @@ sudo env PYTHONPATH="$PWD/src" python -m netshaper -i <interface> \
   --allow-cidr <authorized-cidr> --targets <ip> --dry-run
 ```
 
-Optional DNS/HTTP captive-portal helper (separate terminal):
+Optional DNS/HTTP captive-portal helper (separate terminal). Start NetShaper
+first and copy the helper command it prints so the session-specific
+`--health-token` is included:
 
 ```bash
 sudo env PYTHONPATH="$PWD/src" python -m netshaper.portal \
-  --smart-spoof-all --host-ip <your-ip> \
+  --smart-spoof-all --host-ip <your-ip> --health-token <token> \
   --allow-cidr <authorized-cidr>
 ```
 

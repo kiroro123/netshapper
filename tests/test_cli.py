@@ -3,8 +3,35 @@ import threading
 import unittest
 from unittest import mock
 
+from netshaper.core.session_plan import (
+    ArpOptions,
+    CaptureOptions,
+    DnsOptions,
+    MitmOptions,
+    ModuleID,
+    PortalOptions,
+    SessionPlan,
+)
+from netshaper.core.session_runner import SessionRunner
 from netshaper.models import Device
 from netshaper.ui import cli
+
+
+def _plan(targets, **overrides):
+    values = {
+        "interface": "eth0",
+        "authorized_cidrs": ("192.0.2.0/24",),
+        "targets": tuple(targets),
+        "modules": frozenset({ModuleID.ARP}),
+        "arp": ArpOptions(enabled=True),
+        "dns": DnsOptions(enabled=False),
+        "portal": PortalOptions(enabled=False),
+        "capture": CaptureOptions(enabled=False),
+        "shaping": None,
+        "mitm": MitmOptions(enabled=False),
+    }
+    values.update(overrides)
+    return SessionPlan(**values)
 
 
 class CliTests(unittest.TestCase):
@@ -96,6 +123,16 @@ class CliTests(unittest.TestCase):
         self.assertIn("--smart-spoof-all", hint)
         self.assertIn("--allow-cidr 192.0.2.0/24", hint)
         self.assertIn("--allow-cidr 192.0.2.10/32", hint)
+        self.assertIn(" -m netshaper.portal ", hint)
+        self.assertTrue(hint.startswith("sudo env PYTHONPATH="))
+
+    def test_portal_launch_hint_uses_packaged_command_outside_source_checkout(self):
+        with mock.patch("netshaper.ui.cli.os.path.isfile", return_value=False):
+            hint = cli.portal_launch_hint(
+                cli.ExploitOptions(),
+                host_ip="192.0.2.10",
+            )
+
         self.assertTrue(hint.startswith("sudo netshaper-portal "))
 
     def test_parse_args_rejects_limit_outside_interactive_range(self):
@@ -106,12 +143,19 @@ class CliTests(unittest.TestCase):
 
     def test_normalize_module_choices_rejects_bad_input(self):
         modules, invalid = cli.normalize_module_choices("1 10 x")
-        self.assertEqual(modules, {1})
+        self.assertEqual(modules, {ModuleID.ARP})
         self.assertEqual(invalid, ["10", "x"])
 
     def test_normalize_module_choices_accepts_exploit_modules(self):
         modules, invalid = cli.normalize_module_choices("7 8 9")
-        self.assertEqual(modules, {7, 8, 9})
+        self.assertEqual(
+            modules,
+            {
+                ModuleID.ARP_AMPLIFICATION,
+                ModuleID.DNSSEC,
+                ModuleID.HSTS_IDN_DEMO,
+            },
+        )
         self.assertEqual(invalid, [])
 
     def test_parse_args_accepts_exploit_flags(self):
@@ -154,7 +198,10 @@ class CliTests(unittest.TestCase):
         ]):
             args = cli.parse_args()
 
-        exploit = cli.resolve_exploit_options(args, {8, 9})
+        exploit = cli.resolve_exploit_options(
+            args,
+            {ModuleID.DNSSEC, ModuleID.HSTS_IDN_DEMO},
+        )
         self.assertEqual(exploit.dnssec_mode, "nxdomain")
         self.assertEqual(exploit.arp_amplify, 32)
         self.assertTrue(exploit.hsts_idn_demo)
@@ -163,7 +210,14 @@ class CliTests(unittest.TestCase):
         with mock.patch("sys.argv", ["netshaper"]):
             args = cli.parse_args()
 
-        exploit = cli.resolve_exploit_options(args, {7, 8, 9})
+        exploit = cli.resolve_exploit_options(
+            args,
+            {
+                ModuleID.ARP_AMPLIFICATION,
+                ModuleID.DNSSEC,
+                ModuleID.HSTS_IDN_DEMO,
+            },
+        )
         self.assertEqual(exploit.arp_amplify, 256)
         self.assertEqual(exploit.dnssec_mode, "fail-closed")
         self.assertTrue(exploit.hsts_idn_demo)
@@ -173,9 +227,12 @@ class CliTests(unittest.TestCase):
 
         with mock.patch("netshaper.ui.cli.safe_input", return_value="y"), \
              mock.patch("netshaper.ui.cli.print_flush"):
-            modules, updated = cli.apply_module_dependencies({7}, exploit)
+            modules, updated = cli.apply_module_dependencies(
+                {ModuleID.ARP_AMPLIFICATION},
+                exploit,
+            )
 
-        self.assertEqual(modules, {1, 7})
+        self.assertEqual(modules, {ModuleID.ARP, ModuleID.ARP_AMPLIFICATION})
         self.assertEqual(updated.arp_amplify, 64)
 
     def test_apply_module_dependencies_disables_declined_advanced_module(self):
@@ -187,7 +244,14 @@ class CliTests(unittest.TestCase):
 
         with mock.patch("netshaper.ui.cli.safe_input", return_value="n"), \
              mock.patch("netshaper.ui.cli.print_flush"):
-            modules, updated = cli.apply_module_dependencies({7, 8, 9}, exploit)
+            modules, updated = cli.apply_module_dependencies(
+                {
+                    ModuleID.ARP_AMPLIFICATION,
+                    ModuleID.DNSSEC,
+                    ModuleID.HSTS_IDN_DEMO,
+                },
+                exploit,
+            )
 
         self.assertEqual(modules, set())
         self.assertFalse(updated.arp_amplification_enabled)
@@ -196,8 +260,47 @@ class CliTests(unittest.TestCase):
 
     def test_normalize_module_choices_accepts_comma_separated_values(self):
         modules, invalid = cli.normalize_module_choices("1, 3,5 6")
-        self.assertEqual(modules, {1, 3, 5, 6})
+        self.assertEqual(
+            modules,
+            {ModuleID.ARP, ModuleID.PORTAL, ModuleID.CAPTURE, ModuleID.MITM},
+        )
         self.assertEqual(invalid, [])
+
+    def test_build_session_plan_creates_named_core_options(self):
+        exploit = cli.ExploitOptions(
+            arp_amplify=64,
+            dnssec_mode="fail-closed",
+            hsts_idn_demo=True,
+        )
+
+        plan = cli.build_session_plan(
+            interface="eth0",
+            authorized_cidrs=["192.0.2.0/24"],
+            targets=["192.0.2.10"],
+            modules={
+                ModuleID.ARP,
+                ModuleID.DNS,
+                ModuleID.PORTAL,
+                ModuleID.ARP_AMPLIFICATION,
+            },
+            arp_on=True,
+            dns_spoof_on=True,
+            captive_portal=True,
+            http_redirect_port=80,
+            sniff_on=False,
+            save_pcap=False,
+            rolling=False,
+            exploit=exploit,
+        )
+
+        self.assertEqual(plan.interface, "eth0")
+        self.assertEqual(plan.authorized_cidrs, ("192.0.2.0/24",))
+        self.assertEqual(plan.target_ips, ("192.0.2.10",))
+        self.assertIn(ModuleID.ARP_AMPLIFICATION, plan.modules)
+        self.assertTrue(plan.arp.amplification_enabled)
+        self.assertEqual(plan.arp.amplify, 64)
+        self.assertTrue(plan.dns.dnssec_enabled)
+        self.assertTrue(plan.portal.hsts_idn_demo)
 
     def test_pick_limit_ui_returns_new_10_mbps_preset(self):
         with mock.patch("netshaper.ui.cli.safe_input", return_value="5"), \
@@ -303,28 +406,17 @@ class CliTests(unittest.TestCase):
             with self.assertRaisesRegex(SystemExit, "Could not inspect"):
                 cli.choose_interface("eth0")
 
-    def test_run_active_session_cleans_up_when_sniffer_start_fails(self):
+    def test_session_runner_cleans_up_when_sniffer_start_fails(self):
         ns = mock.Mock()
         ns.stop_event = threading.Event()
         ns.save_state.return_value = True
         ns.launch_sniffer.side_effect = RuntimeError("sniffer failed")
         targets = ["192.0.2.10"]
+        plan = _plan(targets, capture=CaptureOptions(enabled=True))
 
-        with mock.patch("netshaper.ui.cli.print_flush"), \
+        with mock.patch("netshaper.core.session_runner.print_flush"), \
              self.assertRaises(RuntimeError):
-            cli.run_active_session(
-                ns,
-                targets,
-                arp_on=True,
-                dns_spoof_on=False,
-                captive_portal=False,
-                http_redirect_port=None,
-                throttle_on=False,
-                limit=None,
-                sniff_on=True,
-                save_pcap=False,
-                rolling=False,
-            )
+            SessionRunner(ns).execute(plan)
 
         ns._apply_global_rules.assert_called_once()
         ns.add_target.assert_called_once_with(
@@ -346,28 +438,17 @@ class CliTests(unittest.TestCase):
         self.assertEqual(ns.save_state.call_count, 3)
         ns.cleanup.assert_called_once()
 
-    def test_run_active_session_passes_discovered_device_to_add_target(self):
+    def test_session_runner_passes_discovered_device_to_add_target(self):
         ns = mock.Mock()
         ns.stop_event = threading.Event()
         ns.save_state.return_value = True
         ns.launch_sniffer.side_effect = RuntimeError("sniffer failed")
         target = Device(ip="192.0.2.10", mac="00:11:22:33:44:55")
+        plan = _plan([target], capture=CaptureOptions(enabled=True))
 
-        with mock.patch("netshaper.ui.cli.print_flush"), \
+        with mock.patch("netshaper.core.session_runner.print_flush"), \
              self.assertRaises(RuntimeError):
-            cli.run_active_session(
-                ns,
-                [target],
-                arp_on=True,
-                dns_spoof_on=False,
-                captive_portal=False,
-                http_redirect_port=None,
-                throttle_on=False,
-                limit=None,
-                sniff_on=True,
-                save_pcap=False,
-                rolling=False,
-            )
+            SessionRunner(ns).execute(plan)
 
         ns.add_target.assert_called_once_with(
             target,
@@ -387,60 +468,38 @@ class CliTests(unittest.TestCase):
         )
         ns.cleanup.assert_called_once()
 
-    def test_run_active_session_aborts_before_mutation_when_state_save_fails(self):
+    def test_session_runner_aborts_before_mutation_when_state_save_fails(self):
         ns = mock.Mock()
         ns.stop_event = threading.Event()
         ns.save_state.return_value = False
+        plan = _plan(["192.0.2.10"])
 
-        with mock.patch("netshaper.ui.cli.print_flush"), \
+        with mock.patch("netshaper.core.session_runner.print_flush"), \
              self.assertRaises(RuntimeError):
-            cli.run_active_session(
-                ns,
-                ["192.0.2.10"],
-                arp_on=True,
-                dns_spoof_on=False,
-                captive_portal=False,
-                http_redirect_port=None,
-                throttle_on=False,
-                limit=None,
-                sniff_on=False,
-                save_pcap=False,
-                rolling=False,
-            )
+            SessionRunner(ns).execute(plan)
 
         ns._apply_global_rules.assert_not_called()
         ns.add_target.assert_not_called()
         ns.cleanup.assert_called_once()
 
-    def test_run_active_session_rejects_unhealthy_startup(self):
+    def test_session_runner_rejects_unhealthy_startup(self):
         ns = mock.Mock()
         ns.stop_event = threading.Event()
         ns.save_state.return_value = True
         ns.runtime_health_issues.return_value = [
             "packet sniffer stopped unexpectedly"
         ]
+        plan = _plan(["192.0.2.10"])
 
-        with mock.patch("netshaper.ui.cli.print_flush"), \
+        with mock.patch("netshaper.core.session_runner.print_flush"), \
              self.assertRaisesRegex(RuntimeError, "Startup verification failed"):
-            cli.run_active_session(
-                ns,
-                ["192.0.2.10"],
-                arp_on=True,
-                dns_spoof_on=False,
-                captive_portal=False,
-                http_redirect_port=None,
-                throttle_on=False,
-                limit=None,
-                sniff_on=False,
-                save_pcap=False,
-                rolling=False,
-            )
+            SessionRunner(ns).execute(plan)
 
         ns.start_monitor_thread.assert_called_once()
         ns.runtime_evidence_lines.assert_not_called()
         ns.cleanup.assert_called_once()
 
-    def test_run_active_session_reports_runtime_health_failure(self):
+    def test_session_runner_reports_runtime_health_failure(self):
         class LoopOnceEvent:
             def wait(self, _timeout):
                 return False
@@ -456,51 +515,30 @@ class CliTests(unittest.TestCase):
             ["bandwidth monitor thread is not running"],
         ]
         ns.runtime_evidence_lines.return_value = ["Session ID: NS-TEST"]
+        plan = _plan(["192.0.2.10"])
 
-        with mock.patch("netshaper.ui.cli.print_flush"), \
+        with mock.patch("netshaper.core.session_runner.print_flush"), \
              self.assertRaisesRegex(RuntimeError, "Runtime health check failed"):
-            cli.run_active_session(
-                ns,
-                ["192.0.2.10"],
-                arp_on=True,
-                dns_spoof_on=False,
-                captive_portal=False,
-                http_redirect_port=None,
-                throttle_on=False,
-                limit=None,
-                sniff_on=False,
-                save_pcap=False,
-                rolling=False,
-            )
+            SessionRunner(ns).execute(plan)
 
         ns.start_monitor_thread.assert_called_once()
         ns.runtime_evidence_lines.assert_called_once()
         ns.cleanup.assert_called_once()
 
-    def test_run_active_session_starts_arp_amplification_when_requested(self):
+    def test_session_runner_starts_arp_amplification_when_requested(self):
         ns = mock.Mock()
         ns.stop_event = mock.Mock()
         ns.stop_event.wait.return_value = True
         ns.save_state.return_value = True
         ns.runtime_health_issues.return_value = []
         ns.runtime_evidence_lines.return_value = ["Session ID: NS-TEST"]
-        exploit = cli.ExploitOptions(arp_amplify=64, cam_exhaust=32)
+        plan = _plan(
+            ["192.0.2.10"],
+            arp=ArpOptions(enabled=True, amplify=64, cam_exhaust=32),
+        )
 
-        with mock.patch("netshaper.ui.cli.print_flush"):
-            cli.run_active_session(
-                ns,
-                ["192.0.2.10"],
-                arp_on=True,
-                dns_spoof_on=False,
-                captive_portal=False,
-                http_redirect_port=None,
-                throttle_on=False,
-                limit=None,
-                sniff_on=False,
-                save_pcap=False,
-                rolling=False,
-                exploit=exploit,
-            )
+        with mock.patch("netshaper.core.session_runner.print_flush"):
+            SessionRunner(ns).execute(plan)
 
         ns.start_arp_amplification.assert_called_once_with(
             phantom_count=64,
@@ -640,7 +678,7 @@ class CliTests(unittest.TestCase):
                         side_effect=["2", "n", "n"]), \
              mock.patch("netshaper.ui.cli.check_local_port",
                         return_value=False), \
-             mock.patch("netshaper.ui.cli.run_active_session") as run_mock, \
+             mock.patch("netshaper.ui.cli.SessionRunner.execute") as run_mock, \
              mock.patch("netshaper.ui.cli.psutil.net_if_addrs",
                         return_value={"eth0": []}), \
              self.assertRaisesRegex(SystemExit, "requires verified fake DNS"):

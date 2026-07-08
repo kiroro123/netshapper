@@ -37,8 +37,9 @@ passes it through explicitly.
 ## Offensive DNS + Portal Engine
 
 `netshaper-portal` handles DNS queries and serves the captive-portal HTTP page.
-Run it in a **separate terminal** before starting NetShaper when using modules
-2 or 3.
+When modules 2 or 3 are enabled, NetShaper verifies the portal with a
+per-session health token before it trusts any process already listening on
+ports `53` or `80`.
 
 ```bash
 sudo env PYTHONPATH="$PWD/src" python -m netshaper.portal
@@ -52,22 +53,58 @@ alias sportal='sudo env PYTHONPATH=/path/to/netshaper/src python -m netshaper.po
 
 The portal engine binds ports `53` (DNS) and `80` (HTTP), so it requires `sudo`.
 
-## Recommended Two-Terminal Workflow
+## Recommended Portal Workflow
 
-**Terminal 1** — portal engine:
+The easiest path is to let NetShaper launch the portal for the current session:
 
-```bash
-sportal --smart-spoof-all --host-ip <your-ip> \
-  --allow-cidr <authorized-cidr> --verbose-dns
-```
-
-**Terminal 2** — NetShaper:
+**Terminal 1** - NetShaper:
 
 ```bash
 snetshaper -i <interface> --allow-cidr <authorized-cidr>
 ```
 
-Then select modules `1 2 3` (or `1,2,3`) for ARP + DNS + captive portal.
+Then select modules `1 2 3` (or `1,2,3`) for ARP + DNS + captive portal. When
+NetShaper asks:
+
+```text
+Auto-launch netshaper-portal? (y/n):
+```
+
+answer `y`.
+
+Do **not** start a separate portal first unless you include the exact
+`--health-token` printed by the current NetShaper session. A portal already
+listening without that token is treated as unverified and will be refused.
+
+## Manual Two-Terminal Workflow
+
+Use this only when you want to watch verbose DNS logs in a separate terminal.
+
+**Terminal 1** - start NetShaper first:
+
+```bash
+snetshaper -i <interface> --allow-cidr <authorized-cidr>
+```
+
+Select modules `1 2 3`, then copy the full portal command NetShaper prints.
+It will include a session-specific token like:
+
+```bash
+sportal --host-ip <your-ip> \
+  --health-token <token-printed-by-netshaper> \
+  --smart-spoof-all \
+  --allow-cidr <authorized-cidr> \
+  --allow-cidr <your-ip>/32 \
+  --verbose-dns
+```
+
+**Terminal 2** - run that copied portal command.
+
+Then return to Terminal 1 and answer `y` at the auto-launch prompt. NetShaper
+checks the health token first; if the manually started portal is verified, it
+adopts that process instead of spawning a duplicate. If NetShaper says ports
+`53` or `80` are occupied by an unverified listener, stop the old portal
+process and relaunch it with the current session's `--health-token`.
 
 ## Offensive Network Module Menu
 
