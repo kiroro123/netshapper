@@ -45,6 +45,7 @@ class PortalManager:
         self.authorized_cidrs = tuple(str(network) for network in authorized_cidrs)
         self.process: Optional[subprocess.Popen[Any]] = None
         self._command: Optional[list[str]] = None
+        self._process_identity: Optional[dict[str, object]] = None
         self._health_token: Optional[str] = None
         self._journal = journal
 
@@ -68,6 +69,12 @@ class PortalManager:
             return True
 
         if self.process and self.process.poll() is None:
+            if self._process_identity is None and not self._capture_process_identity(
+                self.process,
+            ):
+                log.error("Could not establish recoverable portal process identity")
+                self.stop()
+                return False
             log.debug("Waiting for existing netshaper-portal child")
         else:
             dns_claimed = check_local_port(self.host_ip, 53, socket.SOCK_DGRAM)
@@ -105,14 +112,19 @@ class PortalManager:
                 cmd.append("--hsts-idn-demo")
 
             try:
-                self.process = subprocess.Popen(  # nosec B603
+                process = subprocess.Popen(  # nosec B603
                     cmd,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                 )
+                self.process = process
                 self._command = list(cmd)
             except OSError as exc:
                 log.error(f"portal launch failed: {exc}")
+                return False
+            if not self._capture_process_identity(process):
+                log.error("Could not establish recoverable portal process identity")
+                self.stop()
                 return False
             if not self._journal_state():
                 log.error("Refusing to run netshaper-portal without recovery state")
@@ -190,9 +202,17 @@ class PortalManager:
         if ok:
             self.process = None
             self._command = None
+            self._process_identity = None
             if not self._journal_state():
                 ok = False
         return ok
+
+    def _capture_process_identity(self, process: subprocess.Popen[Any]) -> bool:
+        identity = process_owner_metadata(process.pid)
+        if identity.get("process_create_time") is None:
+            return False
+        self._process_identity = dict(identity)
+        return True
 
     def _journal_state(self) -> bool:
         if self._journal is None:
@@ -207,11 +227,14 @@ class PortalManager:
         process = self.process
         if process is None or process.poll() is not None:
             return {}
+        if self._process_identity is None:
+            log.error("Live portal process has no recoverable identity")
+            return {}
         command = list(self._command or getattr(process, "args", []) or [])
         executable = command[0] if command else None
         return {
             "service": "portal",
-            **process_owner_metadata(process.pid),
+            **self._process_identity,
             "executable": executable,
             "argv": command,
             "ownership_token": self.health_token(),

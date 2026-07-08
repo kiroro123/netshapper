@@ -45,6 +45,7 @@ class MitmProxyManager:
         self.own_ip = own_ip
         self._mitm_proc: Optional[subprocess.Popen[Any]] = None
         self._mitm_command: Optional[list[str]] = None
+        self._mitm_process_identity: Optional[dict[str, object]] = None
         self._mitm_log_path: Optional[str] = None
         self._mitm_log_handle: Optional[object] = None
         self._journal = journal
@@ -76,6 +77,7 @@ class MitmProxyManager:
     def _clear_completed_process(self) -> None:
         self._mitm_proc = None
         self._mitm_command = None
+        self._mitm_process_identity = None
         self._close_log()
 
     @staticmethod
@@ -125,12 +127,17 @@ class MitmProxyManager:
                 "--set",
                 f"web_port={web_port}",
             ]
-            self._mitm_proc = subprocess.Popen(  # nosec B603 B607
+            process = subprocess.Popen(  # nosec B603 B607
                 command,
                 stdout=log_handle or subprocess.DEVNULL,
                 stderr=subprocess.STDOUT if log_handle else subprocess.DEVNULL,
             )
+            self._mitm_proc = process
             self._mitm_command = list(command)
+            if not self._capture_mitm_process_identity(process):
+                log.error("Could not establish recoverable mitmproxy process identity")
+                self.terminate()
+                return False
             if not self._journal_state():
                 log.error("Refusing to run mitmproxy without recovery state")
                 self.terminate()
@@ -209,11 +216,19 @@ class MitmProxyManager:
         if ok:
             self._mitm_proc = None
             self._mitm_command = None
+            self._mitm_process_identity = None
             self._close_log()
             if not self._journal_state():
                 ok = False
 
         return ok
+
+    def _capture_mitm_process_identity(self, process: subprocess.Popen[Any]) -> bool:
+        identity = process_owner_metadata(process.pid)
+        if identity.get("process_create_time") is None:
+            return False
+        self._mitm_process_identity = dict(identity)
+        return True
 
     def get_state_for_persistence(self) -> dict:
         """Get mitmproxy state for persistence."""
@@ -222,11 +237,14 @@ class MitmProxyManager:
         }
         proc = self._mitm_proc
         if proc is not None and proc.poll() is None:
+            if self._mitm_process_identity is None:
+                log.error("Live mitmproxy process has no recoverable identity")
+                return state
             command = list(self._mitm_command or getattr(proc, "args", []) or [])
             state.update(
                 {
                     "service": "mitmproxy",
-                    **process_owner_metadata(proc.pid),
+                    **self._mitm_process_identity,
                     "executable": command[0] if command else None,
                     "argv": command,
                 }
