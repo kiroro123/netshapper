@@ -69,6 +69,12 @@ class PortalManager:
             return True
 
         if self.process and self.process.poll() is None:
+            if self._command is None:
+                self._command = self._command_from_process(self.process)
+            if not self._command:
+                log.error("Could not establish recoverable portal process command")
+                self.stop()
+                return False
             if self._process_identity is None and not self._capture_process_identity(
                 self.process,
             ):
@@ -148,6 +154,40 @@ class PortalManager:
         self.stop()
         return False
 
+    def attach_owned_process(
+        self,
+        process: subprocess.Popen[Any],
+        *,
+        health_token: Optional[str] = None,
+    ) -> bool:
+        """Attach a legacy NetShaper-owned portal child to this manager."""
+        if process.poll() is not None:
+            return False
+
+        command = self._command_from_process(process)
+        self.process = process
+        self._command = command
+        if health_token:
+            self._health_token = health_token
+
+        if not command:
+            log.error("Could not establish recoverable portal process command")
+            self.stop()
+            return False
+        if not self._capture_process_identity(process):
+            log.error("Could not establish recoverable portal process identity")
+            self.stop()
+            return False
+        if not self._journal_state():
+            log.error("Refusing to attach netshaper-portal without recovery state")
+            self.stop()
+            return False
+        return True
+
+    def use_health_token(self, token: str) -> None:
+        """Use an existing portal health token without adopting a process."""
+        self._health_token = token
+
     def health_token(self) -> str:
         if not self._health_token:
             self._health_token = secrets.token_urlsafe(32)
@@ -214,6 +254,15 @@ class PortalManager:
         self._process_identity = dict(identity)
         return True
 
+    @staticmethod
+    def _command_from_process(process: subprocess.Popen[Any]) -> list[str]:
+        args = getattr(process, "args", None)
+        if isinstance(args, (list, tuple)):
+            return [str(item) for item in args]
+        if isinstance(args, str) and args:
+            return [args]
+        return []
+
     def _journal_state(self) -> bool:
         if self._journal is None:
             return True
@@ -230,7 +279,10 @@ class PortalManager:
         if self._process_identity is None:
             log.error("Live portal process has no recoverable identity")
             return {}
-        command = list(self._command or getattr(process, "args", []) or [])
+        command = list(self._command or [])
+        if not command:
+            log.error("Live portal process has no recoverable command")
+            return {}
         executable = command[0] if command else None
         return {
             "service": "portal",

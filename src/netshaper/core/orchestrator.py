@@ -125,13 +125,17 @@ class NetShaper:
                 self.authorized_cidrs,
                 journal=self._journal_state_if_ready,
             )
-            legacy_proc = getattr(self, "_fake_server_proc", None)
-            if legacy_proc is not None:
-                manager.process = legacy_proc
-            legacy_token = getattr(self, "_fake_server_health_token", None)
-            if legacy_token:
-                manager._health_token = legacy_token
             self.portal_manager = manager
+            legacy_proc = getattr(self, "_fake_server_proc", None)
+            legacy_token = getattr(self, "_fake_server_health_token", None)
+            if legacy_proc is not None:
+                if not manager.attach_owned_process(
+                    legacy_proc,
+                    health_token=legacy_token,
+                ):
+                    self._fake_server_proc = None
+            elif legacy_token:
+                manager.use_health_token(legacy_token)
         return manager
 
     @staticmethod
