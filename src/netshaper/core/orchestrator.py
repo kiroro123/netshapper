@@ -80,7 +80,10 @@ class NetShaper:
             journal=self._sync_firewall_state,
             target_authorizer=self._assert_authorized_target,
         )
-        self.mitm_manager = MitmProxyManager(getattr(self, "own_ip", None))
+        self.mitm_manager = MitmProxyManager(
+            getattr(self, "own_ip", None),
+            journal=self._journal_state_if_ready,
+        )
         self.recovery_manager = RecoveryManager(interface)
         self.sessions: Dict[str, TargetSession] = {}
         self.plugins: Dict[str, PluginInterface] = {}
@@ -90,7 +93,11 @@ class NetShaper:
         self.sniffer: Optional[Union[PacketSniffer, RollingPacketSniffer]] = None
         self.stop_event = threading.Event()
         self._mitm_log_path: Optional[str] = None
-        self.portal_manager = PortalManager(self.own_ip, self.authorized_cidrs)
+        self.portal_manager = PortalManager(
+            self.own_ip,
+            self.authorized_cidrs,
+            journal=self._journal_state_if_ready,
+        )
         self._arp_amplifier = None
         self._monitor_thread: Optional[threading.Thread] = None
         self._runtime_errors: List[str] = []
@@ -116,6 +123,7 @@ class NetShaper:
             manager = PortalManager(
                 getattr(self, "own_ip", "127.0.0.1"),
                 self.authorized_cidrs,
+                journal=self._journal_state_if_ready,
             )
             legacy_proc = getattr(self, "_fake_server_proc", None)
             if legacy_proc is not None:
@@ -438,7 +446,10 @@ class NetShaper:
     def _get_mitm_manager(self) -> MitmProxyManager:
         if hasattr(self, "mitm_manager") and self.mitm_manager is not None:
             return self.mitm_manager
-        manager = MitmProxyManager(getattr(self, "own_ip", None))
+        manager = MitmProxyManager(
+            getattr(self, "own_ip", None),
+            journal=self._journal_state_if_ready,
+        )
         self.mitm_manager = manager
         return manager
 
@@ -1170,6 +1181,14 @@ class NetShaper:
             if isinstance(candidate, dict):
                 shaper_state = candidate
 
+        managed_services: dict[str, Any] = {}
+        portal_state = self._portal_manager().get_state_for_persistence()
+        if portal_state:
+            managed_services["portal"] = self._json_safe(portal_state)
+        mitm_state = self._get_mitm_manager().get_state_for_persistence() or {}
+        if mitm_state.get("pid"):
+            managed_services["mitmproxy"] = self._json_safe(mitm_state)
+
         data = {
             "session_id": self.session_id,
             "interface": self.interface,
@@ -1186,6 +1205,7 @@ class NetShaper:
             "shaper_root_qdisc": shaper_state,
             "owner": getattr(self, "_owner_metadata", {}),
             "snapshot": self._snapshot_to_dict(self.state_snapshot),
+            "managed_services": managed_services,
             "plugins": [
                 {
                     "instance_id": plugin.instance_id,
