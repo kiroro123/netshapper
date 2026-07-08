@@ -31,7 +31,7 @@ import psutil
 
 from netshaper import config
 from netshaper.capture.sniffer import PacketSniffer, RollingPacketSniffer
-from netshaper.core.authorization import AuthorizationPolicy
+from netshaper.core.authorization import AuthorizationPolicy, Network
 from netshaper.core.firewall_manager import FirewallManager
 from netshaper.core.mitm_manager import MitmProxyManager, MitmProxyError
 from netshaper.core.owner import current_owner_metadata
@@ -106,7 +106,7 @@ class NetShaper:
 
     # ── Helpers ───────────────────────────────────────────────────────────────
     @property
-    def authorized_cidrs(self) -> tuple:
+    def authorized_cidrs(self) -> tuple[Network, ...]:
         policy = getattr(self, "_auth_policy", None)
         return policy.cidrs if policy else ()
 

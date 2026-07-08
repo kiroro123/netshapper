@@ -98,6 +98,8 @@ module = [
   "netshaper.core.authorization",
   "netshaper.core.firewall_manager",
   "netshaper.core.recovery_manager",
+  "netshaper.core.runtime_contract",
+  "netshaper.core.runtime_protocol",
 ]
 strict = true
 

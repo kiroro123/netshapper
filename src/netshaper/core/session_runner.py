@@ -2,82 +2,12 @@
 
 from __future__ import annotations
 
-from typing import Protocol
+from ipaddress import ip_network
+from typing import Iterable
 
-from netshaper.core.session_plan import SessionPlan, TargetRef
+from netshaper.core.runtime_protocol import SessionRuntime
+from netshaper.core.session_plan import SessionPlan
 from netshaper.utils import bold, green, print_flush
-
-
-class StopEvent(Protocol):
-    def wait(self, timeout: float) -> bool: ...
-
-    def set(self) -> None: ...
-
-
-class NetShaperSessionBackend(Protocol):
-    stop_event: StopEvent
-
-    def save_state(self) -> bool: ...
-
-    def _apply_global_rules(self) -> None: ...
-
-    def launch_fake_server(
-        self,
-        *,
-        suppress_dnssec: bool = False,
-        dnssec_mode: str = "off",
-        web_security_demo: bool = False,
-        dns_upstream: str = "8.8.8.8",
-        smart_spoof_all: bool = False,
-    ) -> bool: ...
-
-    def fake_server_ready(self) -> bool: ...
-
-    def launch_mitmproxy(self, port: int = 8088, web_port: int = 8083) -> bool: ...
-
-    def start_plugin(self, instance_id: str) -> bool: ...
-
-    def add_target(self, target: TargetRef, **target_options: object) -> None: ...
-
-    def launch_sniffer(
-        self,
-        *,
-        target_ips: list[str],
-        save_pcap: bool,
-        rolling: bool,
-        packet_verbose: bool,
-    ) -> None: ...
-
-    def start_arp_amplification(
-        self,
-        *,
-        phantom_count: int,
-        burst: int,
-        interval: float,
-        cam_exhaust: int,
-    ) -> None: ...
-
-    def start_monitor_thread(self) -> object: ...
-
-    def runtime_health_issues(
-        self,
-        *,
-        expect_sniffer: bool = False,
-        expect_monitor: bool = False,
-        expected_tcp_ports: list[int] | None = None,
-        expected_udp_ports: list[int] | None = None,
-    ) -> list[str]: ...
-
-    def runtime_evidence_lines(
-        self,
-        target_ips: list[str],
-        *,
-        expect_sniffer: bool = False,
-        save_pcap: bool = False,
-        rolling: bool = False,
-    ) -> list[str]: ...
-
-    def cleanup(self) -> None: ...
 
 
 class SessionRunner:
@@ -85,10 +15,10 @@ class SessionRunner:
 
     def __init__(
         self,
-        netshaper: NetShaperSessionBackend,
+        netshaper: SessionRuntime,
         *,
         registered_plugins: tuple[tuple[str, str], ...] = (),
-    ):
+    ) -> None:
         self.netshaper = netshaper
         self.registered_plugins = registered_plugins
 
@@ -114,6 +44,7 @@ class SessionRunner:
             raise RuntimeError("Session plan is missing an interface.")
         if not plan.targets:
             raise RuntimeError("Session plan has no targets.")
+        self._validate_authorized_scope(plan)
         if plan.mitm.enabled and plan.mitm.listen_port <= 0:
             raise RuntimeError("mitmproxy listen port must be positive.")
         if plan.mitm.enabled and plan.mitm.web_port <= 0:
@@ -183,24 +114,45 @@ class SessionRunner:
     def start_targets(self, plan: SessionPlan) -> None:
         ns = self.netshaper
         for target in plan.targets:
-            target_options: dict[str, object] = {
-                "arp_on": plan.arp.enabled,
-                "dns_spoof": plan.dns.enabled,
-                "captive_portal": plan.portal.enabled,
-                "http_redirect_port": plan.portal.http_redirect_port,
-                "limit": (
+            ns.add_target(
+                target,
+                arp_on=plan.arp.enabled,
+                dns_spoof=plan.dns.enabled,
+                captive_portal=plan.portal.enabled,
+                http_redirect_port=plan.portal.http_redirect_port,
+                limit=(
                     plan.shaping.bandwidth_mbps if plan.shaping is not None else None
                 ),
-                "arp_interval": plan.arp.interval,
-                "arp_burst": plan.arp.burst,
-            }
-            if plan.shaping is not None:
-                target_options["shaping_profile"] = plan.shaping
-            ns.add_target(target, **target_options)
+                shaping_profile=plan.shaping,
+                arp_interval=plan.arp.interval,
+                arp_burst=plan.arp.burst,
+            )
             if not ns.save_state():
                 raise RuntimeError(
                     "Could not update recovery state after target setup."
                 )
+
+    def _validate_authorized_scope(self, plan: SessionPlan) -> None:
+        plan_scope = self._scope_set(plan.authorized_cidrs, "session plan")
+        runtime_scope = self._scope_set(
+            self.netshaper.authorized_cidrs,
+            "runtime authorization policy",
+        )
+        if not plan_scope:
+            raise RuntimeError("Session plan has no authorized scope.")
+        if plan_scope != runtime_scope:
+            raise RuntimeError(
+                "Session plan authorized scope does not match runtime policy."
+            )
+
+    @staticmethod
+    def _scope_set(values: Iterable[object], label: str) -> frozenset[str]:
+        try:
+            return frozenset(
+                str(ip_network(str(value), strict=False)) for value in values
+            )
+        except ValueError as exc:
+            raise RuntimeError(f"{label} contains an invalid CIDR.") from exc
 
     def start_observers(self, plan: SessionPlan, target_ips: list[str]) -> None:
         ns = self.netshaper
