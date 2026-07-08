@@ -1,9 +1,13 @@
 import json
 import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from ipaddress import IPv4Network
 from unittest import mock
+
+import psutil
 
 from netshaper import config
 from netshaper.core.authorization import AuthorizationError, AuthorizationPolicy
@@ -75,14 +79,15 @@ class ManagerTests(unittest.TestCase):
             "8088",
         ]
         manager._mitm_log_path = "/run/netshaper/NS-TEST/mitmproxy.log"
+        manager._mitm_process_identity = {
+            "pid": 4321,
+            "process_create_time": 123.0,
+            "created_at": 456.0,
+        }
 
         with mock.patch(
             "netshaper.core.mitm_manager.process_owner_metadata",
-            return_value={
-                "pid": 4321,
-                "process_create_time": 123.0,
-                "created_at": 456.0,
-            },
+            side_effect=AssertionError("identity should be captured once"),
         ):
             state = manager.get_state_for_persistence()
 
@@ -104,7 +109,42 @@ class ManagerTests(unittest.TestCase):
                         return_value=False), \
              mock.patch("netshaper.core.mitm_manager.subprocess.Popen",
                         return_value=process), \
+             mock.patch(
+                 "netshaper.core.mitm_manager.process_owner_metadata",
+                 return_value={
+                     "pid": 4321,
+                     "process_create_time": 123.0,
+                     "created_at": 456.0,
+                 },
+             ), \
              mock.patch("netshaper.core.mitm_manager.log"):
+            result = manager.launch(port=8088, web_port=8083)
+
+        self.assertFalse(result)
+        process.terminate.assert_called_once()
+        self.assertIsNone(manager._mitm_proc)
+
+    def test_mitm_manager_stops_process_when_identity_capture_fails(self):
+        process = mock.Mock()
+        process.pid = 4321
+        process.poll.side_effect = [None, 0]
+        manager = MitmProxyManager("127.0.0.1")
+
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch.object(config, "STATE_DIR", tmp), \
+             mock.patch.object(config, "DRY_RUN", False), \
+             mock.patch("netshaper.core.mitm_manager.check_local_port",
+                        return_value=False), \
+             mock.patch("netshaper.core.mitm_manager.subprocess.Popen",
+                        return_value=process), \
+             mock.patch(
+                 "netshaper.core.mitm_manager.process_owner_metadata",
+                 return_value={
+                     "pid": 4321,
+                     "process_create_time": None,
+                     "created_at": 456.0,
+                 },
+             ):
             result = manager.launch(port=8088, web_port=8083)
 
         self.assertFalse(result)
@@ -233,6 +273,7 @@ class ManagerTests(unittest.TestCase):
 
     def test_recovery_terminates_verified_managed_service(self):
         process = mock.Mock()
+        process.create_time.return_value = 1.0
         process.cmdline.return_value = [
             "/usr/bin/python3",
             "-m",
@@ -265,6 +306,7 @@ class ManagerTests(unittest.TestCase):
 
     def test_recovery_kills_verified_managed_service_after_timeout(self):
         process = mock.Mock()
+        process.create_time.return_value = 1.0
         process.cmdline.return_value = [
             "mitmweb",
             "--mode",
@@ -298,6 +340,7 @@ class ManagerTests(unittest.TestCase):
 
     def test_recovery_refuses_managed_service_identity_mismatch(self):
         process = mock.Mock()
+        process.create_time.return_value = 1.0
         process.cmdline.return_value = ["python", "-m", "other.portal"]
         record = {
             "service": "portal",
@@ -325,6 +368,39 @@ class ManagerTests(unittest.TestCase):
                 RecoveryManager._cleanup_managed_service("portal", record)
             )
 
+        process.terminate.assert_not_called()
+
+    def test_recovery_refuses_managed_service_birth_mismatch(self):
+        process = mock.Mock()
+        process.create_time.return_value = 2.0
+        process.cmdline.return_value = [
+            "/usr/bin/python3",
+            "-m",
+            "netshaper.portal",
+            "--health-token",
+            "token",
+        ]
+        record = {
+            "service": "portal",
+            "pid": 1234,
+            "process_create_time": 1.0,
+            "executable": "/usr/bin/python3",
+            "argv": process.cmdline.return_value,
+            "ownership_token": "token",
+        }
+
+        with mock.patch(
+            "netshaper.core.recovery_manager.owner_status",
+            return_value=OwnerStatus.LIVE,
+        ), mock.patch(
+            "netshaper.core.recovery_manager.psutil.Process",
+            return_value=process,
+        ):
+            self.assertFalse(
+                RecoveryManager._cleanup_managed_service("portal", record)
+            )
+
+        process.cmdline.assert_not_called()
         process.terminate.assert_not_called()
 
     def test_recovery_fails_closed_for_unknown_managed_service_owner(self):
@@ -364,6 +440,59 @@ class ManagerTests(unittest.TestCase):
             self.assertTrue(
                 RecoveryManager._cleanup_managed_service("mitmproxy", record)
             )
+
+    def test_recovery_terminates_live_harmless_managed_child_only(self):
+        token = "test-token"
+        managed_cmd = [
+            sys.executable,
+            "-c",
+            "import time; time.sleep(60)",
+            "netshaper.portal",
+            "--health-token",
+            token,
+        ]
+        unrelated_cmd = [
+            sys.executable,
+            "-c",
+            "import time; time.sleep(60)",
+            "unrelated-process",
+        ]
+        managed = subprocess.Popen(  # nosec B603
+            managed_cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        unrelated = subprocess.Popen(  # nosec B603
+            unrelated_cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            managed_process = psutil.Process(managed.pid)
+            record = {
+                "service": "portal",
+                "pid": managed.pid,
+                "process_create_time": managed_process.create_time(),
+                "executable": sys.executable,
+                "argv": managed_cmd,
+                "ownership_token": token,
+            }
+
+            self.assertTrue(
+                RecoveryManager._cleanup_managed_service("portal", record)
+            )
+
+            managed.wait(timeout=5)
+            self.assertIsNone(unrelated.poll())
+        finally:
+            for child in (managed, unrelated):
+                if child.poll() is None:
+                    child.terminate()
+                    try:
+                        child.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        child.kill()
+                        child.wait(timeout=5)
 
 
 if __name__ == "__main__":

@@ -354,6 +354,26 @@ class RecoveryManager:
             )
             return False
 
+        try:
+            expected_create_time = float(record["process_create_time"])
+            actual_create_time = process.create_time()
+        except psutil.NoSuchProcess:
+            return True
+        except Exception as exc:
+            log.error(
+                "[Recovery] Could not verify managed service %s process birth: %s",
+                service_name,
+                exc,
+            )
+            return False
+        if actual_create_time != expected_create_time:
+            log.error(
+                "[Recovery] Managed service %s process birth mismatch; "
+                "leaving it in place",
+                service_name,
+            )
+            return False
+
         if not cls._process_matches_service_record(service_name, process, record):
             log.error(
                 "[Recovery] Managed service %s process identity mismatch; "

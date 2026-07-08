@@ -374,6 +374,7 @@ class NetShaperCleanupTests(unittest.TestCase):
         ns._fake_server_proc = None
         ns._fake_server_health_token = "test-health-token"
         process = mock.Mock()
+        process.pid = 1234
         process.poll.return_value = None
 
         with mock.patch(
@@ -385,7 +386,14 @@ class NetShaperCleanupTests(unittest.TestCase):
         ), mock.patch(
             "netshaper.core.portal_manager.subprocess.Popen",
             return_value=process,
-        ) as popen:
+        ) as popen, mock.patch(
+            "netshaper.core.portal_manager.process_owner_metadata",
+            return_value={
+                "pid": 1234,
+                "process_create_time": 456.0,
+                "created_at": 789.0,
+            },
+        ):
             self.assertTrue(
                 ns.launch_fake_server(
                     dnssec_mode="nxdomain",
@@ -515,6 +523,7 @@ class NetShaperCleanupTests(unittest.TestCase):
         ns.session_id = "NS-TEST"
         ns._mitm_log_path = None
         proc = mock.Mock()
+        proc.pid = 4321
         proc.poll.side_effect = [None, None, 0]
 
         with tempfile.TemporaryDirectory() as tmp, \
@@ -526,6 +535,14 @@ class NetShaperCleanupTests(unittest.TestCase):
                         return_value=False), \
              mock.patch("netshaper.core.mitm_manager.subprocess.Popen",
                         return_value=proc), \
+             mock.patch(
+                 "netshaper.core.mitm_manager.process_owner_metadata",
+                 return_value={
+                     "pid": 4321,
+                     "process_create_time": 123.0,
+                     "created_at": 456.0,
+                 },
+             ), \
              mock.patch("netshaper.core.mitm_manager.time.sleep"), \
              mock.patch("netshaper.core.mitm_manager.log"):
             result = ns.launch_mitmproxy()
