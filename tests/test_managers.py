@@ -61,6 +61,56 @@ class ManagerTests(unittest.TestCase):
 
         self.assertTrue(manager.terminate())
 
+    def test_mitm_manager_state_includes_owned_process(self):
+        manager = MitmProxyManager("127.0.0.1")
+        process = mock.Mock()
+        process.pid = 4321
+        process.poll.side_effect = [None, 0]
+        manager._mitm_proc = process
+        manager._mitm_command = [
+            "mitmweb",
+            "--mode",
+            "transparent",
+            "--listen-port",
+            "8088",
+        ]
+        manager._mitm_log_path = "/run/netshaper/NS-TEST/mitmproxy.log"
+
+        with mock.patch(
+            "netshaper.core.mitm_manager.process_owner_metadata",
+            return_value={
+                "pid": 4321,
+                "process_create_time": 123.0,
+                "created_at": 456.0,
+            },
+        ):
+            state = manager.get_state_for_persistence()
+
+        self.assertEqual(state["service"], "mitmproxy")
+        self.assertEqual(state["pid"], 4321)
+        self.assertEqual(state["executable"], "mitmweb")
+        self.assertEqual(state["mitm_log_path"], "/run/netshaper/NS-TEST/mitmproxy.log")
+
+    def test_mitm_manager_stops_process_when_launch_journal_fails(self):
+        process = mock.Mock()
+        process.pid = 4321
+        process.poll.side_effect = [None, 0]
+        manager = MitmProxyManager("127.0.0.1", journal=lambda: False)
+
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch.object(config, "STATE_DIR", tmp), \
+             mock.patch.object(config, "DRY_RUN", False), \
+             mock.patch("netshaper.core.mitm_manager.check_local_port",
+                        return_value=False), \
+             mock.patch("netshaper.core.mitm_manager.subprocess.Popen",
+                        return_value=process), \
+             mock.patch("netshaper.core.mitm_manager.log"):
+            result = manager.launch(port=8088, web_port=8083)
+
+        self.assertFalse(result)
+        process.terminate.assert_called_once()
+        self.assertIsNone(manager._mitm_proc)
+
     def test_mitm_manager_refuses_existing_listener(self):
         manager = MitmProxyManager("127.0.0.1")
 
@@ -180,6 +230,140 @@ class ManagerTests(unittest.TestCase):
         }
 
         self.assertFalse(RecoveryManager._cleanup_plugins(state))
+
+    def test_recovery_terminates_verified_managed_service(self):
+        process = mock.Mock()
+        process.cmdline.return_value = [
+            "/usr/bin/python3",
+            "-m",
+            "netshaper.portal",
+            "--health-token",
+            "token",
+        ]
+        record = {
+            "service": "portal",
+            "pid": 1234,
+            "process_create_time": 1.0,
+            "executable": "/usr/bin/python3",
+            "argv": process.cmdline.return_value,
+            "ownership_token": "token",
+        }
+
+        with mock.patch(
+            "netshaper.core.recovery_manager.owner_status",
+            return_value=OwnerStatus.LIVE,
+        ), mock.patch(
+            "netshaper.core.recovery_manager.psutil.Process",
+            return_value=process,
+        ):
+            self.assertTrue(
+                RecoveryManager._cleanup_managed_service("portal", record)
+            )
+
+        process.terminate.assert_called_once()
+        process.wait.assert_called_once_with(timeout=5)
+
+    def test_recovery_kills_verified_managed_service_after_timeout(self):
+        process = mock.Mock()
+        process.cmdline.return_value = [
+            "mitmweb",
+            "--mode",
+            "transparent",
+        ]
+        process.wait.side_effect = [Exception("timeout"), None]
+        record = {
+            "service": "mitmproxy",
+            "pid": 4321,
+            "process_create_time": 1.0,
+            "executable": "mitmweb",
+            "argv": process.cmdline.return_value,
+        }
+
+        with mock.patch(
+            "netshaper.core.recovery_manager.owner_status",
+            return_value=OwnerStatus.LIVE,
+        ), mock.patch(
+            "netshaper.core.recovery_manager.psutil.Process",
+            return_value=process,
+        ), mock.patch(
+            "netshaper.core.recovery_manager.psutil.TimeoutExpired",
+            Exception,
+        ):
+            self.assertTrue(
+                RecoveryManager._cleanup_managed_service("mitmproxy", record)
+            )
+
+        process.terminate.assert_called_once()
+        process.kill.assert_called_once()
+
+    def test_recovery_refuses_managed_service_identity_mismatch(self):
+        process = mock.Mock()
+        process.cmdline.return_value = ["python", "-m", "other.portal"]
+        record = {
+            "service": "portal",
+            "pid": 1234,
+            "process_create_time": 1.0,
+            "executable": "/usr/bin/python3",
+            "argv": [
+                "/usr/bin/python3",
+                "-m",
+                "netshaper.portal",
+                "--health-token",
+                "token",
+            ],
+            "ownership_token": "token",
+        }
+
+        with mock.patch(
+            "netshaper.core.recovery_manager.owner_status",
+            return_value=OwnerStatus.LIVE,
+        ), mock.patch(
+            "netshaper.core.recovery_manager.psutil.Process",
+            return_value=process,
+        ):
+            self.assertFalse(
+                RecoveryManager._cleanup_managed_service("portal", record)
+            )
+
+        process.terminate.assert_not_called()
+
+    def test_recovery_fails_closed_for_unknown_managed_service_owner(self):
+        record = {
+            "service": "mitmproxy",
+            "pid": 4321,
+            "process_create_time": None,
+            "executable": "mitmweb",
+            "argv": ["mitmweb", "--mode", "transparent"],
+        }
+
+        with mock.patch(
+            "netshaper.core.recovery_manager.owner_status",
+            return_value=OwnerStatus.UNKNOWN,
+        ), mock.patch(
+            "netshaper.core.recovery_manager.psutil.Process"
+        ) as process_cls:
+            self.assertFalse(
+                RecoveryManager._cleanup_managed_service("mitmproxy", record)
+            )
+
+        process_cls.assert_not_called()
+
+    def test_recovery_treats_stale_managed_service_as_clean(self):
+        record = {
+            "service": "mitmproxy",
+            "pid": 4321,
+            "process_create_time": 1.0,
+            "executable": "mitmweb",
+            "argv": ["mitmweb", "--mode", "transparent"],
+        }
+
+        with mock.patch(
+            "netshaper.core.recovery_manager.owner_status",
+            return_value=OwnerStatus.STALE,
+        ):
+            self.assertTrue(
+                RecoveryManager._cleanup_managed_service("mitmproxy", record)
+            )
 
 
 if __name__ == "__main__":

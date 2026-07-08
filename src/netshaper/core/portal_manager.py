@@ -10,9 +10,10 @@ import subprocess  # nosec B404
 import sys
 import time
 from dataclasses import dataclass
-from typing import Any, Optional, Sequence
+from typing import Any, Callable, Optional, Sequence
 
 from netshaper import config
+from netshaper.core.owner import process_owner_metadata
 from netshaper.system import check_local_port
 from netshaper.utils import print_flush
 
@@ -33,11 +34,19 @@ class PortalManager:
 
     VALID_DNSSEC_MODES = {"off", "fail-closed", "fail-open", "nxdomain", "timeout"}
 
-    def __init__(self, host_ip: str, authorized_cidrs: Sequence[object]):
+    def __init__(
+        self,
+        host_ip: str,
+        authorized_cidrs: Sequence[object],
+        *,
+        journal: Optional[Callable[[], bool]] = None,
+    ):
         self.host_ip = host_ip
         self.authorized_cidrs = tuple(str(network) for network in authorized_cidrs)
         self.process: Optional[subprocess.Popen[Any]] = None
+        self._command: Optional[list[str]] = None
         self._health_token: Optional[str] = None
+        self._journal = journal
 
     def start(self, portal_config: PortalConfig) -> bool:
         dnssec_mode = portal_config.dnssec_mode
@@ -101,8 +110,13 @@ class PortalManager:
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                 )
+                self._command = list(cmd)
             except OSError as exc:
                 log.error(f"portal launch failed: {exc}")
+                return False
+            if not self._journal_state():
+                log.error("Refusing to run netshaper-portal without recovery state")
+                self.stop()
                 return False
 
         for _ in range(20):
@@ -175,4 +189,30 @@ class PortalManager:
 
         if ok:
             self.process = None
+            self._command = None
+            if not self._journal_state():
+                ok = False
         return ok
+
+    def _journal_state(self) -> bool:
+        if self._journal is None:
+            return True
+        try:
+            return self._journal()
+        except Exception as exc:
+            log.error("portal recovery journal failed: %s", exc)
+            return False
+
+    def get_state_for_persistence(self) -> dict[str, object]:
+        process = self.process
+        if process is None or process.poll() is not None:
+            return {}
+        command = list(self._command or getattr(process, "args", []) or [])
+        executable = command[0] if command else None
+        return {
+            "service": "portal",
+            **process_owner_metadata(process.pid),
+            "executable": executable,
+            "argv": command,
+            "ownership_token": self.health_token(),
+        }

@@ -9,9 +9,10 @@ import logging
 import os
 import subprocess  # nosec B404
 import time
-from typing import Optional
+from typing import Any, Callable, Optional
 
 from netshaper import config
+from netshaper.core.owner import process_owner_metadata
 from netshaper.exceptions import NetShaperError
 from netshaper.system import check_local_port
 
@@ -29,7 +30,12 @@ class MitmProxyManager:
     Tracks process, logs, and readiness state.
     """
 
-    def __init__(self, own_ip: str):
+    def __init__(
+        self,
+        own_ip: str,
+        *,
+        journal: Optional[Callable[[], bool]] = None,
+    ):
         """
         Initialize mitmproxy manager.
 
@@ -37,9 +43,11 @@ class MitmProxyManager:
             own_ip: Local IP address where mitmproxy binds
         """
         self.own_ip = own_ip
-        self._mitm_proc: Optional[subprocess.Popen] = None
+        self._mitm_proc: Optional[subprocess.Popen[Any]] = None
+        self._mitm_command: Optional[list[str]] = None
         self._mitm_log_path: Optional[str] = None
         self._mitm_log_handle: Optional[object] = None
+        self._journal = journal
 
     def _open_log(self, session_dir: str) -> Optional[object]:
         """Open mitmproxy log file."""
@@ -67,6 +75,7 @@ class MitmProxyManager:
 
     def _clear_completed_process(self) -> None:
         self._mitm_proc = None
+        self._mitm_command = None
         self._close_log()
 
     @staticmethod
@@ -107,19 +116,25 @@ class MitmProxyManager:
         try:
             log_handle = self._open_log(config.STATE_DIR)
             # mitmweb is the intentional child process for transparent proxying.
+            command = [
+                "mitmweb",
+                "--mode",
+                "transparent",
+                "--listen-port",
+                str(port),
+                "--set",
+                f"web_port={web_port}",
+            ]
             self._mitm_proc = subprocess.Popen(  # nosec B603 B607
-                [
-                    "mitmweb",
-                    "--mode",
-                    "transparent",
-                    "--listen-port",
-                    str(port),
-                    "--set",
-                    f"web_port={web_port}",
-                ],
+                command,
                 stdout=log_handle or subprocess.DEVNULL,
                 stderr=subprocess.STDOUT if log_handle else subprocess.DEVNULL,
             )
+            self._mitm_command = list(command)
+            if not self._journal_state():
+                log.error("Refusing to run mitmproxy without recovery state")
+                self.terminate()
+                return False
 
             # Poll for readiness
             for attempt in range(10):
@@ -193,12 +208,36 @@ class MitmProxyManager:
 
         if ok:
             self._mitm_proc = None
+            self._mitm_command = None
             self._close_log()
+            if not self._journal_state():
+                ok = False
 
         return ok
 
     def get_state_for_persistence(self) -> dict:
         """Get mitmproxy state for persistence."""
-        return {
+        state = {
             "mitm_log_path": self._mitm_log_path,
         }
+        proc = self._mitm_proc
+        if proc is not None and proc.poll() is None:
+            command = list(self._mitm_command or getattr(proc, "args", []) or [])
+            state.update(
+                {
+                    "service": "mitmproxy",
+                    **process_owner_metadata(proc.pid),
+                    "executable": command[0] if command else None,
+                    "argv": command,
+                }
+            )
+        return state
+
+    def _journal_state(self) -> bool:
+        if self._journal is None:
+            return True
+        try:
+            return self._journal()
+        except Exception as exc:
+            log.error("mitmproxy recovery journal failed: %s", exc)
+            return False

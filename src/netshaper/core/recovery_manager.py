@@ -14,6 +14,8 @@ import shutil
 from ipaddress import ip_address
 from typing import Any, Callable, List, Mapping, Optional
 
+import psutil
+
 from netshaper import config
 from netshaper.core.firewall_manager import (
     FirewallManager as ForwardingFirewallManager,
@@ -240,6 +242,9 @@ class RecoveryManager:
 
             log.info(f"[Recovery] Cleaning stale session on {iface}…")
 
+            # Stop managed child services owned by the crashed NetShaper parent.
+            cleanup_ok = self._cleanup_managed_services(data) and cleanup_ok
+
             # Clean global rules
             cleanup_ok = self._cleanup_global_rules(
                 data,
@@ -287,6 +292,167 @@ class RecoveryManager:
         except Exception as exc:
             log.error("[Recovery] Could not persist cleanup intent: %s", exc)
             return False
+
+    @classmethod
+    def _cleanup_managed_services(cls, data: dict[str, Any]) -> bool:
+        records = data.get("managed_services") or {}
+        if not records:
+            return True
+        if not isinstance(records, dict):
+            log.error("[Recovery] Invalid managed service manifest")
+            return False
+
+        cleanup_ok = True
+        for service_name in ("portal", "mitmproxy"):
+            record = records.get(service_name)
+            if record is None:
+                continue
+            if not isinstance(record, dict):
+                log.error("[Recovery] Invalid %s service record", service_name)
+                cleanup_ok = False
+                continue
+            cleanup_ok = cls._cleanup_managed_service(
+                service_name,
+                record,
+            ) and cleanup_ok
+        return cleanup_ok
+
+    @classmethod
+    def _cleanup_managed_service(
+        cls,
+        service_name: str,
+        record: Mapping[str, Any],
+    ) -> bool:
+        if not cls._validate_managed_service_record(service_name, record):
+            return False
+
+        status = owner_status(record)
+        if status is OwnerStatus.STALE:
+            log.info("[Recovery] Managed service %s is already stopped", service_name)
+            return True
+        if status is OwnerStatus.UNKNOWN:
+            log.error(
+                "[Recovery] Could not verify managed service %s owner; "
+                "leaving manifest in place",
+                service_name,
+            )
+            return False
+
+        pid = cls._managed_service_pid(record)
+        if pid is None:
+            return False
+
+        try:
+            process = psutil.Process(pid)
+        except psutil.NoSuchProcess:
+            return True
+        except Exception as exc:
+            log.error(
+                "[Recovery] Could not inspect managed service %s: %s",
+                service_name,
+                exc,
+            )
+            return False
+
+        if not cls._process_matches_service_record(service_name, process, record):
+            log.error(
+                "[Recovery] Managed service %s process identity mismatch; "
+                "leaving it in place",
+                service_name,
+            )
+            return False
+
+        try:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except psutil.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5)
+            log.info("[Recovery] Terminated managed service %s", service_name)
+            return True
+        except psutil.NoSuchProcess:
+            return True
+        except Exception as exc:
+            log.error(
+                "[Recovery] Failed to terminate managed service %s: %s",
+                service_name,
+                exc,
+            )
+            return False
+
+    @classmethod
+    def _validate_managed_service_record(
+        cls,
+        service_name: str,
+        record: Mapping[str, Any],
+    ) -> bool:
+        if record.get("service") != service_name:
+            log.error("[Recovery] Managed service name mismatch")
+            return False
+        if cls._managed_service_pid(record) is None:
+            log.error("[Recovery] Managed service %s has invalid PID", service_name)
+            return False
+
+        executable = record.get("executable")
+        argv = record.get("argv")
+        if not isinstance(executable, str) or not executable:
+            log.error("[Recovery] Managed service %s lacks executable", service_name)
+            return False
+        if not isinstance(argv, list) or not all(
+            isinstance(item, str) for item in argv
+        ):
+            log.error("[Recovery] Managed service %s lacks argv", service_name)
+            return False
+        return cls._managed_service_command_is_expected(service_name, record)
+
+    @staticmethod
+    def _managed_service_pid(record: Mapping[str, Any]) -> Optional[int]:
+        raw_pid = record.get("pid")
+        if not isinstance(raw_pid, (int, str)):
+            return None
+        try:
+            pid = int(raw_pid)
+        except (TypeError, ValueError):
+            return None
+        return pid if pid > 0 else None
+
+    @staticmethod
+    def _managed_service_command_is_expected(
+        service_name: str,
+        record: Mapping[str, Any],
+    ) -> bool:
+        argv = record.get("argv")
+        command = " ".join(argv if isinstance(argv, list) else [])
+        if service_name == "portal":
+            token = record.get("ownership_token")
+            return (
+                isinstance(token, str)
+                and bool(token)
+                and "netshaper.portal" in command
+                and "--health-token" in command
+                and token in command
+            )
+        if service_name == "mitmproxy":
+            return "mitmweb" in command and "--mode" in command and "transparent" in command
+        return False
+
+    @classmethod
+    def _process_matches_service_record(
+        cls,
+        service_name: str,
+        process: psutil.Process,
+        record: Mapping[str, Any],
+    ) -> bool:
+        try:
+            cmdline = process.cmdline()
+        except Exception:
+            return False
+        probe = {
+            **dict(record),
+            "argv": cmdline,
+        }
+        return cls._managed_service_command_is_expected(service_name, probe)
 
     def _cleanup_global_rules(
         self,

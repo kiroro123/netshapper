@@ -52,6 +52,24 @@ class StateSnapshotTests(unittest.TestCase):
                     ),
                 )
             }
+            ns.portal_manager = mock.Mock()
+            ns.portal_manager.get_state_for_persistence.return_value = {
+                "service": "portal",
+                "pid": 1234,
+                "process_create_time": 10.0,
+                "executable": "/usr/bin/python3",
+                "argv": ["/usr/bin/python3", "-m", "netshaper.portal"],
+                "ownership_token": "token",
+            }
+            ns.mitm_manager = mock.Mock()
+            ns.mitm_manager.get_state_for_persistence.return_value = {
+                "service": "mitmproxy",
+                "pid": 4321,
+                "process_create_time": 20.0,
+                "executable": "mitmweb",
+                "argv": ["mitmweb", "--mode", "transparent"],
+                "mitm_log_path": "/run/netshaper/NS-TEST/mitmproxy.log",
+            }
 
             with mock.patch("netshaper.core.orchestrator.config.STATE_DIR", tmp):
                 result = ns.save_state()
@@ -87,6 +105,16 @@ class StateSnapshotTests(unittest.TestCase):
                     "duplicate_percent": 0.0,
                     "reorder_percent": 0.0,
                 },
+            )
+            self.assertEqual(data["managed_services"]["portal"]["pid"], 1234)
+            self.assertEqual(
+                data["managed_services"]["portal"]["ownership_token"],
+                "token",
+            )
+            self.assertEqual(data["managed_services"]["mitmproxy"]["pid"], 4321)
+            self.assertIn(
+                "mitmproxy.log",
+                data["managed_services"]["mitmproxy"]["mitm_log_path"],
             )
 
     def test_save_state_records_global_rule_comment(self):
