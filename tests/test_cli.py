@@ -36,6 +36,7 @@ def _plan(targets, **overrides):
 
 def _runner_ns():
     ns = mock.Mock()
+    ns.authorized_cidrs = ("192.0.2.0/24",)
     ns.stop_event = mock.Mock()
     ns.stop_event.wait.return_value = True
     ns.save_state.return_value = True
@@ -420,6 +421,7 @@ class CliTests(unittest.TestCase):
 
     def test_session_runner_cleans_up_when_sniffer_start_fails(self):
         ns = mock.Mock()
+        ns.authorized_cidrs = ("192.0.2.0/24",)
         ns.stop_event = threading.Event()
         ns.save_state.return_value = True
         ns.launch_sniffer.side_effect = RuntimeError("sniffer failed")
@@ -438,6 +440,7 @@ class CliTests(unittest.TestCase):
             captive_portal=False,
             http_redirect_port=None,
             limit=None,
+            shaping_profile=None,
             arp_interval=2.0,
             arp_burst=1,
         )
@@ -452,6 +455,7 @@ class CliTests(unittest.TestCase):
 
     def test_session_runner_passes_discovered_device_to_add_target(self):
         ns = mock.Mock()
+        ns.authorized_cidrs = ("192.0.2.0/24",)
         ns.stop_event = threading.Event()
         ns.save_state.return_value = True
         ns.launch_sniffer.side_effect = RuntimeError("sniffer failed")
@@ -469,6 +473,7 @@ class CliTests(unittest.TestCase):
             captive_portal=False,
             http_redirect_port=None,
             limit=None,
+            shaping_profile=None,
             arp_interval=2.0,
             arp_burst=1,
         )
@@ -482,6 +487,7 @@ class CliTests(unittest.TestCase):
 
     def test_session_runner_aborts_before_mutation_when_state_save_fails(self):
         ns = mock.Mock()
+        ns.authorized_cidrs = ("192.0.2.0/24",)
         ns.stop_event = threading.Event()
         ns.save_state.return_value = False
         plan = _plan(["192.0.2.10"])
@@ -496,6 +502,7 @@ class CliTests(unittest.TestCase):
 
     def test_session_runner_rejects_unhealthy_startup(self):
         ns = mock.Mock()
+        ns.authorized_cidrs = ("192.0.2.0/24",)
         ns.stop_event = threading.Event()
         ns.save_state.return_value = True
         ns.runtime_health_issues.return_value = [
@@ -520,6 +527,7 @@ class CliTests(unittest.TestCase):
                 pass
 
         ns = mock.Mock()
+        ns.authorized_cidrs = ("192.0.2.0/24",)
         ns.stop_event = LoopOnceEvent()
         ns.save_state.return_value = True
         ns.runtime_health_issues.side_effect = [
@@ -539,6 +547,7 @@ class CliTests(unittest.TestCase):
 
     def test_session_runner_starts_arp_amplification_when_requested(self):
         ns = mock.Mock()
+        ns.authorized_cidrs = ("192.0.2.0/24",)
         ns.stop_event = mock.Mock()
         ns.stop_event.wait.return_value = True
         ns.save_state.return_value = True
@@ -599,6 +608,19 @@ class CliTests(unittest.TestCase):
         ns.save_state.assert_not_called()
         ns._apply_global_rules.assert_not_called()
         ns.launch_fake_server.assert_not_called()
+        ns.add_target.assert_not_called()
+        ns.cleanup.assert_called_once()
+
+    def test_session_runner_rejects_scope_mismatch_before_host_mutation(self):
+        ns = _runner_ns()
+        plan = _plan(["192.0.2.10"], authorized_cidrs=("198.51.100.0/24",))
+
+        with mock.patch("netshaper.core.session_runner.print_flush"), \
+             self.assertRaisesRegex(RuntimeError, "authorized scope"):
+            SessionRunner(ns).execute(plan)
+
+        ns.save_state.assert_not_called()
+        ns._apply_global_rules.assert_not_called()
         ns.add_target.assert_not_called()
         ns.cleanup.assert_called_once()
 
