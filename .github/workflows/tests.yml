@@ -40,8 +40,17 @@ jobs:
           python -m coverage run -m pytest -q
           python -m coverage report
           python -m coverage report \
-            --include="src/netshaper/core/authorization.py,src/netshaper/core/firewall_manager.py,src/netshaper/core/mitm_manager.py,src/netshaper/core/plugin.py,src/netshaper/core/plugin_loader.py,src/netshaper/core/recovery_manager.py,src/netshaper/core/state_manager.py,src/netshaper/network/firewall.py,src/netshaper/network/shaper.py" \
+            --include="src/netshaper/core/authorization.py,src/netshaper/core/firewall_manager.py,src/netshaper/core/mitm_manager.py,src/netshaper/core/plugin.py,src/netshaper/core/plugin_loader.py,src/netshaper/core/portal_manager.py,src/netshaper/core/recovery_manager.py,src/netshaper/core/session_plan.py,src/netshaper/core/session_runner.py,src/netshaper/core/state_manager.py,src/netshaper/network/firewall.py,src/netshaper/network/shaper.py" \
             --fail-under=80
+          python -m coverage report \
+            --include="src/netshaper/core/session_plan.py" \
+            --fail-under=90
+          python -m coverage report \
+            --include="src/netshaper/core/session_runner.py" \
+            --fail-under=90
+          python -m coverage report \
+            --include="src/netshaper/core/portal_manager.py" \
+            --fail-under=85
 
   audit-and-build:
     runs-on: ubuntu-latest

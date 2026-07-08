@@ -649,12 +649,12 @@ def build_session_plan(
     interface: str,
     authorized_cidrs: list,
     targets: List[Union[Device, str]],
-    modules: set[ModuleID],
     arp_on: bool,
     dns_spoof_on: bool,
     captive_portal: bool,
     http_redirect_port: Optional[int],
     sniff_on: bool,
+    mitm_on: bool,
     save_pcap: bool,
     rolling: bool,
     packet_verbose: bool = False,
@@ -662,13 +662,15 @@ def build_session_plan(
     arp_interval: float = 2.0,
     arp_burst: int = 1,
     exploit: Optional[ExploitOptions] = None,
+    portal_auto_launch: bool = False,
+    portal_smart_spoof_all: bool = False,
+    mitm_auto_launch: bool = False,
 ) -> SessionPlan:
     exploit = exploit or ExploitOptions()
     return SessionPlan(
         interface=interface,
         authorized_cidrs=tuple(str(network) for network in authorized_cidrs),
         targets=tuple(targets),
-        modules=frozenset(modules),
         arp=ArpOptions(
             enabled=arp_on,
             interval=arp_interval,
@@ -687,6 +689,8 @@ def build_session_plan(
             enabled=captive_portal,
             http_redirect_port=http_redirect_port,
             hsts_idn_demo=exploit.hsts_idn_demo,
+            auto_launch=portal_auto_launch,
+            smart_spoof_all=portal_smart_spoof_all,
         ),
         capture=CaptureOptions(
             enabled=sniff_on,
@@ -695,7 +699,7 @@ def build_session_plan(
             packet_verbose=packet_verbose,
         ),
         shaping=shaping_profile,
-        mitm=MitmOptions(enabled=ModuleID.MITM in modules),
+        mitm=MitmOptions(enabled=mitm_on, auto_launch=mitm_auto_launch),
     )
 
 
@@ -909,90 +913,62 @@ def main() -> None:
                     safe_input("  Use rolling 50 MB files? (y/n): ").lower() == "y"
                 )
 
-        if dns_spoof_on and not ns.fake_server_ready():
-            print_flush(
-                "  [!] Fake DNS (port 53) is not verified for this session."
-            )
-            print_flush(
-                "      "
-                + portal_launch_hint(
-                    exploit,
-                    host_ip=ns.own_ip,
-                    authorized_cidrs=authorized_cidrs,
-                    smart_spoof_all=True,
-                    health_token=ns.fake_server_health_token(),
+        portal_auto_launch = False
+        portal_smart_spoof_all = dns_spoof_on
+        portal_required = (
+            dns_spoof_on
+            or http_redirect_port == 80
+            or exploit.portal_web_security_demo
+        )
+        if portal_required and not ns.fake_server_ready():
+            if dns_spoof_on:
+                print_flush(
+                    "  [!] Fake DNS (port 53) is not verified for this session."
                 )
-            )
-            if (
-                safe_input("  Auto-launch netshaper-portal? (y/n): ").lower()
-                == "y"
-            ):
-                if not ns.launch_fake_server(
-                    dnssec_mode=exploit.dnssec_mode,
-                    web_security_demo=exploit.portal_web_security_demo,
-                    dns_upstream=exploit.dnssec_upstream,
-                    smart_spoof_all=True,
-                ):
-                    sys.exit("[NetShaper] Fake DNS server was not verified.")
+                portal_required_error = (
+                    "[NetShaper] DNS spoofing requires verified fake DNS."
+                )
+                portal_hint_smart_spoof = True
+            elif http_redirect_port == 80:
+                print_flush(
+                    "  [!] Fake HTTP (port 80) is not verified for this session."
+                )
+                portal_required_error = (
+                    "[NetShaper] Captive portal requires verified fake HTTP."
+                )
+                portal_hint_smart_spoof = dns_spoof_on
             else:
-                sys.exit("[NetShaper] DNS spoofing requires verified fake DNS.")
+                print_flush(
+                    "  [!] HSTS demo HTTP service (port 80) is not verified "
+                    "for this session."
+                )
+                portal_required_error = (
+                    "[NetShaper] HSTS demo requires verified fake HTTP."
+                )
+                portal_hint_smart_spoof = dns_spoof_on
 
-        if http_redirect_port == 80 and not ns.fake_server_ready():
-            print_flush(
-                "  [!] Fake HTTP (port 80) is not verified for this session."
-            )
             print_flush(
                 "      "
                 + portal_launch_hint(
                     exploit,
                     host_ip=ns.own_ip,
                     authorized_cidrs=authorized_cidrs,
-                    smart_spoof_all=dns_spoof_on,
+                    smart_spoof_all=portal_hint_smart_spoof,
                     health_token=ns.fake_server_health_token(),
                 )
             )
             if (
-                safe_input("  Auto-launch netshaper-portal? (y/n): ").lower()
+                safe_input(
+                    "  Auto-launch netshaper-portal after confirmation? (y/n): "
+                ).lower()
                 == "y"
             ):
-                if not ns.launch_fake_server(
-                    dnssec_mode=exploit.dnssec_mode,
-                    web_security_demo=exploit.portal_web_security_demo,
-                    dns_upstream=exploit.dnssec_upstream,
-                    smart_spoof_all=dns_spoof_on,
-                ):
-                    sys.exit("[NetShaper] Captive portal requires verified fake HTTP.")
+                portal_auto_launch = True
+                portal_smart_spoof_all = portal_hint_smart_spoof
             else:
-                sys.exit("[NetShaper] Captive portal requires verified fake HTTP.")
-        elif exploit.portal_web_security_demo and not ns.fake_server_ready():
-            print_flush(
-                "  [!] HSTS demo HTTP service (port 80) is not verified "
-                "for this session."
-            )
-            print_flush(
-                "      "
-                + portal_launch_hint(
-                    exploit,
-                    host_ip=ns.own_ip,
-                    authorized_cidrs=authorized_cidrs,
-                    smart_spoof_all=dns_spoof_on,
-                    health_token=ns.fake_server_health_token(),
-                )
-            )
-            if (
-                safe_input("  Auto-launch netshaper-portal? (y/n): ").lower()
-                == "y"
-            ):
-                if not ns.launch_fake_server(
-                    dnssec_mode=exploit.dnssec_mode,
-                    web_security_demo=True,
-                    dns_upstream=exploit.dnssec_upstream,
-                    smart_spoof_all=dns_spoof_on,
-                ):
-                    sys.exit("[NetShaper] HSTS demo requires verified fake HTTP.")
-            else:
-                sys.exit("[NetShaper] HSTS demo requires verified fake HTTP.")
+                sys.exit(portal_required_error)
 
+        mitm_auto_launch = False
         if http_redirect_port == 8088:
             if check_local_port(ns.own_ip, 8088):
                 sys.exit(
@@ -1000,9 +976,13 @@ def main() -> None:
                     "unverified listener."
                 )
             print_flush("  [!] mitmproxy (port 8088) not running.")
-            if safe_input("  Auto-launch mitmproxy? (y/n): ").lower() == "y":
-                if not ns.launch_mitmproxy(port=8088, web_port=8083):
-                    sys.exit("[NetShaper] mitmproxy did not become reachable.")
+            if (
+                safe_input(
+                    "  Auto-launch mitmproxy after confirmation? (y/n): "
+                ).lower()
+                == "y"
+            ):
+                mitm_auto_launch = True
             else:
                 print_flush(
                     "      mitmweb --mode transparent --listen-port 8088 "
@@ -1014,12 +994,12 @@ def main() -> None:
             interface=interface,
             authorized_cidrs=authorized_cidrs,
             targets=targets,
-            modules=modules,
             arp_on=arp_on,
             dns_spoof_on=dns_spoof_on,
             captive_portal=captive_portal,
             http_redirect_port=http_redirect_port,
             sniff_on=sniff_on,
+            mitm_on=mitm_on,
             save_pcap=save_pcap,
             rolling=rolling,
             packet_verbose=args.packet_verbose,
@@ -1027,6 +1007,9 @@ def main() -> None:
             arp_interval=args.arp_interval,
             arp_burst=args.arp_burst,
             exploit=exploit,
+            portal_auto_launch=portal_auto_launch,
+            portal_smart_spoof_all=portal_smart_spoof_all,
+            mitm_auto_launch=mitm_auto_launch,
         )
 
         W = 58
@@ -1052,6 +1035,8 @@ def main() -> None:
         print_flush(f"  Captive portal: {_yn(captive_portal)}")
         if captive_portal:
             print_flush(f"    HTTP -> port: {http_redirect_port}")
+        if portal_auto_launch:
+            print_flush("    Portal start: after confirmation")
         print_flush(
             f"  Throttle      : {green(f'{limit} Mbps') if throttle_on else 'No'}"
         )
@@ -1060,6 +1045,8 @@ def main() -> None:
                 "    Netem       : " + " ".join(shaping_profile.netem_arguments())
             )
         print_flush(f"  mitmproxy     : {_yn(mitm_on)}")
+        if mitm_on:
+            print_flush(f"    Auto-start  : {_yn(mitm_auto_launch)}")
         print_flush(f"  Sniffer       : {_yn(sniff_on)}")
         if sniff_on and save_pcap:
             print_flush(f"    Rolling pcap: {_yn(rolling)}")
@@ -1093,14 +1080,10 @@ def main() -> None:
         signal.signal(signal.SIGTERM, sig_handler)
 
         try:
-            for plugin_id, instance_id in registered_plugins:
-                if ns.start_plugin(instance_id):
-                    print_flush(
-                        f"  [+] Plugin {plugin_id} started ({instance_id})"
-                    )
-                else:
-                    raise RuntimeError(f"Plugin {plugin_id} failed to start")
-            SessionRunner(ns).execute(plan)
+            SessionRunner(
+                ns,
+                registered_plugins=tuple(registered_plugins),
+            ).execute(plan)
         except KeyboardInterrupt:
             ns.stop_event.set()
     except RuntimeError as exc:

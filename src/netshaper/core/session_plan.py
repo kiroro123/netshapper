@@ -14,7 +14,7 @@ TargetRef = Union[Device, str]
 
 
 class ModuleID(str, Enum):
-    """Named offensive network modules used internally after CLI parsing."""
+    """Named offensive network modules used while resolving CLI choices."""
 
     ARP = "arp"
     DNS = "dns"
@@ -58,6 +58,8 @@ class PortalOptions:
     enabled: bool
     http_redirect_port: Optional[int] = None
     hsts_idn_demo: bool = False
+    auto_launch: bool = False
+    smart_spoof_all: bool = False
 
 
 @dataclass(frozen=True)
@@ -71,6 +73,9 @@ class CaptureOptions:
 @dataclass(frozen=True)
 class MitmOptions:
     enabled: bool
+    auto_launch: bool = False
+    listen_port: int = 8088
+    web_port: int = 8083
 
 
 @dataclass(frozen=True)
@@ -80,7 +85,6 @@ class SessionPlan:
     interface: str
     authorized_cidrs: tuple[str, ...]
     targets: tuple[TargetRef, ...]
-    modules: frozenset[ModuleID]
     arp: ArpOptions
     dns: DnsOptions
     portal: PortalOptions

@@ -65,7 +65,7 @@ class PortalManager:
             http_claimed = check_local_port(self.host_ip, 80)
             if dns_claimed or http_claimed:
                 log.error(
-                    "Refusing to adopt unverified portal listener "
+                    "Refusing to use unverified portal listener "
                     "(dns=%s, http=%s). Stop the existing listener or relaunch "
                     "it with the session health token printed by NetShaper.",
                     dns_claimed,
@@ -76,7 +76,7 @@ class PortalManager:
             cmd = [
                 sys.executable,
                 "-m",
-                "netshaper.fake_server3",
+                "netshaper.portal",
                 "--host-ip",
                 self.host_ip,
                 "--upstream",

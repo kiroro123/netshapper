@@ -14,6 +14,7 @@ from netshaper.core.session_plan import (
 )
 from netshaper.core.session_runner import SessionRunner
 from netshaper.models import Device
+from netshaper.network.shaper import ShapingProfile
 from netshaper.ui import cli
 
 
@@ -22,7 +23,6 @@ def _plan(targets, **overrides):
         "interface": "eth0",
         "authorized_cidrs": ("192.0.2.0/24",),
         "targets": tuple(targets),
-        "modules": frozenset({ModuleID.ARP}),
         "arp": ArpOptions(enabled=True),
         "dns": DnsOptions(enabled=False),
         "portal": PortalOptions(enabled=False),
@@ -32,6 +32,20 @@ def _plan(targets, **overrides):
     }
     values.update(overrides)
     return SessionPlan(**values)
+
+
+def _runner_ns():
+    ns = mock.Mock()
+    ns.stop_event = mock.Mock()
+    ns.stop_event.wait.return_value = True
+    ns.save_state.return_value = True
+    ns.fake_server_ready.return_value = True
+    ns.launch_fake_server.return_value = True
+    ns.launch_mitmproxy.return_value = True
+    ns.start_plugin.return_value = True
+    ns.runtime_health_issues.return_value = []
+    ns.runtime_evidence_lines.return_value = ["Session ID: NS-TEST"]
+    return ns
 
 
 class CliTests(unittest.TestCase):
@@ -277,30 +291,28 @@ class CliTests(unittest.TestCase):
             interface="eth0",
             authorized_cidrs=["192.0.2.0/24"],
             targets=["192.0.2.10"],
-            modules={
-                ModuleID.ARP,
-                ModuleID.DNS,
-                ModuleID.PORTAL,
-                ModuleID.ARP_AMPLIFICATION,
-            },
             arp_on=True,
             dns_spoof_on=True,
             captive_portal=True,
             http_redirect_port=80,
             sniff_on=False,
+            mitm_on=False,
             save_pcap=False,
             rolling=False,
             exploit=exploit,
+            portal_auto_launch=True,
+            portal_smart_spoof_all=True,
         )
 
         self.assertEqual(plan.interface, "eth0")
         self.assertEqual(plan.authorized_cidrs, ("192.0.2.0/24",))
         self.assertEqual(plan.target_ips, ("192.0.2.10",))
-        self.assertIn(ModuleID.ARP_AMPLIFICATION, plan.modules)
         self.assertTrue(plan.arp.amplification_enabled)
         self.assertEqual(plan.arp.amplify, 64)
         self.assertTrue(plan.dns.dnssec_enabled)
         self.assertTrue(plan.portal.hsts_idn_demo)
+        self.assertTrue(plan.portal.auto_launch)
+        self.assertTrue(plan.portal.smart_spoof_all)
 
     def test_pick_limit_ui_returns_new_10_mbps_preset(self):
         with mock.patch("netshaper.ui.cli.safe_input", return_value="5"), \
@@ -548,6 +560,193 @@ class CliTests(unittest.TestCase):
         )
         ns.cleanup.assert_called_once()
 
+    def test_session_runner_starts_portal_service_after_confirmation(self):
+        ns = _runner_ns()
+        ns.fake_server_ready.return_value = False
+        plan = _plan(
+            ["192.0.2.10"],
+            dns=DnsOptions(enabled=True),
+            portal=PortalOptions(
+                enabled=False,
+                auto_launch=True,
+                smart_spoof_all=True,
+            ),
+        )
+
+        with mock.patch("netshaper.core.session_runner.print_flush"):
+            SessionRunner(ns).execute(plan)
+
+        ns.launch_fake_server.assert_called_once_with(
+            suppress_dnssec=False,
+            dnssec_mode="off",
+            web_security_demo=False,
+            dns_upstream="8.8.8.8",
+            smart_spoof_all=True,
+        )
+        calls = [call[0] for call in ns.method_calls]
+        self.assertLess(calls.index("launch_fake_server"), calls.index("add_target"))
+        ns.cleanup.assert_called_once()
+
+    def test_session_runner_rejects_required_portal_before_host_mutation(self):
+        ns = _runner_ns()
+        ns.fake_server_ready.return_value = False
+        plan = _plan(["192.0.2.10"], dns=DnsOptions(enabled=True))
+
+        with mock.patch("netshaper.core.session_runner.print_flush"), \
+             self.assertRaisesRegex(RuntimeError, "netshaper-portal"):
+            SessionRunner(ns).execute(plan)
+
+        ns.save_state.assert_not_called()
+        ns._apply_global_rules.assert_not_called()
+        ns.launch_fake_server.assert_not_called()
+        ns.add_target.assert_not_called()
+        ns.cleanup.assert_called_once()
+
+    def test_session_runner_starts_mitmproxy_after_confirmation(self):
+        ns = _runner_ns()
+        plan = _plan(
+            ["192.0.2.10"],
+            portal=PortalOptions(enabled=False, http_redirect_port=8088),
+            mitm=MitmOptions(enabled=True, auto_launch=True),
+        )
+
+        with mock.patch("netshaper.core.session_runner.print_flush"):
+            SessionRunner(ns).execute(plan)
+
+        ns.launch_mitmproxy.assert_called_once_with(port=8088, web_port=8083)
+        calls = [call[0] for call in ns.method_calls]
+        self.assertLess(calls.index("launch_mitmproxy"), calls.index("add_target"))
+        ns.cleanup.assert_called_once()
+
+    def test_session_runner_starts_registered_plugins_in_service_phase(self):
+        ns = _runner_ns()
+        plan = _plan(["192.0.2.10"])
+
+        with mock.patch("netshaper.core.session_runner.print_flush"):
+            SessionRunner(
+                ns,
+                registered_plugins=(("dummy", "dummy-1234"),),
+            ).execute(plan)
+
+        ns.start_plugin.assert_called_once_with("dummy-1234")
+        calls = [call[0] for call in ns.method_calls]
+        self.assertLess(calls.index("start_plugin"), calls.index("add_target"))
+        ns.cleanup.assert_called_once()
+
+    def test_session_runner_reports_cleanup_error_state(self):
+        ns = _runner_ns()
+        ns._cleanup_complete = False
+        plan = _plan(["192.0.2.10"])
+
+        with mock.patch("netshaper.core.session_runner.print_flush") as output:
+            SessionRunner(ns).execute(plan)
+
+        self.assertIn("cleanup errors", output.call_args.args[0])
+
+    def test_session_runner_validates_required_plan_fields(self):
+        ns = _runner_ns()
+        runner = SessionRunner(ns)
+
+        with self.assertRaisesRegex(RuntimeError, "interface"):
+            runner.validate(_plan(["192.0.2.10"], interface=""))
+        with self.assertRaisesRegex(RuntimeError, "no targets"):
+            runner.validate(_plan([]))
+        with self.assertRaisesRegex(RuntimeError, "listen port"):
+            runner.validate(
+                _plan(
+                    ["192.0.2.10"],
+                    mitm=MitmOptions(enabled=True, auto_launch=True, listen_port=0),
+                )
+            )
+        with self.assertRaisesRegex(RuntimeError, "web port"):
+            runner.validate(
+                _plan(
+                    ["192.0.2.10"],
+                    mitm=MitmOptions(enabled=True, auto_launch=True, web_port=0),
+                )
+            )
+        with self.assertRaisesRegex(RuntimeError, "mitmproxy"):
+            runner.validate(_plan(["192.0.2.10"], mitm=MitmOptions(enabled=True)))
+
+    def test_session_runner_rejects_failed_state_saves_at_lifecycle_points(self):
+        ns = _runner_ns()
+        runner = SessionRunner(ns)
+
+        ns.save_state.side_effect = [True, False]
+        with self.assertRaisesRegex(RuntimeError, "after global rules"):
+            runner.prepare(_plan(["192.0.2.10"]))
+
+        ns = _runner_ns()
+        ns.save_state.return_value = False
+        with self.assertRaisesRegex(RuntimeError, "after target setup"):
+            SessionRunner(ns).start_targets(_plan(["192.0.2.10"]))
+
+        ns = _runner_ns()
+        ns.save_state.return_value = False
+        with self.assertRaisesRegex(RuntimeError, "after startup"):
+            SessionRunner(ns).start_observers(_plan(["192.0.2.10"]), ["192.0.2.10"])
+
+    def test_session_runner_service_phase_reports_start_failures(self):
+        plan = _plan(
+            ["192.0.2.10"],
+            dns=DnsOptions(enabled=True),
+            portal=PortalOptions(enabled=False, auto_launch=True),
+        )
+        ns = _runner_ns()
+        ns.fake_server_ready.return_value = False
+        ns.launch_fake_server.return_value = False
+        with self.assertRaisesRegex(RuntimeError, "portal"):
+            SessionRunner(ns).start_services(plan)
+
+        ns = _runner_ns()
+        mitm_plan = _plan(
+            ["192.0.2.10"],
+            mitm=MitmOptions(enabled=True, auto_launch=True),
+        )
+        ns.launch_mitmproxy.return_value = False
+        with self.assertRaisesRegex(RuntimeError, "mitmproxy"):
+            SessionRunner(ns).start_services(mitm_plan)
+
+        ns = _runner_ns()
+        ns.start_plugin.return_value = False
+        with self.assertRaisesRegex(RuntimeError, "Plugin dummy failed"):
+            SessionRunner(
+                ns,
+                registered_plugins=(("dummy", "dummy-1234"),),
+            ).start_services(_plan(["192.0.2.10"]))
+
+        ns = _runner_ns()
+        ns.save_state.return_value = False
+        with self.assertRaisesRegex(RuntimeError, "after service start"):
+            SessionRunner(
+                ns,
+                registered_plugins=(("dummy", "dummy-1234"),),
+            ).start_services(_plan(["192.0.2.10"]))
+
+        ns = _runner_ns()
+        ns.fake_server_ready.return_value = False
+        with self.assertRaisesRegex(RuntimeError, "not verified"):
+            SessionRunner(ns).start_services(
+                _plan(["192.0.2.10"], dns=DnsOptions(enabled=True))
+            )
+
+        ns = _runner_ns()
+        with self.assertRaisesRegex(RuntimeError, "not approved"):
+            SessionRunner(ns).start_services(
+                _plan(["192.0.2.10"], mitm=MitmOptions(enabled=True))
+            )
+
+    def test_session_runner_passes_shaping_profile_to_target_setup(self):
+        ns = _runner_ns()
+        profile = ShapingProfile(bandwidth_mbps=3.0)
+        plan = _plan(["192.0.2.10"], shaping=profile)
+
+        SessionRunner(ns).start_targets(plan)
+
+        ns.add_target.assert_called_once()
+        self.assertIs(ns.add_target.call_args.kwargs["shaping_profile"], profile)
+        self.assertEqual(ns.add_target.call_args.kwargs["limit"], 3.0)
+
     def test_main_exits_when_stale_recovery_fails(self):
         ns = mock.Mock()
         ns.load_state_and_cleanup.return_value = False
@@ -685,6 +884,92 @@ class CliTests(unittest.TestCase):
             cli.main()
 
         run_mock.assert_not_called()
+        ns.launch_fake_server.assert_not_called()
+        ns.close.assert_called_once()
+
+    def test_main_records_portal_autolaunch_without_starting_preconfirm(self):
+        ns = mock.Mock()
+        ns.load_state_and_cleanup.return_value = True
+        ns.own_ip = "192.0.2.10"
+        ns.own_ipv6 = None
+        ns.gw = "192.0.2.1"
+        ns.gw_ipv6 = None
+        ns.fake_server_ready.return_value = False
+        ns.fake_server_health_token.return_value = "test-health-token"
+        target = Device(ip="192.0.2.20", mac="00:11:22:33:44:55")
+        ns.discover.return_value = [target]
+
+        with mock.patch("sys.argv", [
+                "netshaper",
+                "-i", "eth0",
+                "--allow-cidr", "192.0.2.0/24",
+                "--modules", "2",
+             ]), \
+             mock.patch("netshaper.ui.cli.SystemChecker.check"), \
+             mock.patch("netshaper.ui.cli.choose_interface", return_value="eth0"), \
+             mock.patch("netshaper.ui.cli.config.configure_logging"), \
+             mock.patch("netshaper.ui.cli.print_flush"), \
+             mock.patch("netshaper.core.orchestrator.NetShaper",
+                        return_value=ns), \
+             mock.patch("netshaper.ui.cli.pick_targets_ui",
+                        return_value=[target]), \
+             mock.patch("netshaper.ui.cli.safe_input",
+                        side_effect=["n", "y", "y"]), \
+             mock.patch("netshaper.ui.cli.SessionRunner.execute") as run_mock, \
+             mock.patch("netshaper.ui.cli.psutil.net_if_addrs",
+                        return_value={"eth0": []}):
+            cli.main()
+
+        ns.launch_fake_server.assert_not_called()
+        ns.launch_mitmproxy.assert_not_called()
+        run_mock.assert_called_once()
+        plan = run_mock.call_args.args[0]
+        self.assertTrue(plan.dns.enabled)
+        self.assertTrue(plan.portal.auto_launch)
+        self.assertTrue(plan.portal.smart_spoof_all)
+        ns.close.assert_called_once()
+
+    def test_main_records_mitm_autolaunch_without_starting_preconfirm(self):
+        ns = mock.Mock()
+        ns.load_state_and_cleanup.return_value = True
+        ns.own_ip = "192.0.2.10"
+        ns.own_ipv6 = None
+        ns.gw = "192.0.2.1"
+        ns.gw_ipv6 = None
+        target = Device(ip="192.0.2.20", mac="00:11:22:33:44:55")
+        ns.discover.return_value = [target]
+
+        with mock.patch("sys.argv", [
+                "netshaper",
+                "-i", "eth0",
+                "--allow-cidr", "192.0.2.0/24",
+                "--modules", "6",
+             ]), \
+             mock.patch("netshaper.ui.cli.SystemChecker.check"), \
+             mock.patch("netshaper.ui.cli.choose_interface", return_value="eth0"), \
+             mock.patch("netshaper.ui.cli.config.configure_logging"), \
+             mock.patch("netshaper.ui.cli.print_flush"), \
+             mock.patch("netshaper.core.orchestrator.NetShaper",
+                        return_value=ns), \
+             mock.patch("netshaper.ui.cli.pick_targets_ui",
+                        return_value=[target]), \
+             mock.patch("netshaper.ui.cli.safe_input",
+                        side_effect=["y", "y"]), \
+             mock.patch("netshaper.ui.cli.check_local_port",
+                        return_value=False), \
+             mock.patch("netshaper.ui.cli.SessionRunner.execute") as run_mock, \
+             mock.patch("netshaper.ui.cli.psutil.net_if_addrs",
+                        return_value={"eth0": []}):
+            cli.main()
+
+        ns.launch_mitmproxy.assert_not_called()
+        ns.launch_fake_server.assert_not_called()
+        run_mock.assert_called_once()
+        plan = run_mock.call_args.args[0]
+        self.assertTrue(plan.mitm.enabled)
+        self.assertTrue(plan.mitm.auto_launch)
+        self.assertEqual(plan.mitm.listen_port, 8088)
+        self.assertEqual(plan.portal.http_redirect_port, 8088)
         ns.close.assert_called_once()
 
     def test_main_does_not_start_plugin_before_final_confirmation(self):
