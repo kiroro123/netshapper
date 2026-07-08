@@ -48,15 +48,16 @@ class PortalManagerTests(unittest.TestCase):
             "--health-token",
             "token",
         ]
+        manager._process_identity = {
+            "pid": 1234,
+            "process_create_time": 456.0,
+            "created_at": 789.0,
+        }
         manager._health_token = "token"
 
         with mock.patch(
             "netshaper.core.portal_manager.process_owner_metadata",
-            return_value={
-                "pid": 1234,
-                "process_create_time": 456.0,
-                "created_at": 789.0,
-            },
+            side_effect=AssertionError("identity should be captured once"),
         ):
             state = manager.get_state_for_persistence()
 
@@ -65,16 +66,109 @@ class PortalManagerTests(unittest.TestCase):
         self.assertEqual(state["ownership_token"], "token")
         self.assertIn("netshaper.portal", state["argv"])
 
+    def test_attach_owned_process_captures_identity_and_command(self):
+        journal = mock.Mock(return_value=True)
+        manager = PortalManager(
+            "192.0.2.10",
+            ["192.0.2.0/24"],
+            journal=journal,
+        )
+        process = mock.Mock()
+        process.pid = 1234
+        process.poll.return_value = None
+        process.args = [
+            "/usr/bin/python3",
+            "-m",
+            "netshaper.portal",
+            "--health-token",
+            "token",
+        ]
+
+        with mock.patch(
+            "netshaper.core.portal_manager.process_owner_metadata",
+            return_value={
+                "pid": 1234,
+                "process_create_time": 456.0,
+                "created_at": 789.0,
+            },
+        ) as owner_metadata:
+            self.assertTrue(
+                manager.attach_owned_process(process, health_token="token")
+            )
+            state = manager.get_state_for_persistence()
+
+        owner_metadata.assert_called_once_with(1234)
+        journal.assert_called_once()
+        self.assertEqual(state["pid"], 1234)
+        self.assertEqual(state["process_create_time"], 456.0)
+        self.assertEqual(state["argv"], process.args)
+        self.assertEqual(state["ownership_token"], "token")
+
+    def test_attach_owned_process_stops_when_command_is_missing(self):
+        manager = PortalManager("192.0.2.10", ["192.0.2.0/24"])
+        process = mock.Mock()
+        process.pid = 1234
+        process.poll.side_effect = [None, None, 0]
+
+        self.assertFalse(manager.attach_owned_process(process, health_token="token"))
+
+        process.terminate.assert_called_once()
+        self.assertIsNone(manager.process)
+
+    def test_attach_owned_process_stops_when_identity_capture_fails(self):
+        manager = PortalManager("192.0.2.10", ["192.0.2.0/24"])
+        process = mock.Mock()
+        process.pid = 1234
+        process.poll.side_effect = [None, None, 0]
+        process.args = [
+            "/usr/bin/python3",
+            "-m",
+            "netshaper.portal",
+            "--health-token",
+            "token",
+        ]
+
+        with mock.patch(
+            "netshaper.core.portal_manager.process_owner_metadata",
+            return_value={
+                "pid": 1234,
+                "process_create_time": None,
+                "created_at": 789.0,
+            },
+        ):
+            self.assertFalse(
+                manager.attach_owned_process(process, health_token="token")
+            )
+
+        process.terminate.assert_called_once()
+        self.assertIsNone(manager.process)
+
     def test_start_waits_for_existing_child(self):
         manager = PortalManager("192.0.2.10", ["192.0.2.0/24"])
         manager.process = mock.Mock()
+        manager.process.pid = 1234
         manager.process.poll.return_value = None
+        manager.process.args = [
+            "/usr/bin/python3",
+            "-m",
+            "netshaper.portal",
+            "--health-token",
+            "token",
+        ]
 
         with mock.patch.object(manager, "ready", side_effect=[False, True]), \
              mock.patch("netshaper.core.portal_manager.check_local_port"
                         ) as port_check, \
              mock.patch("netshaper.core.portal_manager.subprocess.Popen"
-                        ) as popen:
+                        ) as popen, \
+             mock.patch(
+                 "netshaper.core.portal_manager.process_owner_metadata",
+                 return_value={
+                     "pid": 1234,
+                     "process_create_time": 456.0,
+                     "created_at": 789.0,
+                 },
+             ):
             self.assertTrue(manager.start(PortalConfig()))
 
         port_check.assert_not_called()
@@ -83,6 +177,7 @@ class PortalManagerTests(unittest.TestCase):
     def test_start_launches_public_portal_module(self):
         manager = PortalManager("192.0.2.10", ["192.0.2.0/24"])
         process = mock.Mock()
+        process.pid = 1234
         process.poll.return_value = None
 
         with mock.patch.object(manager, "ready", side_effect=[False, True]), \
@@ -91,7 +186,15 @@ class PortalManagerTests(unittest.TestCase):
              mock.patch("netshaper.core.portal_manager.check_local_port",
                         side_effect=[False, False]), \
              mock.patch("netshaper.core.portal_manager.subprocess.Popen",
-                        return_value=process) as popen:
+                        return_value=process) as popen, \
+             mock.patch(
+                 "netshaper.core.portal_manager.process_owner_metadata",
+                 return_value={
+                     "pid": 1234,
+                     "process_create_time": 456.0,
+                     "created_at": 789.0,
+                 },
+             ):
             self.assertTrue(
                 manager.start(
                     PortalConfig(
@@ -111,6 +214,30 @@ class PortalManagerTests(unittest.TestCase):
         self.assertIn("192.0.2.0/24", command)
         self.assertIn("192.0.2.10/32", command)
 
+    def test_start_stops_child_when_identity_capture_fails(self):
+        manager = PortalManager("192.0.2.10", ["192.0.2.0/24"])
+        process = mock.Mock()
+        process.pid = 1234
+        process.poll.side_effect = [None, 0]
+
+        with mock.patch.object(manager, "ready", return_value=False), \
+             mock.patch("netshaper.core.portal_manager.check_local_port",
+                        side_effect=[False, False]), \
+             mock.patch("netshaper.core.portal_manager.subprocess.Popen",
+                        return_value=process), \
+             mock.patch(
+                 "netshaper.core.portal_manager.process_owner_metadata",
+                 return_value={
+                     "pid": 1234,
+                     "process_create_time": None,
+                     "created_at": 789.0,
+                 },
+             ):
+            self.assertFalse(manager.start(PortalConfig()))
+
+        process.terminate.assert_called_once()
+        self.assertIsNone(manager.process)
+
     def test_start_returns_false_when_popen_fails(self):
         manager = PortalManager("192.0.2.10", ["192.0.2.0/24"])
 
@@ -124,6 +251,7 @@ class PortalManagerTests(unittest.TestCase):
     def test_start_returns_false_when_child_exits_during_startup(self):
         manager = PortalManager("192.0.2.10", ["192.0.2.0/24"])
         process = mock.Mock()
+        process.pid = 1234
         process.poll.return_value = 2
         process.returncode = 2
 
@@ -132,6 +260,14 @@ class PortalManagerTests(unittest.TestCase):
                         side_effect=[False, False]), \
              mock.patch("netshaper.core.portal_manager.subprocess.Popen",
                         return_value=process), \
+             mock.patch(
+                 "netshaper.core.portal_manager.process_owner_metadata",
+                 return_value={
+                     "pid": 1234,
+                     "process_create_time": 456.0,
+                     "created_at": 789.0,
+                 },
+             ), \
              mock.patch.object(manager, "stop", wraps=manager.stop) as stop_mock:
             self.assertFalse(manager.start(PortalConfig()))
 
@@ -140,6 +276,7 @@ class PortalManagerTests(unittest.TestCase):
     def test_start_times_out_and_stops_child(self):
         manager = PortalManager("192.0.2.10", ["192.0.2.0/24"])
         process = mock.Mock()
+        process.pid = 1234
         process.poll.return_value = None
 
         with mock.patch.object(manager, "ready", return_value=False), \
@@ -147,6 +284,14 @@ class PortalManagerTests(unittest.TestCase):
                         side_effect=[False, False]), \
              mock.patch("netshaper.core.portal_manager.subprocess.Popen",
                         return_value=process), \
+             mock.patch(
+                 "netshaper.core.portal_manager.process_owner_metadata",
+                 return_value={
+                     "pid": 1234,
+                     "process_create_time": 456.0,
+                     "created_at": 789.0,
+                 },
+             ), \
              mock.patch("netshaper.core.portal_manager.time.sleep"), \
              mock.patch.object(manager, "stop", return_value=True) as stop_mock:
             self.assertFalse(manager.start(PortalConfig()))
