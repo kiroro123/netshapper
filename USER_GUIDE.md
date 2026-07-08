@@ -67,7 +67,7 @@ Then select modules `1 2 3` (or `1,2,3`) for ARP + DNS + captive portal. When
 NetShaper asks:
 
 ```text
-Auto-launch netshaper-portal? (y/n):
+Auto-launch netshaper-portal after confirmation? (y/n):
 ```
 
 answer `y`.
@@ -101,10 +101,12 @@ sportal --host-ip <your-ip> \
 **Terminal 2** - run that copied portal command.
 
 Then return to Terminal 1 and answer `y` at the auto-launch prompt. NetShaper
-checks the health token first; if the manually started portal is verified, it
-adopts that process instead of spawning a duplicate. If NetShaper says ports
-`53` or `80` are occupied by an unverified listener, stop the old portal
-process and relaunch it with the current session's `--health-token`.
+checks the health token first; if the manually started portal is verified,
+NetShaper uses that external portal instead of spawning a duplicate. That
+external portal remains operator-managed and must be stopped separately. If
+NetShaper says ports `53` or `80` are occupied by an unverified listener, stop
+the old portal process and relaunch it with the current session's
+`--health-token`.
 
 ## Offensive Network Module Menu
 
