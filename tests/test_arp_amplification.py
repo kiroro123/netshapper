@@ -198,6 +198,35 @@ class ARPAmplificationTests(unittest.TestCase):
             ["ARP amplification worker failed: send failed"],
         )
 
+    def test_shutdown_reports_alive_workers_and_keeps_thread_handles(self):
+        amplifier = ARPAmplifier("eth0", ATTACKER_MAC)
+        alive = mock.Mock()
+        alive.is_alive.return_value = True
+        stopped = mock.Mock()
+        stopped.is_alive.return_value = False
+        amplifier._threads = [alive, stopped]
+
+        with mock.patch("netshaper.network.exploit.arp_amplification.log"):
+            self.assertFalse(amplifier.shutdown())
+
+        alive.join.assert_called_once_with(timeout=5.0)
+        stopped.join.assert_called_once_with(timeout=5.0)
+        self.assertEqual(amplifier._threads, [alive])
+        self.assertIsInstance(amplifier.last_error, RuntimeError)
+        self.assertEqual(str(amplifier.last_error), "1 ARP worker(s) failed to stop")
+
+    def test_shutdown_clears_threads_when_all_workers_stop(self):
+        amplifier = ARPAmplifier("eth0", ATTACKER_MAC)
+        stopped = mock.Mock()
+        stopped.is_alive.return_value = False
+        amplifier._threads = [stopped]
+
+        with mock.patch("netshaper.network.exploit.arp_amplification.log"):
+            self.assertTrue(amplifier.shutdown())
+
+        stopped.join.assert_called_once_with(timeout=5.0)
+        self.assertEqual(amplifier._threads, [])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
